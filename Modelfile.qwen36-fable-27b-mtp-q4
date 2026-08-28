@@ -1,0 +1,10 @@
+FROM /private/tmp/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-MTP-Q4_K_M.gguf
+
+# Balanced for occasional coding/agent use on a 64 GB unified-memory Mac.
+PARAMETER num_ctx 32768
+
+# Repository guidance for its MTP GGUFs.
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER repeat_penalty 1.0

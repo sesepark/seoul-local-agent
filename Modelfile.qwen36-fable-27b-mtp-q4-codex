@@ -1,0 +1,8 @@
+FROM qwen36-fable-27b-mtp-q4:latest
+
+# CookieRunHub 등 코드 작업용: 긴 파일 문맥, 낮은 변동성.
+PARAMETER num_ctx 32768
+PARAMETER temperature 0.2
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+PARAMETER repeat_penalty 1.05

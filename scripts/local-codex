@@ -1,0 +1,18 @@
+#!/bin/zsh
+# Manual, read-only local Codex session. It never starts automatically.
+set -eu
+
+MODEL="qwen36-fable-27b-mtp-q4-codex:latest"
+
+unload_model() {
+  /usr/bin/curl --silent --show-error --max-time 10 \
+    -X POST http://127.0.0.1:11434/api/generate \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${MODEL}\",\"keep_alive\":0}" >/dev/null 2>&1 || true
+}
+
+trap unload_model EXIT INT TERM
+export OLLAMA_KEEP_ALIVE=0
+/opt/homebrew/bin/codex --oss --local-provider ollama --model "$MODEL" \
+  --profile local-coding \
+  --sandbox read-only --ask-for-approval untrusted "$@"

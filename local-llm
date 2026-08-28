@@ -1,0 +1,36 @@
+#!/bin/zsh
+set -euo pipefail
+
+model="qwen36-fable-27b-mtp-q4:latest"
+openclaw_model="ollama/qwen36-fable-27b-mtp-q4:latest"
+
+usage() {
+  print "Usage: $0 {on|off|status|ask|agent} [message]"
+}
+
+case "${1:-}" in
+  on)
+    ollama run "$model" "Reply exactly: LOCAL_LLM_READY" --think false --keepalive 5m
+    ;;
+  off)
+    ollama stop "$model"
+    ;;
+  status)
+    ollama ps
+    openclaw gateway status --require-rpc
+    ;;
+  ask)
+    shift
+    [[ $# -gt 0 ]] || { print "ask requires a prompt" >&2; exit 2; }
+    ollama run "$model" "$*" --think false --keepalive 5m
+    ;;
+  agent)
+    shift
+    [[ $# -gt 0 ]] || { print "agent requires a task" >&2; exit 2; }
+    openclaw agent --session-id manual-local-llm --model "$openclaw_model" --thinking off --message "$*"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
