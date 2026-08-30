@@ -5,6 +5,10 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
     @Published private(set) var isRecording = false
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var errorMessage: String?
+
+    /// The banner is dismissible, so the view needs a way to clear a message it
+    /// has finished showing without the setter becoming public.
+    func dismissError() { errorMessage = nil }
     private var recorder: AVAudioRecorder?
     private var timer: Timer?
     private var startedAt: Date?

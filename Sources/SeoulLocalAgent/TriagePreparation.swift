@@ -276,14 +276,25 @@ enum CarryForwardPolicy {
         var expired: [ClassifiedItem] = []
     }
 
-    static func evaluate(previousItems: [ClassifiedItem], uncheckedTitles: Set<String>, now: Date) -> Outcome {
+    /// `completedIDs` are the `trackingID`s the reader has ticked off in the
+    /// 브리핑 보관함. Everything else that was an action yesterday is still an
+    /// action today.
+    ///
+    /// This used to be driven by the set of *unchecked* to_do titles read back
+    /// out of the Notion page, which meant two things went wrong quietly: an
+    /// item whose generated title changed between runs lost its identity, and
+    /// an item past the page's `briefingMaxActions` cut-off was never written
+    /// as a to_do at all and so could never be carried. Keying on the tracking
+    /// ID and inverting the test — carry unless explicitly finished — fixes
+    /// both.
+    static func evaluate(previousItems: [ClassifiedItem], completedIDs: Set<String>, now: Date) -> Outcome {
         var outcome = Outcome()
         for item in previousItems {
             if isUpcomingCalendarEntry(item, now: now) {
                 outcome.carried.append(item)
                 continue
             }
-            guard item.category == .action, isUnchecked(item, in: uncheckedTitles) else { continue }
+            guard item.category == .action, !completedIDs.contains(item.trackingID) else { continue }
             if let expiry = BriefPresentation.deadlineExpiry(item.deadline), expiry <= now {
                 outcome.expired.append(item)
             } else {
@@ -295,14 +306,6 @@ enum CarryForwardPolicy {
 
     static func isUpcomingCalendarEntry(_ item: ClassifiedItem, now: Date) -> Bool {
         item.sourceItem.source == SourceName.calendar && item.sourceItem.timestamp > now
-    }
-
-    /// Notion stores the to_do as the title plus its deadline suffix, and older pages
-    /// stored a raw ISO deadline, so both shapes have to match.
-    static func isUnchecked(_ item: ClassifiedItem, in titles: Set<String>) -> Bool {
-        let plain = BriefPresentation.title(for: item)
-        let full = BriefPresentation.todoTitle(for: item)
-        return titles.contains { $0 == full || $0 == plain || $0.hasPrefix("\(plain) · 마감") }
     }
 
     /// Items already covered by a carried-over result, with identical evidence, do

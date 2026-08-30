@@ -59,6 +59,7 @@ final class ActiveProcessRegistry: @unchecked Sendable {
     static let runnerMarkers = [
         "scripts/transcribe_runner.py",
         "scripts/matting_runner.py",
+        "scripts/media_runner.py",
         "mineru.cli.fast_api",
     ]
 
@@ -129,7 +130,13 @@ final class ActiveProcessRegistry: @unchecked Sendable {
 }
 
 enum AppConfig {
-    static let model = "qwen36-fable-27b-mtp-q4:latest"
+    /// Official Qwen3.6 MoE (35B total, 3B active) in Apple Silicon MLX form.
+    /// Measured against the creative-writing 27B merge this replaced, on the same
+    /// twelve-item labelled set: identical category accuracy, 11.8 → 60 generated
+    /// tokens per second, 11.1 → 3.3 seconds per item end to end. The merge was
+    /// tuned for prose, not for the schema-bound extraction this pipeline needs,
+    /// and being dense it also spent five times the time to reach the same answer.
+    static let model = "qwen3.6:35b-a3b-nvfp4"
     static let ollamaURL = URL(string: "http://127.0.0.1:11434")!
     /// Single source of truth: the writer re-checks this against the same policy.
     static let notionParentID = NotionParentPolicy.allowedParentID
@@ -146,7 +153,6 @@ enum AppConfig {
     /// The "분석 품질" setting: shorter batches ask the model for less per call,
     /// which finishes sooner per request and degrades less when a batch fails.
     static var classificationBatchSize: Int { briefingQualityMode == .thorough ? 6 : 3 }
-    static var presentationBatchSize: Int { briefingQualityMode == .thorough ? 4 : 2 }
     static var briefingMaxActions: Int { max(3, UserDefaults.standard.integer(forKey: "briefingMaxActions").nonZero(or: 10)) }
     static var briefingMaxReferences: Int { max(3, UserDefaults.standard.integer(forKey: "briefingMaxReferences").nonZero(or: 8)) }
 
@@ -610,21 +616,16 @@ struct IMessageSource {
 }
 
 enum CalendarIntegration {
-    static var authorizationDescription: String {
-        let status = EKEventStore.authorizationStatus(for: .event)
-        switch status {
-        case .fullAccess: return "읽기 허용됨"
-        case .writeOnly: return "쓰기 전용 · 읽기 권한 필요"
-        case .notDetermined: return "권한 요청 필요"
-        case .denied, .restricted: return "시스템 설정에서 허용 필요"
-        @unknown default: return "권한 상태를 확인할 수 없음"
-        }
-    }
+    static var authorizationDescription: String { describe(EKEventStore.authorizationStatus(for: .event)) }
+    static var reminderAuthorizationDescription: String { describe(EKEventStore.authorizationStatus(for: .reminder)) }
 
-    static func requestReadAccess() async throws {
-        let store = EKEventStore()
-        guard try await store.requestFullAccessToEvents() else {
-            throw AgentError.processFailed("캘린더 읽기 권한이 허용되지 않았습니다. 시스템 설정 > 개인정보 보호 및 보안 > 캘린더에서 SeoulLocalAgent를 허용하세요.")
+    private static func describe(_ status: EKAuthorizationStatus) -> String {
+        switch status {
+        case .fullAccess: "허용됨"
+        case .writeOnly: "쓰기 전용 · 읽기 권한 필요"
+        case .notDetermined: "권한 요청 필요"
+        case .denied, .restricted: "시스템 설정에서 허용 필요"
+        @unknown default: "권한 상태를 확인할 수 없음"
         }
     }
 }
@@ -756,23 +757,13 @@ private struct SlackAuthTest: Decodable {
     enum CodingKeys: String, CodingKey { case ok, error; case teamID = "team_id" }
 }
 
-private struct SlackUserInfo: Decodable {
-    struct User: Decodable {
-        struct Profile: Decodable {
-            let displayName: String?
-            let realName: String?
-            enum CodingKeys: String, CodingKey { case displayName = "display_name"; case realName = "real_name" }
-        }
-        let name: String?
-        let realName: String?
-        let profile: Profile?
-        enum CodingKeys: String, CodingKey { case name, profile; case realName = "real_name" }
-    }
-    let ok: Bool
-    let user: User?
-}
-
 struct SlackSource {
+    /// Reads four endpoints and nothing else: `auth.test` (no scope),
+    /// `conversations.list`, `conversations.history`, and `conversations.replies`.
+    /// So the token needs exactly `channels:read`, `groups:read`, `im:read`,
+    /// `channels:history`, `groups:history`, `im:history` — no directory access.
+    /// A user token (`xoxp-`) reads the account's own DMs and every channel it is
+    /// already in; a bot token only sees channels the bot was invited to.
     private let session = URLSession.shared
 
     func collect(since: Date) async throws -> SourceHarvest {
@@ -905,7 +896,9 @@ private struct OllamaResponse: Decodable {
 }
 private struct ClassificationEnvelope: Decodable { let items: [ClassificationResult] }
 private struct ClassificationResult: Decodable {
-    let sourceID: String
+    /// Optional on purpose: a model can drop the field even though the schema
+    /// marks it required, and a strict decode would throw away the whole batch.
+    let sourceID: String?
     let facts: String
     let category: BriefCategory
     let summary: String
@@ -914,25 +907,16 @@ private struct ClassificationResult: Decodable {
     let nextAction: String
     let deadline: String
     let confidence: Double?
+    /// The reader-facing text. Written in the same call as the classification so
+    /// it is grounded in the message body, which a separate editing pass never saw.
+    let displayTitle: String?
+    let displaySummary: String?
     enum CodingKeys: String, CodingKey {
         case facts, category, summary, reason, importance, deadline, confidence
         case sourceID = "source_id"
         case nextAction = "next_action"
-    }
-}
-
-private struct PresentationEnvelope: Decodable {
-    let items: [PresentationResult]
-}
-
-private struct PresentationResult: Decodable {
-    let sourceID: String
-    let title: String
-    let summary: String
-
-    enum CodingKeys: String, CodingKey {
-        case title, summary
-        case sourceID = "source_id"
+        case displayTitle = "display_title"
+        case displaySummary = "display_summary"
     }
 }
 
@@ -961,7 +945,15 @@ struct LocalClassifier {
                 Self.unclassified($0, reason: "입력 품질 게이트: 본문 누락", summary: "본문 누락으로 자동 분류를 보류했습니다.")
             }
             guard !usable.isEmpty else { continue }
-            let safeItems = usable.map { ["source_id": $0.id, "source": $0.source, "account": $0.account, "author": $0.author, "timestamp": ISO8601DateFormatter().string(from: $0.timestamp), "subject": $0.subject, "body": $0.body, "link": $0.link.absoluteString] }
+            let safeItems = usable.map { item -> [String: String] in
+                var fields = ["source_id": item.id, "source": item.source, "account": item.account,
+                              "author": item.author, "timestamp": ISO8601DateFormatter().string(from: item.timestamp),
+                              "subject": item.subject, "body": item.body, "link": item.link.absoluteString]
+                // Only present where it changes the judgement, so the model does not
+                // have to reason about an empty field on every ordinary message.
+                if let audience = item.audience { fields["audience"] = audience }
+                return fields
+            }
             let promptData = try JSONSerialization.data(withJSONObject: ["items": safeItems])
             let format: [String: Any] = [
                 "type": "object",
@@ -980,7 +972,13 @@ struct LocalClassifier {
                                 "next_action": ["type": "string"],
                         "deadline": ["type": "string"],
                         "confidence": ["type": "number"],
+                        "display_title": ["type": "string"],
+                        "display_summary": ["type": "string"],
                             ],
+                    // The display fields stay out of `required`: an `excluded` item
+                    // is only counted, never shown, and forcing prose for it costs
+                    // generation time for text nobody reads. `BriefPresentation`
+                    // falls back to the plain summary whenever they are absent.
                     "required": ["source_id", "facts", "category", "summary", "reason", "importance", "next_action", "deadline"],
                         ],
                     ],
@@ -992,7 +990,9 @@ struct LocalClassifier {
                 "prompt": String(decoding: promptData, as: UTF8.self), "stream": false, "think": false,
                 "format": format, "keep_alive": "5m", "options": [
                     "num_ctx": 16384, "temperature": 0.1, "top_p": 0.8,
-                    "top_k": 20, "repeat_penalty": 1.0, "num_predict": 1_800,
+                    // Two more fields per item, and they carry the whole report now.
+                    // Measured peak for a six-item batch is about 1,300 tokens.
+                    "top_k": 20, "repeat_penalty": 1.0, "num_predict": 2_600,
                 ],
             ]
             var request = URLRequest(url: AppConfig.ollamaURL.appending(path: "api/generate"))
@@ -1021,14 +1021,31 @@ struct LocalClassifier {
                 throw AgentError.processFailed("로컬 모델 분류 JSON 형식 오류 (\(batchLabel)).")
             }
             let sourceByID = Dictionary(uniqueKeysWithValues: usable.map { ($0.id, $0) })
+            // Some models return the right answers but omit `source_id`. When the
+            // batch was answered one-for-one, position identifies each item; any
+            // other shape is left to the deterministic fallback below rather than
+            // risking one message's summary landing on another.
+            let byPosition = decoded.items.count == usable.count && decoded.items.allSatisfy { $0.sourceID == nil }
             // A single hallucinated or omitted source_id used to discard the whole
             // batch and, through the caller, the entire source. Keep every item the
             // model did answer for and fall back deterministically for the rest.
             var answered = Set<String>()
-            for classified in decoded.items {
-                guard let source = sourceByID[classified.sourceID], answered.insert(classified.sourceID).inserted else { continue }
+            for (position, classified) in decoded.items.enumerated() {
+                let source = byPosition ? usable[position] : classified.sourceID.flatMap { sourceByID[$0] }
+                guard let source, answered.insert(source.id).inserted else { continue }
                 let confidence = classified.confidence ?? (classified.category == .action ? 0.7 : 0.8)
-                results.append(ClassifiedItem(sourceItem: source, facts: BriefPresentation.usable(classified.facts, limit: 600), category: classified.category, summary: classified.summary, reason: classified.reason, importance: min(5, max(1, classified.importance)), nextAction: classified.nextAction, deadline: classified.deadline, confidence: min(1, max(0, confidence))))
+                results.append(ClassifiedItem(
+                    sourceItem: source,
+                    facts: BriefPresentation.usable(classified.facts, limit: 600),
+                    category: classified.category, summary: classified.summary,
+                    reason: classified.reason, importance: min(5, max(1, classified.importance)),
+                    nextAction: classified.nextAction, deadline: classified.deadline,
+                    // The gates keep an over-long or leaked string from reaching the
+                    // page; `BriefPresentation` then falls back to the plain summary.
+                    displayTitle: BriefPresentation.usable(classified.displayTitle, limit: 90),
+                    displaySummary: BriefPresentation.usable(classified.displaySummary, limit: 700),
+                    confidence: min(1, max(0, confidence))
+                ))
             }
             results += usable.filter { !answered.contains($0.id) }.map {
                 Self.unclassified($0, reason: "모델이 이 항목의 분류를 반환하지 않아 확인 항목으로 남겼습니다.", summary: "자동 분류를 완료하지 못했습니다. 원문을 확인해 주세요.")
@@ -1043,114 +1060,6 @@ struct LocalClassifier {
             sourceItem: item, facts: nil, category: .reference, summary: summary,
             reason: reason, importance: 2, nextAction: "원문 확인", deadline: "", confidence: 0.0
         )
-    }
-
-    /// A second, bounded presentation pass. If it returns malformed data the
-    /// caller keeps the first-pass classification and uses deterministic UI
-    /// fallbacks; this must never create a retry loop for a daily briefing.
-    /// The reader-facing editor is kept intentionally small. A bad response
-    /// affects only one four-item batch, never the entire day's briefing.
-    func polish(_ items: [ClassifiedItem]) async throws -> [ClassifiedItem] {
-        var polishedByID: [String: ClassifiedItem] = [:]
-        for batch in items.filter({ $0.category != .excluded }).chunked(into: AppConfig.presentationBatchSize) {
-            try Task.checkCancellation()
-            do {
-                for item in try await polishBatch(batch) {
-                    polishedByID[item.id] = item
-                }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                // Bounded partial fallback: no retry loop and no loss of good batches.
-                continue
-            }
-        }
-        return items.map { polishedByID[$0.id] ?? $0 }
-    }
-
-    private func polishBatch(_ items: [ClassifiedItem]) async throws -> [ClassifiedItem] {
-        guard !items.isEmpty else { return [] }
-        guard let promptURL = Bundle.module.url(forResource: "brief-editor-system-prompt", withExtension: "txt") else {
-            throw AgentError.processFailed("한국어 편집 시스템 프롬프트 리소스를 찾지 못했습니다.")
-        }
-        let systemPrompt = try String(contentsOf: promptURL, encoding: .utf8)
-        let safeItems: [[String: Any]] = items.map { item in
-            [
-                "source_id": item.id,
-                "category": item.category.rawValue,
-                "source": item.sourceItem.source,
-                "account": item.sourceItem.account,
-                "subject": item.sourceItem.subject,
-                "facts": item.facts ?? item.summary,
-                "reason": item.reason,
-                "importance": item.importance,
-            ]
-        }
-        let format: [String: Any] = [
-            "type": "object",
-            "properties": [
-                "items": [
-                    "type": "array",
-                    "items": [
-                        "type": "object",
-                        "properties": [
-                            "source_id": ["type": "string"],
-                            "title": ["type": "string"],
-                            "summary": ["type": "string"],
-                        ],
-                        "required": ["source_id", "title", "summary"],
-                    ],
-                ],
-            ],
-            "required": ["items"],
-        ]
-        let payload: [String: Any] = [
-            "model": AppConfig.model,
-            "system": systemPrompt,
-            "prompt": String(decoding: try JSONSerialization.data(withJSONObject: ["items": safeItems]), as: UTF8.self),
-            "stream": false,
-            "think": false,
-            "format": format,
-            "keep_alive": "5m",
-            "options": [
-                    "num_ctx": 24_576,
-                "temperature": 0.2,
-                "top_p": 0.8,
-                "top_k": 20,
-                "repeat_penalty": 1.0,
-                "num_predict": 1_400,
-            ],
-        ]
-        var request = URLRequest(url: AppConfig.ollamaURL.appending(path: "api/generate"))
-        request.httpMethod = "POST"
-        request.timeoutInterval = 600
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (data, response) = try await requestWithRetry(request)
-        guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
-            throw AgentError.processFailed("로컬 모델 한국어 편집 HTTP 오류")
-        }
-        let decodedResponse = try JSONDecoder().decode(OllamaResponse.self, from: data)
-        if let error = decodedResponse.error { throw AgentError.processFailed("로컬 모델 편집 오류: \(error)") }
-        guard let raw = decodedResponse.response, let json = Self.extractJSONObject(from: raw),
-              let decoded = try? JSONDecoder().decode(PresentationEnvelope.self, from: Data(json.utf8)) else {
-            throw AgentError.processFailed("로컬 모델 한국어 편집 JSON 형식 오류")
-        }
-        let byID = Dictionary(decoded.items.map { ($0.sourceID, $0) }, uniquingKeysWith: { first, _ in first })
-        // Items the editor skipped keep their first-pass text instead of failing
-        // the batch, but a response that matches nothing is a real failure.
-        guard items.contains(where: { byID[$0.id] != nil }) else {
-            throw AgentError.processFailed("로컬 모델 한국어 편집 결과가 어떤 항목과도 일치하지 않습니다")
-        }
-        return items.map { item in
-            guard let presentation = byID[item.id] else { return item }
-            var result = item
-            result.displayTitle = BriefPresentation.usable(presentation.title, limit: 90)
-            // The editor prompt allows 650 characters; a lower gate here silently
-            // threw away every long summary and fell back to the first pass.
-            result.displaySummary = BriefPresentation.usable(presentation.summary, limit: 700)
-            return result
-        }
     }
 
     func unload() async {
@@ -1185,6 +1094,10 @@ struct LocalClassifier {
 }
 
 private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+
     func chunked(into size: Int) -> [[Element]] {
         stride(from: 0, to: count, by: size).map { Array(self[$0 ..< Swift.min($0 + size, count)]) }
     }

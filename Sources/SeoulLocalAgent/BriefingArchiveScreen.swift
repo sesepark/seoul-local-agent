@@ -1,0 +1,511 @@
+import SwiftUI
+import AppKit
+
+/// 브리핑 보관함 — where the result of 자동 브리핑 now lives.
+///
+/// It used to live on a Notion page, which meant the app could produce a
+/// briefing it could not itself show, and the reader had to leave for a browser
+/// to find out what it said. The same three headings are here instead, with the
+/// checkbox doing real work: ticking an item off is what tells tomorrow's run it
+/// no longer needs carrying forward.
+struct BriefingArchiveView: View {
+    @ObservedObject var controller: AutomationController
+
+    private var model: BriefingArchiveModel { controller.briefingArchive }
+
+    var body: some View {
+        WorkspaceScreen(title: AppSection.archive.title, subtitle: AppSection.archive.subtitle) {
+            if model.days.isEmpty {
+                empty
+            } else {
+                dayBar
+                filterBar
+                ForEach(BriefingArchiveModel.Bucket.allCases) { bucket in
+                    section(bucket)
+                }
+                collectionFootnote
+            }
+            if let error = model.error {
+                DismissibleError(message: error) { model.error = nil }
+            }
+        }
+        .animation(.appContent, value: model.selectedDateKey)
+        .animation(.appContent, value: model.search)
+        .onAppear { model.reconcilePlacements() }
+        .sheet(item: Binding(get: { model.scheduling }, set: { model.scheduling = $0 })) { entry in
+            ScheduleSheet(entry: entry, model: model)
+        }
+        .toolbar { toolbar }
+    }
+
+    // MARK: - 툴바
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem {
+            Menu {
+                Button("Notion으로 내보내기", systemImage: "arrow.up.forward.square") {
+                    Task { await model.exportToNotion() }
+                }
+                .disabled(model.selectedDay == nil || model.isExporting)
+                if let url = model.notionURL {
+                    Button("내보낸 Notion 페이지 열기", systemImage: "safari") { NSWorkspace.shared.open(url) }
+                }
+                Divider()
+                Button("Mac 캘린더 열기", systemImage: "calendar") {
+                    NSWorkspace.shared.open(URL(string: "ical://")!)
+                }
+                Button("미리 알림 열기", systemImage: "checklist") {
+                    NSWorkspace.shared.open(URL(string: "x-apple-reminderkit://")!)
+                }
+            } label: {
+                Label("내보내기", systemImage: model.isExporting ? "arrow.up.circle" : "square.and.arrow.up")
+            }
+            .help("이 날의 브리핑을 Notion으로 보내거나, 캘린더 앱을 엽니다")
+        }
+        ToolbarItem {
+            Button("새로고침", systemImage: "arrow.clockwise") {
+                model.reload()
+                model.reconcilePlacements()
+            }
+            .help("저장된 브리핑과 캘린더 상태를 다시 읽습니다")
+        }
+        ToolbarSpacer(.flexible)
+        ToolbarItem {
+            if controller.isRunning {
+                Button("중지", systemImage: "stop.fill") { controller.stopBriefing() }
+                    .tint(.red)
+                    .help("모델을 안전하게 해제하고 멈춥니다 (⌘.)")
+            } else {
+                Button("인박스 정리 시작", systemImage: "tray.full.fill") { controller.startBriefing() }
+                    .buttonStyle(.glassProminent)
+                    .tint(.snuBlue)
+                    .help("지금 수집하고 정리해 이 보관함에 저장합니다 (⌘R)")
+            }
+        }
+    }
+
+    // MARK: - 본문
+
+    private var empty: some View {
+        VStack(spacing: Spacing.m) {
+            EmptyResults(
+                symbol: "checklist",
+                message: "아직 저장된 브리핑이 없습니다.\n인박스 정리를 한 번 돌리면 결과가 날짜별로 여기에 쌓입니다."
+            )
+            Button("인박스 정리 시작", systemImage: "tray.full.fill") { controller.startBriefing() }
+                .buttonStyle(.glassProminent)
+                .tint(.snuBlue)
+                .disabled(controller.isRunning)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, Spacing.l)
+        .glassPanel()
+    }
+
+    private var dayBar: some View {
+        HStack(spacing: Spacing.m) {
+            Button("이전 날", systemImage: "chevron.left") { model.step(1) }
+                .labelStyle(.iconOnly)
+                .disabled(!model.canStepBack)
+                .help("하루 전 브리핑")
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(BriefingArchiveModel.dayTitle(model.selectedDateKey))
+                    .font(.headline)
+                if let day = model.selectedDay {
+                    Text("정리한 시각 \(day.updatedAt.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button("다음 날", systemImage: "chevron.right") { model.step(-1) }
+                .labelStyle(.iconOnly)
+                .disabled(!model.canStepForward)
+                .help("하루 뒤 브리핑")
+
+            Spacer()
+
+            Label("남은 일 \(model.openActionCount)개", systemImage: "circle.badge.exclamationmark")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(model.openActionCount == 0 ? Color.secondary : Color.snuBlueLabel)
+
+            // Icon only: a picker showing the selected date would print the same
+            // string twice in one bar, three inches from the heading.
+            Menu {
+                ForEach(model.days, id: \.dateKey) { day in
+                    Button(BriefingArchiveModel.dayTitle(day.dateKey)) { model.selectedDateKey = day.dateKey }
+                }
+            } label: {
+                Label("날짜 고르기", systemImage: "calendar")
+            }
+            .labelStyle(.iconOnly)
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("보관된 날짜 중에서 하나를 고릅니다")
+        }
+        .padding(.horizontal, Spacing.l)
+        .padding(.vertical, Spacing.m)
+        .glassPanel(Radius.card)
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: Spacing.m) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("보관된 모든 날에서 검색", text: Binding(get: { model.search }, set: { model.search = $0 }))
+                .textFieldStyle(.plain)
+            if model.isSearching {
+                Button("지우기", systemImage: "xmark.circle.fill") { model.search = "" }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+            }
+            Divider().frame(height: 16)
+            Toggle("끝낸 항목 숨기기", isOn: Binding(get: { model.hidesDone }, set: { model.hidesDone = $0 }))
+                .toggleStyle(.checkbox)
+                .font(.callout)
+            if !model.status.isEmpty {
+                Text(model.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .transition(.appBanner)
+            }
+        }
+        .padding(.horizontal, Spacing.l)
+        .padding(.vertical, Spacing.s)
+        .glassPanel(Radius.card)
+        .animation(.appControl, value: model.status)
+    }
+
+    @ViewBuilder
+    private func section(_ bucket: BriefingArchiveModel.Bucket) -> some View {
+        let entries = model.entries(bucket)
+        // 기타 is the tray of things the pipeline set aside; showing an empty
+        // heading for it every day would be three lines of nothing.
+        if !entries.isEmpty || bucket != .other {
+            GroupBox {
+                if entries.isEmpty {
+                    Text(model.isSearching ? "검색과 일치하는 항목이 없습니다." : bucket.emptyText)
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, Spacing.s)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                            if index > 0 { Divider() }
+                            BriefingEntryRow(entry: entry, model: model, showsDate: model.isSearching)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: Spacing.s) {
+                    Label(bucket.rawValue, systemImage: bucket.symbol).font(.headline)
+                    Text("\(entries.count)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var collectionFootnote: some View {
+        if let day = model.selectedDay {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                if let range = day.collectionRange {
+                    Text("수집 범위 · \(range)")
+                }
+                let counts = day.sourceCounts.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)개" }
+                if !counts.isEmpty { Text("소스별 · \(counts.joined(separator: ", "))") }
+                if let expired = day.expiredCarryOverCount, expired > 0 {
+                    Text("마감이 지나 이월하지 않은 항목 \(expired)개")
+                }
+                ForEach(day.failures, id: \.self) { failure in
+                    Label(failure, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+// MARK: - 항목 한 줄
+
+private struct BriefingEntryRow: View {
+    let entry: BriefingArchiveModel.Entry
+    @ObservedObject var model: BriefingArchiveModel
+    let showsDate: Bool
+
+    @State private var note = ""
+    @FocusState private var noteFocused: Bool
+
+    private var isExpanded: Bool { model.isExpanded(entry) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            header
+            if isExpanded { detail.transition(.appCard) }
+        }
+        .padding(.vertical, Spacing.s)
+        .animation(.appControl, value: isExpanded)
+        .animation(.appControl, value: entry.mark.isDone)
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+            Button {
+                model.toggleDone(entry)
+            } label: {
+                Image(systemName: entry.mark.isDone ? "checkmark.circle.fill" : "circle")
+                    .font(.body)
+                    .foregroundStyle(entry.mark.isDone ? Color.green : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(entry.mark.isDone ? "아직 안 끝났다고 표시합니다" : "끝냈다고 표시합니다. 내일 브리핑으로 이월되지 않습니다")
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.title)
+                    .font(.body.weight(.medium))
+                    .strikethrough(entry.mark.isDone, color: .secondary)
+                    .foregroundStyle(entry.mark.isDone ? .secondary : .primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                badges
+            }
+
+            Spacer(minLength: Spacing.s)
+
+            Button {
+                model.toggleExpanded(entry)
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
+            .buttonStyle(.plain)
+            .help(isExpanded ? "접기" : "자세히 보기")
+        }
+        .contentShape(.rect)
+        .onTapGesture { model.toggleExpanded(entry) }
+    }
+
+    private var badges: some View {
+        HStack(spacing: Spacing.s) {
+            Badge(text: entry.source, symbol: sourceSymbol)
+            if showsDate {
+                Badge(text: BriefingArchiveModel.dayTitle(entry.dateKey), symbol: "calendar.day.timeline.left")
+            }
+            if let deadline = entry.deadlineText {
+                Badge(text: "마감 \(deadline)", symbol: "clock", tint: .orange)
+            }
+            if let placement = entry.placement {
+                Badge(
+                    text: placement.isReminder ? "미리 알림에 있음" : "캘린더에 있음",
+                    symbol: placement.isReminder ? "checklist" : "calendar.badge.checkmark",
+                    tint: .green
+                )
+            }
+            if !model.note(for: entry).isEmpty {
+                Badge(text: "메모", symbol: "text.bubble")
+            }
+        }
+    }
+
+    private var sourceSymbol: String {
+        switch entry.source {
+        case SourceName.gmail: "envelope"
+        case SourceName.slack: "number"
+        case SourceName.messages: "message"
+        case SourceName.calendar: "calendar"
+        case SourceName.web: "globe"
+        default: "tray"
+        }
+    }
+
+    private var detail: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            field("맥락", entry.summary)
+            if let action = entry.nextAction { field("요청", action) }
+            field("발신", "\(entry.source) · \(entry.author.isEmpty ? "발신자 미상" : entry.author)")
+            field("도착", entry.receivedText)
+            if let deadline = entry.deadlineText { field("마감", deadline) }
+            if let placement = entry.placement {
+                field("캘린더", placement.date.formatted(date: .abbreviated, time: placement.isReminder ? .omitted : .shortened))
+            }
+
+            HStack(spacing: Spacing.s) {
+                Text("메모").font(.caption.weight(.semibold)).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
+                TextField("나중에 나에게 남길 한 줄", text: $note)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($noteFocused)
+                    .onSubmit { model.setNote(note, for: entry) }
+            }
+
+            HStack(spacing: Spacing.s) {
+                Button("원문 열기", systemImage: "arrow.up.forward.app") { NSWorkspace.shared.open(entry.link) }
+                    .buttonStyle(.bordered)
+                    .help(entry.link.absoluteString)
+
+                if entry.placement == nil {
+                    Button("캘린더에 추가", systemImage: "calendar.badge.plus") {
+                        Task { await model.schedule(entry) }
+                    }
+                    .buttonStyle(.bordered)
+                    .help(scheduleHelp)
+
+                    Menu {
+                        Button("날짜 정해서 일정 추가…", systemImage: "calendar") { model.ask(entry, asReminder: false) }
+                        Button("미리 알림으로 보내기…", systemImage: "checklist") { model.ask(entry, asReminder: true) }
+                    } label: {
+                        Label("다른 방식", systemImage: "ellipsis")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                } else {
+                    Button("캘린더에서 지우기", systemImage: "calendar.badge.minus") { model.unschedule(entry) }
+                        .buttonStyle(.bordered)
+                        .help("\(AgentCalendar.title) 캘린더에서 이 항목을 지웁니다")
+                }
+
+                Spacer()
+            }
+        }
+        .padding(.leading, 24)
+        .onAppear { note = model.note(for: entry) }
+        .onChange(of: noteFocused) { _, focused in
+            if !focused { model.setNote(note, for: entry) }
+        }
+        // Collapsing the row tears the field down without ever moving focus, so
+        // without this a note typed and then collapsed would be thrown away.
+        // Safe here because these rows are in a plain `VStack`, not a lazy one:
+        // scrolling past a row does not destroy it.
+        .onDisappear { model.setNote(note, for: entry) }
+    }
+
+    private var scheduleHelp: String {
+        guard let parsed = entry.suggestedDate(), parsed.isConfident else {
+            return "마감이 분명하지 않아 날짜를 확인하는 창이 열립니다"
+        }
+        let when = parsed.includesTime
+            ? parsed.date.formatted(date: .abbreviated, time: .shortened)
+            : parsed.date.formatted(date: .abbreviated, time: .omitted)
+        return "\(when)로 \(AgentCalendar.title) 캘린더에 바로 넣습니다"
+    }
+
+    @ViewBuilder
+    private func field(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .leading)
+            Text(value)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+}
+
+private struct Badge: View {
+    let text: String
+    let symbol: String
+    var tint: Color = .secondary
+
+    var body: some View {
+        Label(text, systemImage: symbol)
+            .font(.caption2)
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(tint.opacity(0.12), in: Capsule())
+    }
+}
+
+// MARK: - 날짜 확인 창
+
+/// Shown when the deadline was written in a way that could mean more than one
+/// day — or was not written at all. Pre-filled with the best reading of it, so
+/// confirming is one click and correcting is two.
+private struct ScheduleSheet: View {
+    let entry: BriefingArchiveModel.Entry
+    @ObservedObject var model: BriefingArchiveModel
+
+    @State private var date = Date()
+    @State private var includesTime = true
+    @State private var asReminder = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.l) {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                Text("캘린더에 추가").font(.headline)
+                Text(entry.title)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let raw = entry.deadlineText {
+                Label("원문의 마감 표기: \(raw)", systemImage: "text.quote")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Picker("보낼 곳", selection: $asReminder) {
+                Text("캘린더 일정").tag(false)
+                Text("미리 알림").tag(true)
+            }
+            .pickerStyle(.segmented)
+
+            DatePicker(
+                "날짜",
+                selection: $date,
+                displayedComponents: includesTime ? [.date, .hourAndMinute] : [.date]
+            )
+            .datePickerStyle(.compact)
+
+            Toggle("시각도 정하기", isOn: $includesTime)
+                .help("끄면 하루 종일 일정으로 들어갑니다")
+
+            Label("\(AgentCalendar.title) 캘린더에만 씁니다. 원래 쓰던 캘린더는 건드리지 않습니다.", systemImage: "lock.shield")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("취소") { model.scheduling = nil }
+                Button("추가") {
+                    Task { await model.place(entry, at: date, includesTime: includesTime, asReminder: asReminder) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.snuBlue)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(Spacing.xl)
+        .frame(width: 420)
+        .onAppear {
+            asReminder = model.schedulingPrefersReminder
+            guard let parsed = entry.suggestedDate() else {
+                // Nothing readable in the deadline: tomorrow morning is a better
+                // starting point than "now", which is already in the past by the
+                // time anyone clicks.
+                date = KoreanDeadline.calendar.date(bySettingHour: 9, minute: 0, second: 0, of: Date().addingTimeInterval(86_400)) ?? Date()
+                return
+            }
+            date = parsed.date
+            includesTime = parsed.includesTime
+        }
+    }
+}

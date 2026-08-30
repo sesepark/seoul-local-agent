@@ -159,8 +159,17 @@ struct SeoulLocalAgentTests {
 
     @Test("Organizer chunks long transcripts without dropping content")
     func organizerChunking() {
-        let segments = (0..<12).map {
-            TranscriptSegment(id: "s\($0)", start: Double($0 * 10), end: Double($0 * 10 + 9), speaker: "SPEAKER_00", text: String(repeating: "가", count: 80))
+        // Written out rather than inferred: as one chained expression the type
+        // checker times out on this line.
+        let segments: [TranscriptSegment] = (0..<12).map { (index: Int) -> TranscriptSegment in
+            let start = Double(index) * 10
+            return TranscriptSegment(
+                id: "s\(index)",
+                start: start,
+                end: start + 9,
+                speaker: "SPEAKER_00",
+                text: String(repeating: "가", count: 80)
+            )
         }
         let joinedText = segments.map { $0.text }.joined()
         let run = TranscriptRun(
@@ -612,7 +621,7 @@ struct SeoulLocalAgentTests {
         #expect(BriefPresentation.deadlineText("이번 주 금요일") == "이번 주 금요일")
     }
 
-    @Test("Carry-forward matches the to_do text the report actually wrote")
+    @Test("Carry-forward keeps every unfinished action and drops expired ones")
     func carryForwardTitleMatching() {
         let source = item(id: "gmail:deadline", body: "제출 요청 본문입니다.")
         var withDeadline = ClassifiedItem(sourceItem: source, facts: "f", category: .action, summary: "s", reason: "r", importance: 5, nextAction: "", deadline: "2026-09-09T18:00:00+09:00")
@@ -663,12 +672,10 @@ struct SeoulLocalAgentTests {
         let past = action("gmail:past", title: "지난 마감", deadline: "2020-01-01T18:00:00+09:00")
         let done = action("gmail:done", title: "이미 완료", deadline: "")
 
-        let unchecked: Set<String> = [
-            BriefPresentation.todoTitle(for: open),
-            BriefPresentation.todoTitle(for: future),
-            BriefPresentation.todoTitle(for: past),
-        ]
-        let outcome = CarryForwardPolicy.evaluate(previousItems: [open, future, past, done], uncheckedTitles: unchecked, now: now)
+        // Only what the reader ticked off in 브리핑 보관함 is finished; the rest
+        // is still outstanding whether or not it ever appeared on a page.
+        let completed: Set<String> = [done.trackingID]
+        let outcome = CarryForwardPolicy.evaluate(previousItems: [open, future, past, done], completedIDs: completed, now: now)
         #expect(outcome.carried.map(\.id) == ["gmail:open", "gmail:future"])
         #expect(outcome.expired.map(\.id) == ["gmail:past"])
     }
@@ -686,8 +693,9 @@ struct SeoulLocalAgentTests {
         }
         let upcoming = event("calendar:soon", at: 86_400)
         let finished = event("calendar:done", at: -86_400)
-        // Calendar entries have no checkbox, so an empty unchecked set must not hide them.
-        let outcome = CarryForwardPolicy.evaluate(previousItems: [upcoming, finished], uncheckedTitles: [], now: now)
+        // Calendar entries are never ticked off by hand, so an empty completed
+        // set must not hide them.
+        let outcome = CarryForwardPolicy.evaluate(previousItems: [upcoming, finished], completedIDs: [], now: now)
         #expect(outcome.carried.map(\.id) == ["calendar:soon"])
         #expect(outcome.expired.isEmpty)
     }
@@ -739,11 +747,9 @@ struct SeoulLocalAgentTests {
 
         defaults.set(BriefingQualityMode.thorough.rawValue, forKey: "briefingQualityMode")
         let thoroughClassification = AppConfig.classificationBatchSize
-        let thoroughPresentation = AppConfig.presentationBatchSize
 
         defaults.set(BriefingQualityMode.balanced.rawValue, forKey: "briefingQualityMode")
         #expect(AppConfig.classificationBatchSize < thoroughClassification)
-        #expect(AppConfig.presentationBatchSize < thoroughPresentation)
     }
 }
 

@@ -89,30 +89,6 @@ struct NotionWriter {
         return nil
     }
 
-    func unfinishedActionTitles(from dateKey: String) async throws -> Set<String> {
-        guard NotionParentPolicy.allowsWrite(parentID: AppConfig.notionParentID) else { throw AgentError.invalidNotionParent }
-        guard let pageID = try await findChildPage(named: dateKey) else { return [] }
-        var cursor: String?
-        var titles = Set<String>()
-        repeat {
-            var arguments = ["api", "v1/blocks/\(pageID)/children"]
-            if let cursor { arguments += ["start_cursor=\(cursor)"] }
-            let data = try await runner.run("/opt/homebrew/bin/ntn", arguments)
-            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw AgentError.processFailed("Notion todo 응답 형식이 올바르지 않습니다.")
-            }
-            let results = root["results"] as? [[String: Any]] ?? []
-            for block in results where block["type"] as? String == "to_do" {
-                guard let todo = block["to_do"] as? [String: Any], todo["checked"] as? Bool == false else { continue }
-                let richText = todo["rich_text"] as? [[String: Any]] ?? []
-                let title = richText.compactMap { $0["plain_text"] as? String }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
-                if !title.isEmpty { titles.insert(title) }
-            }
-            cursor = (root["has_more"] as? Bool) == true ? root["next_cursor"] as? String : nil
-        } while cursor != nil
-        return titles
-    }
-
     private func render(_ briefing: DailyBriefing) -> String {
         let visible = BriefingQualityGate.normalized(briefing.items)
         let actions = visible.filter { $0.category == .action }.sorted { $0.importance > $1.importance }
@@ -166,9 +142,22 @@ struct BriefingService {
     private let classifier = LocalClassifier()
     private let writer = NotionWriter()
     private let store = StateStore()
+    private let archiveStore = BriefingArchiveStore()
     private let preferenceStore = BriefingPreferencesStore()
 
     func markdownPreview(_ briefing: DailyBriefing) -> String { writer.preview(briefing) }
+
+    /// Notion is an export now, not a step of the run. Nothing calls this unless
+    /// the reader presses the button, and the parent-page allowlist inside
+    /// `NotionWriter` still applies.
+    func exportToNotion(_ briefing: DailyBriefing) async throws -> URL {
+        let url = try await writer.write(briefing)
+        var state = store.load()
+        state.dailyBriefings[briefing.dateKey]?.notionURL = url
+        state.lastNotionURL = url
+        try store.save(state)
+        return url
+    }
 
     private struct SourceCollection {
         let checkpointKey: String
@@ -197,10 +186,21 @@ struct BriefingService {
 
     /// `pendingItemCount` is reported once, when the set of items that will be sent
     /// to the model is known, so the UI never has to parse it back out of prose.
-    func run(range: CollectionRange, writeToNotion: Bool = true, progress: @escaping @Sendable (RunPhase, String, Int?) async -> Void) async throws -> DailyBriefing {
+    ///
+    /// `persists` is the only remaining dry-run switch. It used to be
+    /// `writeToNotion`, which conflated three separate things — writing to
+    /// Notion, saving local state, and reusing the day's earlier work — so a
+    /// shadow run silently re-analysed everything. Notion is no longer part of
+    /// a run at all; it is an export the reader asks for from the 보관함.
+    func run(range: CollectionRange, persists: Bool = true, progress: @escaping @Sendable (RunPhase, String, Int?) async -> Void) async throws -> DailyBriefing {
         let state = store.load()
         let now = Date()
-        let initial = Calendar.current.date(byAdding: .day, value: -7, to: now)!
+        // No checkpoint yet means the last run was a manual re-review, which still
+        // read everything up to the moment it finished. Start from that instead of
+        // a blind seven days, but never reach back further than thirty days: a
+        // months-old success would otherwise pull an unbounded first window.
+        let floor = Calendar.current.date(byAdding: .day, value: -30, to: now)!
+        let initial = max(state.lastSuccessAt ?? Calendar.current.date(byAdding: .day, value: -7, to: now)!, floor)
         let manualSince = range.days.flatMap { Calendar.current.date(byAdding: .day, value: -$0, to: now) }
         let gmailSince = manualSince ?? state.checkpoints["gmail"] ?? initial
         let slackSince = manualSince ?? state.checkpoints["slack"] ?? initial
@@ -211,16 +211,22 @@ struct BriefingService {
             • Slack: 접근 가능한 채널·DM의 새 메시지 검색
             • 메시지: iMessage·SMS·RCS 수신 메시지 검색
             • 캘린더: 앞으로 14일 일정 읽기
+            • 웹 공지: 등록한 학교 공지 게시판의 새 글 확인
             """, nil)
             let iMessageSince = manualSince ?? state.checkpoints["imessage"] ?? initial
             async let gmailResult = collectSafely(checkpointKey: "gmail", sourceName: "Gmail") { try await gmail.collect(since: gmailSince) }
             async let slackResult = collectSafely(checkpointKey: "slack", sourceName: "Slack") { try await slack.collect(since: slackSince) }
             async let iMessageResult = collectSafely(checkpointKey: "imessage", sourceName: "메시지") { SourceHarvest(items: try await iMessage.collect(since: iMessageSince)) }
+            // Public pages only, so this one needs no checkpoint: a post is new when
+            // its URL has not been seen before, which the source tracks itself.
+            async let webResult = collectSafely(checkpointKey: "web", sourceName: "웹 공지") {
+                await WebNoticeSource().collect()
+            }
             let calendarEnd = Calendar.current.date(byAdding: .day, value: 14, to: now)!
             async let calendarResult = collectSafely(checkpointKey: "calendar", sourceName: "캘린더") {
                 SourceHarvest(items: try calendar.collect(upcomingFrom: Calendar.current.startOfDay(for: now), through: calendarEnd))
             }
-            let collections = await [gmailResult, slackResult, iMessageResult, calendarResult]
+            let collections = await [gmailResult, slackResult, iMessageResult, calendarResult, webResult]
             let collected = collections.flatMap(\.items)
             try Task.checkCancellation()
             let preferences = preferenceStore.load()
@@ -228,7 +234,7 @@ struct BriefingService {
             let deduped = SourceDeduplicator.unique(preferenceResult.included)
             let grouped = IncidentGrouper.group(deduped)
             if deduped.isEmpty, collections.contains(where: { $0.errorMessage != nil }) {
-                throw AgentError.processFailed("모든 수집 소스가 실패하거나 읽을 새 항목이 없습니다. Notion에 빈 브리핑을 작성하지 않았습니다.")
+                throw AgentError.processFailed("모든 수집 소스가 실패하거나 읽을 새 항목이 없습니다. 빈 브리핑을 저장하지 않았습니다.")
             }
             let collectionSummary = collections.map { collection in
                 if let error = collection.errorMessage { return "• \(error)" }
@@ -241,27 +247,25 @@ struct BriefingService {
             let dateKey = Self.dateKey(now)
             var carried: [ClassifiedItem] = []
             var expiredCarryOverCount = 0
-            var carryForwardFailures: [String] = []
             if let previous = state.dailyBriefings.values
                 .filter({ $0.dateKey != dateKey && $0.updatedAt < now })
                 .sorted(by: { $0.updatedAt > $1.updatedAt })
                 .first {
                 await progress(.collecting, "1/4 · 이전 브리핑에서 아직 끝나지 않은 항목을 확인하고 있습니다.", nil)
-                do {
-                    // Without a Notion read there is no completion signal, so a dry run
-                    // carries only entries that expire on their own, such as calendar events.
-                    let unchecked = writeToNotion ? try await writer.unfinishedActionTitles(from: previous.dateKey) : []
-                    let outcome = CarryForwardPolicy.evaluate(previousItems: previous.items, uncheckedTitles: unchecked, now: now)
-                    carried = outcome.carried
-                    expiredCarryOverCount = outcome.expired.count
-                } catch {
-                    carryForwardFailures.append("이전 항목 이월 확인: \(error.localizedDescription)")
-                }
+                // Read from disk, not over the network: what is finished is what
+                // the reader ticked off in 브리핑 보관함.
+                let outcome = CarryForwardPolicy.evaluate(
+                    previousItems: previous.items,
+                    completedIDs: archiveStore.load().completedIDs,
+                    now: now
+                )
+                carried = outcome.carried
+                expiredCarryOverCount = outcome.expired.count
             }
             try Task.checkCancellation()
             // A second run on the same day must not re-analyse what the first run
             // already classified, only what is new or has changed since.
-            let sameDayItems = writeToNotion ? (state.dailyBriefings[dateKey]?.items ?? []) : []
+            let sameDayItems = state.dailyBriefings[dateKey]?.items ?? []
             let unchanged = CarryForwardPolicy.unchangedItems(in: grouped, alreadyCarried: carried + sameDayItems)
             let pending = grouped.filter { !unchanged.contains($0.id) }
             await progress(.collecting, """
@@ -279,7 +283,7 @@ struct BriefingService {
             for source in orderedSources where sourceGroups[source]?.isEmpty == false {
                 try Task.checkCancellation()
                 let items = sourceGroups[source] ?? []
-                await progress(.classifying, "2/4 · \(source) \(items.count)개를 별도 기준으로 분류하고 있습니다.", nil)
+                await progress(.classifying, "2/4 · \(source) \(items.count)개를 분류하고 한국어 브리핑 문장까지 한 번에 만들고 있습니다.", nil)
                 do {
                     var sourceClassified = try await classifier.classify(items, userInstructions: preferences.userInstructions)
                     sourceClassified = sourceClassified.map { item in
@@ -292,13 +296,6 @@ struct BriefingService {
                         var stamped = item
                         stamped.contentFingerprint = SourceFingerprint.of(item.sourceItem)
                         return stamped
-                    }
-                    await progress(.classifying, "2/4 · \(source) 결과를 한국어 브리핑으로 한 번만 편집하고 있습니다.", nil)
-                    do {
-                        sourceClassified = try await classifier.polish(sourceClassified)
-                    } catch {
-                        // A presentation miss is non-fatal and has no retry.
-                        analysisFailures.append("\(source) 한국어 편집: 기본 문구 사용")
                     }
                     classified += BriefingQualityGate.normalized(sourceClassified)
                 } catch {
@@ -313,8 +310,8 @@ struct BriefingService {
             // A freshly analysed item wins over the carried copy of the same thing.
             classified = Array(Dictionary(grouping: classified + carried, by: { $0.trackingID }).compactMap { $0.value.first })
             try Task.checkCancellation()
-            await progress(.writing, "3/4 · 허용된 Daily Report 위치에 결과를 작성하고 있습니다.", nil)
-            var daily = (writeToNotion ? state.dailyBriefings[dateKey] : nil) ?? DailyBriefing(dateKey: dateKey, items: [], sourceCounts: [:], failures: [], notionURL: nil, updatedAt: now)
+            await progress(.writing, "3/4 · 정리한 결과를 브리핑 보관함에 저장하고 있습니다.", nil)
+            var daily = state.dailyBriefings[dateKey] ?? DailyBriefing(dateKey: dateKey, items: [], sourceCounts: [:], failures: [], notionURL: nil, updatedAt: now)
             // A manual re-review must improve an earlier same-day draft rather
             // than preserve its old, lower-quality classification.
             daily.items = Array(Dictionary(grouping: classified + daily.items, by: \.trackingID).compactMap { $0.value.first })
@@ -326,24 +323,25 @@ struct BriefingService {
             let effectiveSince = min(gmailSince, slackSince, iMessageSince)
             daily.collectionRange = "\(range.rawValue) · \(effectiveSince.formatted(date: .abbreviated, time: .shortened)) 이후"
             daily.expiredCarryOverCount = expiredCarryOverCount
-            daily.failures = collections.compactMap(\.errorMessage) + collections.flatMap(\.warnings) + analysisFailures + carryForwardFailures
-            if !writeToNotion {
+            daily.failures = collections.compactMap(\.errorMessage) + collections.flatMap(\.warnings) + analysisFailures
+            if !persists {
                 await classifier.unload()
                 return daily
             }
-            daily.notionURL = try await writer.write(daily)
             var nextState = state
             nextState.dailyBriefings[dateKey] = daily
-            if range == .sinceLastSuccess {
-                for collection in collections where collection.isComplete {
-                    nextState.checkpoints[collection.checkpointKey] = now
-                }
+            // Recorded for every range, not only the incremental one. A manual
+            // "최근 3일 재검토" also read that source cleanly up to now, so the next
+            // incremental run should resume from here; skipping it was what left
+            // the checkpoints permanently empty and every run re-reading the same
+            // window. A source that only partly succeeded still does not advance.
+            for collection in collections where collection.isComplete {
+                nextState.checkpoints[collection.checkpointKey] = max(nextState.checkpoints[collection.checkpointKey] ?? now, now)
             }
-            nextState.lastNotionURL = daily.notionURL
             nextState.lastSuccessAt = now
             nextState.lastError = nil
             try store.save(nextState)
-            await progress(.writing, "4/4 · Notion 작성 완료. 로컬 모델 메모리를 해제하고 있습니다.", nil)
+            await progress(.writing, "4/4 · 보관함에 저장했습니다. 로컬 모델 메모리를 해제하고 있습니다.", nil)
             await classifier.unload()
             return daily
         } catch is CancellationError {

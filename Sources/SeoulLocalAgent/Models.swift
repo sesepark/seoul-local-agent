@@ -1,3 +1,4 @@
+import SwiftUI
 import Foundation
 
 enum BriefCategory: String, Codable, CaseIterable {
@@ -17,8 +18,12 @@ struct SourceItem: Codable, Hashable, Identifiable {
     /// Stable across reruns for a conversation/incident. Older state files do
     /// not contain it, so all consumers must fall back to `id`.
     var stableID: String?
+    /// Who the item was addressed to, when that changes what counts as relevant.
+    /// A notice from another college's board is written for that college, so only
+    /// something this user could personally apply to is worth reporting.
+    var audience: String?
 
-    init(id: String, source: String, account: String, author: String, timestamp: Date, subject: String, body: String, link: URL, stableID: String? = nil) {
+    init(id: String, source: String, account: String, author: String, timestamp: Date, subject: String, body: String, link: URL, stableID: String? = nil, audience: String? = nil) {
         self.id = id
         self.source = source
         self.account = account
@@ -28,6 +33,7 @@ struct SourceItem: Codable, Hashable, Identifiable {
         self.body = body
         self.link = link
         self.stableID = stableID
+        self.audience = audience
     }
 }
 
@@ -75,7 +81,8 @@ enum SourceName {
     static let slack = "Slack"
     static let messages = "메시지"
     static let calendar = "캘린더"
-    static let ordered = [gmail, slack, messages, calendar]
+    static let web = "웹 공지"
+    static let ordered = [gmail, slack, messages, calendar, web]
 }
 
 struct PersistentState: Codable {
@@ -107,7 +114,7 @@ extension DailyBriefing {
             let redacted = SourceItem(
                 id: source.id, source: source.source, account: source.account, author: source.author,
                 timestamp: source.timestamp, subject: source.subject, body: "", link: source.link,
-                stableID: source.stableID
+                stableID: source.stableID, audience: source.audience
             )
             return ClassifiedItem(
                 sourceItem: redacted, facts: item.facts, category: item.category, summary: item.summary,
@@ -158,13 +165,14 @@ enum BriefingQualityMode: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
     var title: String { self == .thorough ? "정밀 · 권장" : "균형" }
-    /// Measured on the local 27B model: roughly 12 seconds per item for the fact
-    /// pass and a second pass for the Korean edit, so a 100-item window is tens of
-    /// minutes rather than the few minutes the old text implied.
+    /// Measured on the local MoE model after the classification and the Korean
+    /// report text were merged into one call: 3.6 to 6.0 seconds per item for 정밀
+    /// depending on what else the machine is doing, so a 100-item window is minutes
+    /// rather than the tens of minutes the dense 27B model and its second pass needed.
     var explanation: String {
         self == .thorough
-            ? "사실 추출 6건·한국어 편집 4건 배치로 처리합니다. 항목 100건 기준 대략 30~50분 걸립니다."
-            : "같은 품질 검사를 3건·2건의 짧은 배치로 처리합니다. 한 번의 요청이 짧아 실패 시 손실이 적습니다."
+            ? "한 요청에 6건씩 묶어 분류와 한국어 브리핑 문장을 한 번에 만듭니다. 항목 100건 기준 대략 10분 걸립니다."
+            : "같은 품질 검사를 3건씩의 짧은 배치로 처리합니다. 한 번의 요청이 짧아 실패 시 손실이 적습니다."
     }
 }
 
@@ -275,27 +283,141 @@ enum DocumentRecognitionMode: String, CaseIterable, Identifiable, Sendable {
     var producesMarkdown: Bool { self == .precise }
 }
 
+/// The sidebar. Settings deliberately is *not* a case: macOS puts settings in a
+/// ⌘, window, and keeping it here as a peer made the list read as a flat pile of
+/// unrelated things.
+///
+/// Declaration order *is* sidebar order, which is also what `⌘1`…`⌘0` follow, so
+/// a case moved here moves on screen and under the user's fingers together.
 enum AppSection: String, CaseIterable, Identifiable {
-    case overview, transcription, documents, cutout, briefing, settings
+    case overview
+    case documents, scan, pdf
+    case transcription, audioCleanup, cutout, upscale
+    case compression, convert
+    case briefing, archive
+
     var id: String { rawValue }
+
+    /// The name in the sidebar *and* in the window title bar. Screens used to
+    /// re-state a slightly different title inside their own content — the
+    /// sidebar said 녹음·전사 while the screen said 녹음 전사 — so there is now
+    /// exactly one string per screen.
     var title: String {
         switch self {
         case .overview: "개요"
-        case .transcription: "녹음·전사"
         case .documents: "문서 인식"
+        case .scan: "스캔 보정"
+        case .pdf: "PDF 편집"
+        case .transcription: "녹음·전사"
+        case .audioCleanup: "소리 다듬기"
         case .cutout: "누끼 따기"
+        case .upscale: "화질 올리기"
+        case .compression: "용량 줄이기"
+        case .convert: "형식 변환"
         case .briefing: "자동 브리핑"
-        case .settings: "설정"
+        case .archive: "브리핑 보관함"
         }
     }
+
+    var subtitle: String {
+        switch self {
+        case .overview: "이 Mac에서 도는 것들의 현재 상태입니다. 아래에서 바로 이어서 할 수 있습니다."
+        case .documents: "강의 슬라이드 사진, 스캔한 유인물 PDF, 화면의 일부를 텍스트로 바꿉니다. 어느 쪽을 고르든 이미지가 이 Mac을 벗어나지 않습니다."
+        case .scan: "비스듬히 찍은 유인물 사진을 반듯하게 펴고 그늘을 지워 스캔한 것처럼 만듭니다. 여러 장을 한 PDF로 묶을 수 있습니다."
+        case .pdf: "PDF를 합치고 나누고 쪽을 정리합니다. 암호를 걸거나 풀고, 서명 이미지와 워터마크를 얹습니다."
+        case .transcription: "앱에서 바로 녹음하거나 파일을 드롭해 한국어 전사를 만듭니다. 여러 전사와 AI 자동요약은 대기열에 추가한 순서대로 하나씩 처리됩니다."
+        case .audioCleanup: "강의·회의 녹음에서 에어컨 소리와 웅성거림을 걷어내고 음량을 고르게 맞춥니다. 영상을 넣으면 소리만 꺼내 다듬습니다."
+        case .cutout: "사진을 드롭하면 배경을 지운 투명 PNG를 만듭니다. 모델은 이 Mac에서만 실행되고 사진은 기기를 벗어나지 않습니다."
+        case .upscale: "작거나 흐린 사진을 크고 또렷하게 만듭니다. 뒷자리에서 찍은 슬라이드나 저해상도 스캔에 씁니다."
+        case .compression: "사진·PDF·영상의 용량을 이 Mac에서 줄입니다. 파일은 기기를 벗어나지 않고 원본도 그대로 남습니다."
+        case .convert: "사진·오디오·영상·문서를 다른 형식으로 바꿉니다. 필요한 것은 전부 이 Mac 안에서 처리합니다."
+        case .briefing: "메일·메시지·웹 공지를 모아 이 Mac의 모델로 정리합니다. 수집부터 저장까지의 상태를 여기서 봅니다."
+        case .archive: "정리된 결과가 날짜별로 쌓입니다. 끝낸 일을 체크하고, 남은 일은 Mac 캘린더나 미리 알림으로 바로 넘깁니다."
+        }
+    }
+
+    /// A few words for the launcher grid on 개요, where the full subtitle would
+    /// not fit and nine tools is more than anyone remembers by name alone.
+    var hint: String {
+        switch self {
+        case .overview: "지금 상태와 이어서 할 일"
+        case .documents: "사진·PDF에서 글자 뽑기"
+        case .scan: "찍은 유인물을 반듯한 스캔으로"
+        case .pdf: "합치기·나누기·서명·암호"
+        case .transcription: "녹음하고 한국어로 받아쓰기"
+        case .audioCleanup: "잡음 빼고 음량 고르게"
+        case .cutout: "배경 지운 투명 PNG"
+        case .upscale: "작고 흐린 사진을 크게"
+        case .compression: "사진·PDF·영상 용량 줄이기"
+        case .convert: "다른 형식으로 바꾸기"
+        case .briefing: "메일·공지 모아 정리하기"
+        case .archive: "정리된 할 일과 캘린더 연동"
+        }
+    }
+
     var symbol: String {
         switch self {
         case .overview: "square.grid.2x2"
-        case .transcription: "waveform"
         case .documents: "text.viewfinder"
+        case .scan: "doc.viewfinder"
+        case .pdf: "doc.on.doc"
+        case .transcription: "waveform"
+        case .audioCleanup: "waveform.path.badge.minus"
         case .cutout: "person.and.background.dotted"
+        // Deliberately the mirror image of 용량 줄이기: the two tools do opposite
+        // things and the sidebar should say so before the label is read.
+        case .upscale: "arrow.up.left.and.arrow.down.right"
+        case .compression: "arrow.down.right.and.arrow.up.left"
+        case .convert: "arrow.triangle.2.circlepath"
         case .briefing: "tray.full"
-        case .settings: "gearshape"
+        case .archive: "checklist"
+        }
+    }
+
+    /// ⌘1…⌘9 then ⌘0, in sidebar order. The screens past the number row take a
+    /// letter instead — the same answer Apple's own apps reach when a sidebar
+    /// outgrows ten rows. 자동 브리핑 and its 보관함 are one subject with two
+    /// screens, so they share ⌘B and ⇧⌘B rather than taking unrelated letters.
+    var shortcut: KeyEquivalent {
+        switch self {
+        case .overview: "1"
+        case .documents: "2"
+        case .scan: "3"
+        case .pdf: "4"
+        case .transcription: "5"
+        case .audioCleanup: "6"
+        case .cutout: "7"
+        case .upscale: "8"
+        case .compression: "9"
+        case .convert: "0"
+        case .briefing, .archive: "b"
+        }
+    }
+
+    var shortcutModifiers: EventModifiers {
+        self == .archive ? [.command, .shift] : .command
+    }
+
+    /// Which heading the row sits under. A flat list of eleven would read as a
+    /// pile of unrelated things; grouped by what the user is holding — a
+    /// document, a recording or a photo, a file to convert — it reads as a menu.
+    enum Group: String, CaseIterable, Identifiable {
+        case start = "시작"
+        case documents = "문서"
+        case media = "미디어"
+        case files = "변환"
+        case automation = "자동화"
+
+        var id: String { rawValue }
+
+        var members: [AppSection] {
+            switch self {
+            case .start: [.overview]
+            case .documents: [.documents, .scan, .pdf]
+            case .media: [.transcription, .audioCleanup, .cutout, .upscale]
+            case .files: [.compression, .convert]
+            case .automation: [.briefing, .archive]
+            }
         }
     }
 }

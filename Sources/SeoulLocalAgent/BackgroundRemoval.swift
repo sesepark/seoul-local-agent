@@ -119,8 +119,11 @@ enum CutoutComposer {
     /// Downscales and composites in one pass for the card thumbnails. A phone
     /// photo is far larger than the card, and SwiftUI would otherwise redo the
     /// full-resolution work on every redraw.
-    static func preview(of url: URL, maxPixel: Int, background: CGColor?) -> CGImage? {
-        guard let image = load(url) else { return nil }
+    static func preview(of url: URL, maxPixel: Int, background: CGColor?, edit: PhotoEdit = .identity) -> CGImage? {
+        guard let loaded = load(url) else { return nil }
+        // Before the downscale: the crop is a fraction of the original, and doing it
+        // first also means fewer pixels to resample.
+        let image = edit.apply(to: loaded)
         let scale = min(1, Double(maxPixel) / Double(max(image.width, image.height)))
         let width = max(1, Int((Double(image.width) * scale).rounded()))
         let height = max(1, Int((Double(image.height) * scale).rounded()))
@@ -136,6 +139,15 @@ enum CutoutComposer {
         context.interpolationQuality = .high
         context.draw(image, in: bounds)
         return context.makeImage()
+    }
+
+    /// Header only: the card needs the size, not several megapixels of decoded image.
+    static func size(of url: URL) -> CGSize? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        return CGSize(width: width, height: height)
     }
 
     static func load(_ url: URL) -> CGImage? {
@@ -474,6 +486,9 @@ struct CutoutItem: Identifiable, Sendable {
     let source: URL
     var output: URL?
     var state: State = .waiting
+    /// Kept beside the result rather than burned into the file, so the cutout can
+    /// be re-cropped or un-flipped without running the model again.
+    var edit: PhotoEdit = .identity
 
     var isFinished: Bool { if case .done = state { true } else { false } }
 

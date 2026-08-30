@@ -29,8 +29,12 @@ done
   <key>CFBundleName</key><string>서울대 로컬 에이전트</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSMicrophoneUsageDescription</key><string>회의와 강의를 녹음해 이 기기에서 전사하기 위해 마이크를 사용합니다.</string>
-  <key>NSCalendarsFullAccessUsageDescription</key><string>인박스 정리에 앞으로의 일정을 읽기 전용으로 포함하기 위해 캘린더에 접근합니다.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>인박스 정리에 앞으로의 일정을 포함하고, 브리핑 보관함에서 고른 항목만 '서울대 로컬 에이전트' 전용 캘린더에 넣기 위해 캘린더에 접근합니다.</string>
+  <key>NSRemindersFullAccessUsageDescription</key><string>브리핑 보관함에서 고른 항목을 '서울대 로컬 에이전트' 전용 목록에 미리 알림으로 넣기 위해 접근합니다.</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
 </dict></plist>
 PLIST
 /usr/bin/codesign --force --sign - "$APP_DIR"

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import PhotosUI
 import UniformTypeIdentifiers
 import AVFoundation
 import Combine
@@ -10,15 +11,36 @@ struct SeoulLocalAgentApp: App {
     @StateObject private var controller = AutomationController()
 
     init() {
+        // A board that quietly changes its markup would otherwise show up as a
+        // silent zero inside a briefing. This reports each site on its own.
+        if CommandLine.arguments.contains("--web-notices-check") {
+            Task {
+                for (site, result) in await WebNoticeSource().inspect() {
+                    switch result {
+                    case .success(let entries):
+                        let sample = entries.first.map { " · 예: \($0.title.prefix(40))" } ?? ""
+                        print("\(entries.isEmpty ? "⚠️" : "✅") \(site.name) \(entries.count)건\(sample)")
+                    case .failure(let error):
+                        print("❌ \(site.name) 실패: \(error.localizedDescription)")
+                    }
+                }
+                exit(EXIT_SUCCESS)
+            }
+        }
+        // `--briefing-shadow` runs the whole pipeline and prints the report
+        // without touching stored state; `--briefing-write` also saves it and
+        // exports it to Notion, which is now an explicit extra step rather than
+        // the last phase of every run.
         let shadow = CommandLine.arguments.contains("--briefing-shadow")
         let write = CommandLine.arguments.contains("--briefing-write")
         if shadow || write {
             Task {
                 do {
                     let service = BriefingService()
-                    let briefing = try await service.run(range: .day3, writeToNotion: write) { _, message, _ in
+                    var briefing = try await service.run(range: .day3, persists: write) { _, message, _ in
                         FileHandle.standardError.write(Data((message + "\n").utf8))
                     }
+                    if write { briefing.notionURL = try await service.exportToNotion(briefing) }
                     if shadow { FileHandle.standardOutput.write(Data(service.markdownPreview(briefing).utf8)) }
                     if write { FileHandle.standardOutput.write(Data((briefing.notionURL?.absoluteString ?? "") .utf8)) }
                     exit(EXIT_SUCCESS)
@@ -31,27 +53,85 @@ struct SeoulLocalAgentApp: App {
     }
 
     var body: some Scene {
+        // `Window`, not `WindowGroup`: there is one workspace and no reason for
+        // a second copy of it. A `WindowGroup` hands out a new window on every
+        // ⌘N and on every `openWindow`, so 앱 열기 kept stacking duplicates;
+        // a `Window` is unique, and opening it again just brings it forward.
+        //
+        // It also comes first on purpose. While `MenuBarExtra` was the leading
+        // scene, SwiftUI treated *it* as the app's primary scene and launching
+        // the app opened nothing at all — the only way in was the menu bar's own
+        // 앱 열기 button, which is why that button existed.
+        Window("서울대 로컬 에이전트", id: "main") {
+            MainWorkspaceView(controller: controller)
+        }
+        .defaultSize(width: 1120, height: 780)
+        .windowResizability(.contentMinSize)
+        .commands { AppCommands(controller: controller) }
+
         MenuBarExtra {
             MenuContentView(controller: controller)
         } label: {
             Label("서울대 로컬 에이전트", systemImage: controller.dictation.isRecording ? "mic.circle.fill" : (controller.isRunning ? "graduationcap.circle.fill" : "graduationcap.circle"))
         }
         .menuBarExtraStyle(.window)
-        WindowGroup("서울대 로컬 에이전트", id: "main") {
-            MainWorkspaceView(controller: controller)
+
+        // ⌘, — the only place settings live now. They used to be an eighth
+        // sidebar row holding nine sections in one endless scroll.
+        Settings {
+            SettingsWindow(controller: controller)
         }
-        .defaultSize(width: 1080, height: 760)
-        .windowResizability(.contentMinSize)
-        Window("녹음 전사", id: "transcription") {
-            TranscriptionWindowView(controller: controller)
+    }
+}
+
+/// The menu bar. The app had no `commands` block at all, so it shipped without
+/// ⌘, , without a way to start a run from the keyboard, and without section
+/// switching — every action needed the mouse.
+private struct AppCommands: Commands {
+    @ObservedObject var controller: AutomationController
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("인박스 정리 시작") { controller.startBriefing() }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(controller.isRunning)
+            Button("실행 중지") { controller.stopBriefing() }
+                .keyboardShortcut(".", modifiers: .command)
+                .disabled(!controller.isRunning)
         }
-        .defaultSize(width: 900, height: 680)
-        .windowResizability(.contentMinSize)
+        CommandGroup(before: .toolbar) {
+            // Divided the way the sidebar is: eleven screens in one undivided
+            // run is a menu nobody reads to the bottom of.
+            // Divided the way the sidebar is: eleven screens in one undivided
+            // run is a menu nobody reads to the bottom of.
+            ForEach(AppSection.Group.allCases) { group in
+                ForEach(group.members) { item in
+                    Button(item.title) { controller.section = item }
+                        .keyboardShortcut(item.shortcut, modifiers: item.shortcutModifiers)
+                }
+                Divider()
+            }
+        }
+        CommandGroup(replacing: .help) {
+            Button("서울대 로컬 에이전트 창 열기") {
+                openWindow(id: "main")
+                NSApp.activate()
+            }
+        }
     }
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Checking the dark palette used to mean flipping the whole system's
+        // appearance; this darkens only this app so the two schemes can be
+        // compared without disturbing anything else.
+        if CommandLine.arguments.contains("--force-dark") {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        } else if CommandLine.arguments.contains("--force-light") {
+            NSApp.appearance = NSAppearance(named: .aqua)
+        }
         // Process discovery performs blocking system I/O and must never hold
         // SwiftUI's main thread during launch.
         DispatchQueue.global(qos: .utility).async {
@@ -64,6 +144,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // close-then-terminate-then-kill pass that returns only once it is gone.
         // Everything else is a short-lived child that `terminateAll` covers.
         MattingDaemon.shared.shutdownNow()
+        // Same for the 소리 다듬기 · 화질 올리기 runner, which also keeps a torch
+        // model warm between files.
+        MediaDaemon.shared.shutdownNow()
         // Tree, not just the direct child: the 정밀 문서 인식 helper starts a
         // local service of its own that would otherwise be left behind.
         ActiveProcessRegistry.shared.terminateAllTrees()
@@ -72,6 +155,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @MainActor
 final class AutomationController: ObservableObject {
+    /// Lives here rather than in the split view so the ⌘1…⌘6 menu commands can
+    /// move the selection; menu commands are outside the window's view tree.
+    ///
+    /// `--section <name>` picks the starting screen, which lets a screen be
+    /// looked at in a background launch instead of by typing ⌘-number into a
+    /// window that has to be frontmost to receive it.
+    @Published var section: AppSection = {
+        guard let index = CommandLine.arguments.firstIndex(of: "--section"),
+              index + 1 < CommandLine.arguments.count,
+              let requested = AppSection(rawValue: CommandLine.arguments[index + 1])
+        else { return .overview }
+        return requested
+    }()
     @Published var phase: RunPhase = .idle
     @Published var detail = "명시적 실행을 기다리고 있습니다."
     @Published var selectedRange: CollectionRange {
@@ -92,7 +188,13 @@ final class AutomationController: ObservableObject {
     @Published var briefingImportantPatternsText: String
     @Published var briefingPreferencesStatus = ""
     @Published var calendarAuthorizationStatus = CalendarIntegration.authorizationDescription
+    @Published var reminderAuthorizationStatus = CalendarIntegration.reminderAuthorizationDescription
     @Published var lastBriefing: DailyBriefing?
+    /// The briefings themselves, and what the reader has done with them.
+    let briefingArchive = BriefingArchiveModel()
+    /// Today's schedule for the 개요 screen. Read on demand rather than kept in
+    /// sync: EventKit is the source of truth and the screen is not always up.
+    @Published var todayEvents: [CalendarGlance] = []
     @Published var errorMessage: String?
     @Published var isRunning = false
     @Published var isTranscribing = false
@@ -121,7 +223,6 @@ final class AutomationController: ObservableObject {
     @Published var selectedTranscriptRunID: UUID?
     @Published var selectedOrganizationRunID: UUID?
     @Published var transcribingRecordingID: RecordingItem.ID?
-    @Published var isPlayingRecording = false
     @Published var isOrganizingTranscript = false
     @Published var organizationDetail = ""
     @Published var organizationError: String?
@@ -142,7 +243,7 @@ final class AutomationController: ObservableObject {
     @Published private(set) var isRecognizingDocument = false
     @Published private(set) var recognizedText = ""
     @Published private(set) var recognizedSourceName = ""
-    @Published private(set) var recognitionStatus = "이미지나 PDF를 드롭하거나 화면 영역을 캡처하세요."
+    @Published private(set) var recognitionStatus = "대기 중"
     @Published var recognitionError: String?
     @Published private(set) var recognizedNoteText = ""
     /// Drives the save panel's file type and the hint under the result.
@@ -161,9 +262,90 @@ final class AutomationController: ObservableObject {
     }
     @Published private(set) var cutoutItems: [CutoutItem] = []
     @Published private(set) var isRemovingBackground = false
-    @Published private(set) var cutoutStatus = "사진을 드롭하면 배경을 지운 PNG를 만듭니다."
+    @Published private(set) var cutoutStatus = "대기 중"
     @Published var cutoutError: String?
+    @Published var compressionMode: CompressionMode {
+        didSet { UserDefaults.standard.set(compressionMode.rawValue, forKey: "compressionMode") }
+    }
+    @Published var compressionLevel: CompressionLevel {
+        didSet { UserDefaults.standard.set(compressionLevel.rawValue, forKey: "compressionLevel") }
+    }
+    @Published var compressionImageFormat: ImageOutputFormat {
+        didSet { UserDefaults.standard.set(compressionImageFormat.rawValue, forKey: "compressionImageFormat") }
+    }
+    @Published var compressionVideoCodec: VideoOutputCodec {
+        didSet { UserDefaults.standard.set(compressionVideoCodec.rawValue, forKey: "compressionVideoCodec") }
+    }
+    @Published var compressionTargetBytes: Int {
+        didSet { UserDefaults.standard.set(compressionTargetBytes, forKey: "compressionTargetBytes") }
+    }
+    @Published private(set) var compressionItems: [CompressionItem] = []
+    @Published private(set) var isCompressing = false
+    @Published private(set) var compressionStatus = "대기 중"
+    @Published private(set) var compressionETA: TimeInterval?
+    @Published var compressionError: String?
+
+    // MARK: 소리 다듬기 · 화질 올리기 · 스캔 보정 · 형식 변환 · PDF 편집
+
+    /// Each new tool owns its own queue instead of adding another forty
+    /// published properties to this class; the screens observe these directly,
+    /// which also keeps a progress tick from redrawing every other screen.
+    let audioCleanup = BatchToolModel(name: "AudioCleanup", idleStatus: "녹음이나 영상을 넣으면 잡음을 걷어냅니다.")
+    let upscale = BatchToolModel(name: "Upscale", idleStatus: "사진을 넣으면 크고 또렷하게 만듭니다.")
+    let scan = BatchToolModel(name: "Scan", idleStatus: "찍은 유인물을 넣으면 반듯한 스캔으로 만듭니다.")
+    let convert = BatchToolModel(name: "Convert", idleStatus: "파일을 넣고 바꿀 형식을 고르세요.")
+    let pdfEditor = PDFEditorModel()
+
+    @Published var audioCleanupMethod: AudioCleanupMethod {
+        didSet { UserDefaults.standard.set(audioCleanupMethod.rawValue, forKey: "audioCleanupMethod") }
+    }
+    @Published var audioCleanupStrength: AudioCleanupStrength {
+        didSet { UserDefaults.standard.set(audioCleanupStrength.rawValue, forKey: "audioCleanupStrength") }
+    }
+    @Published var audioCleanupNormalises: Bool {
+        didSet { UserDefaults.standard.set(audioCleanupNormalises, forKey: "audioCleanupNormalises") }
+    }
+    @Published var audioCleanupFormat: AudioOutputFormat {
+        didSet { UserDefaults.standard.set(audioCleanupFormat.rawValue, forKey: "audioCleanupFormat") }
+    }
+    @Published var upscaleModel: UpscaleModel {
+        didSet { UserDefaults.standard.set(upscaleModel.rawValue, forKey: "upscaleModel") }
+    }
+    @Published var upscaleFormat: UpscaleFormat {
+        didSet { UserDefaults.standard.set(upscaleFormat.rawValue, forKey: "upscaleFormat") }
+    }
+    @Published var scanFinish: ScanFinish {
+        didSet { UserDefaults.standard.set(scanFinish.rawValue, forKey: "scanFinish") }
+    }
+    @Published var scanResolution: ScanResolution {
+        didSet { UserDefaults.standard.set(scanResolution.rawValue, forKey: "scanResolution") }
+    }
+    @Published var scanFormat: ScanOutputFormat {
+        didSet { UserDefaults.standard.set(scanFormat.rawValue, forKey: "scanFormat") }
+    }
+    @Published var scanDetectsEdges: Bool {
+        didSet { UserDefaults.standard.set(scanDetectsEdges, forKey: "scanDetectsEdges") }
+    }
+    /// Changing the family has to move the format with it: `MP3` is not a thing
+    /// a picture can become, and leaving it selected would queue every file
+    /// against a conversion that refuses all of them.
+    @Published var conversionFamily: ConversionFamily {
+        didSet {
+            UserDefaults.standard.set(conversionFamily.rawValue, forKey: "conversionFamily")
+            if conversionTarget.family != conversionFamily, let first = conversionFamily.targets.first {
+                conversionTarget = first
+            }
+        }
+    }
+    @Published var conversionTarget: ConversionTarget {
+        didSet { UserDefaults.standard.set(conversionTarget.rawValue, forKey: "conversionTarget") }
+    }
+    @Published var conversionQuality: Double {
+        didSet { UserDefaults.standard.set(conversionQuality, forKey: "conversionQuality") }
+    }
+
     let audioRecorder = AudioRecorder()
+    let recordingPlayer = RecordingPlayer()
     let dictation = DictationController()
     private var task: Task<Void, Never>?
     private var transcriptionTask: Task<Void, Never>?
@@ -172,12 +354,14 @@ final class AutomationController: ObservableObject {
     private var mediaImportTask: Task<Void, Never>?
     private var recognitionTask: Task<Void, Never>?
     private var cutoutTask: Task<Void, Never>?
+    private var compressionTask: Task<Void, Never>?
+    private var compressionEstimator = CompressionProgressEstimator()
+    private var compressionETAUpdatedAt = Date.distantPast
     private var cancellables: Set<AnyCancellable> = []
     private let store = StateStore()
     private let briefingPreferencesStore = BriefingPreferencesStore()
     private let organizationPreferencesStore = TranscriptOrganizationPreferencesStore()
     private var transcriptArchive = TranscriptArchive.load()
-    private var audioPlayer: AVAudioPlayer?
     private var briefingStartedAt: Date?
     private var transcriptionStartedAt: Date?
     private var organizationStartedAt: Date?
@@ -233,6 +417,34 @@ final class AutomationController: ObservableObject {
         mattingModel = MattingModelChoice(rawValue: UserDefaults.standard.string(forKey: "mattingModel") ?? "") ?? .highResolution
         cutoutBackground = CutoutBackground(rawValue: UserDefaults.standard.string(forKey: "cutoutBackground") ?? "") ?? .transparent
         cutoutCustomColor = Self.color(fromHex: UserDefaults.standard.string(forKey: "cutoutCustomColor")) ?? .white
+        compressionMode = CompressionMode(rawValue: UserDefaults.standard.string(forKey: "compressionMode") ?? "") ?? .level
+        compressionLevel = CompressionLevel(rawValue: UserDefaults.standard.string(forKey: "compressionLevel") ?? "") ?? .standard
+        // JPEG rather than 원본 유지: someone opening this tab wants a smaller
+        // file, and keeping a PNG as a PNG barely delivers one.
+        compressionImageFormat = ImageOutputFormat(rawValue: UserDefaults.standard.string(forKey: "compressionImageFormat") ?? "") ?? .jpeg
+        compressionVideoCodec = VideoOutputCodec(rawValue: UserDefaults.standard.string(forKey: "compressionVideoCodec") ?? "") ?? .h264
+        let savedTarget = UserDefaults.standard.integer(forKey: "compressionTargetBytes")
+        compressionTargetBytes = savedTarget > 0 ? savedTarget : 1_048_576
+        // The gate is the default because it needs no download and is fast
+        // enough to feel free; the model is opted into per batch.
+        audioCleanupMethod = AudioCleanupMethod(rawValue: UserDefaults.standard.string(forKey: "audioCleanupMethod") ?? "") ?? .gate
+        audioCleanupStrength = AudioCleanupStrength(rawValue: UserDefaults.standard.string(forKey: "audioCleanupStrength") ?? "") ?? .standard
+        audioCleanupNormalises = UserDefaults.standard.object(forKey: "audioCleanupNormalises") as? Bool ?? true
+        audioCleanupFormat = AudioOutputFormat(rawValue: UserDefaults.standard.string(forKey: "audioCleanupFormat") ?? "") ?? .m4a
+        // Two times over rather than four: it is several times faster and the
+        // result looks more natural on the blurry slide photos this is for.
+        upscaleModel = UpscaleModel(rawValue: UserDefaults.standard.string(forKey: "upscaleModel") ?? "") ?? .realESRGANx2
+        upscaleFormat = UpscaleFormat(rawValue: UserDefaults.standard.string(forKey: "upscaleFormat") ?? "") ?? .png
+        scanFinish = ScanFinish(rawValue: UserDefaults.standard.string(forKey: "scanFinish") ?? "") ?? .bright
+        scanResolution = ScanResolution(rawValue: UserDefaults.standard.string(forKey: "scanResolution") ?? "") ?? .standard
+        scanFormat = ScanOutputFormat(rawValue: UserDefaults.standard.string(forKey: "scanFormat") ?? "") ?? .pdf
+        scanDetectsEdges = UserDefaults.standard.object(forKey: "scanDetectsEdges") as? Bool ?? true
+        let savedFamily = ConversionFamily(rawValue: UserDefaults.standard.string(forKey: "conversionFamily") ?? "") ?? .image
+        conversionFamily = savedFamily
+        let savedConversion = ConversionTarget(rawValue: UserDefaults.standard.string(forKey: "conversionTarget") ?? "")
+        conversionTarget = savedConversion?.family == savedFamily ? savedConversion! : (savedFamily.targets.first ?? .jpeg)
+        let savedQuality = UserDefaults.standard.double(forKey: "conversionQuality")
+        conversionQuality = savedQuality > 0 ? savedQuality : 0.9
         let savedASR = UserDefaults.standard.string(forKey: "asrModelChoice")
         asrModel = savedASR.flatMap(ASRModelChoice.init(rawValue:)) ?? .qwen06B8Bit
         let savedDiarization = UserDefaults.standard.string(forKey: "diarizationChoice")
@@ -246,10 +458,9 @@ final class AutomationController: ObservableObject {
         lectureOrganizationPrompt = organizationPreferences.lecturePrompt
         meetingOrganizationPrompt = organizationPreferences.meetingPrompt
         generalOrganizationPrompt = organizationPreferences.generalPrompt
-        let state = store.load()
-        if let url = state.lastNotionURL, let date = state.lastSuccessAt {
-            lastBriefing = DailyBriefing(dateKey: BriefingService.dateKey(date), items: [], sourceCounts: [:], failures: [], notionURL: url, updatedAt: date)
-        }
+        // The most recent briefing is whatever the archive holds, which is now
+        // the real thing rather than a stub built around a Notion link.
+        lastBriefing = briefingArchive.days.first
         refreshRecordings()
         dictation.isOtherWorkRunning = { [weak self] in
             guard let self else { return false }
@@ -259,6 +470,12 @@ final class AutomationController: ObservableObject {
         // Dictation is its own observable object; forward its changes so the menu
         // bar icon and overview reflect it without duplicating the state here.
         dictation.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        // And the archive: 보관함 and 개요 both read it through the controller, so
+        // without this a ticked checkbox would not re-sort its own list until
+        // something else happened to redraw the screen.
+        briefingArchive.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
         // Same for the recorder: without this the elapsed time published every
@@ -286,17 +503,38 @@ final class AutomationController: ObservableObject {
         saveBriefingPreferences()
     }
 
-    func requestCalendarReadAccess() {
+    /// Full access now, not read-only: the 보관함 turns an item into an event.
+    /// Everything written goes into the app's own 서울대 로컬 에이전트 calendar,
+    /// so granting this cannot change an appointment the user already had.
+    func requestCalendarAccess() {
         Task { [weak self] in
             do {
-                try await CalendarIntegration.requestReadAccess()
+                try await CalendarWriter.requestEventAccess()
                 await MainActor.run {
                     self?.calendarAuthorizationStatus = CalendarIntegration.authorizationDescription
-                    self?.briefingPreferencesStatus = "캘린더 읽기 권한을 허용했습니다. 다음 인박스 정리부터 앞으로 14일 일정을 함께 읽습니다."
+                    self?.briefingPreferencesStatus = "캘린더 권한을 허용했습니다. 앞으로 14일 일정을 읽고, 보관함에서 고른 항목만 '\(AgentCalendar.title)' 캘린더에 넣습니다."
+                    self?.refreshToday()
                 }
             } catch {
                 await MainActor.run {
                     self?.calendarAuthorizationStatus = CalendarIntegration.authorizationDescription
+                    self?.briefingPreferencesStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func requestReminderAccess() {
+        Task { [weak self] in
+            do {
+                try await CalendarWriter.requestReminderAccess()
+                await MainActor.run {
+                    self?.reminderAuthorizationStatus = CalendarIntegration.reminderAuthorizationDescription
+                    self?.briefingPreferencesStatus = "미리 알림 권한을 허용했습니다. 보관함에서 고른 항목을 '\(AgentCalendar.title)' 목록에 넣습니다."
+                }
+            } catch {
+                await MainActor.run {
+                    self?.reminderAuthorizationStatus = CalendarIntegration.reminderAuthorizationDescription
                     self?.briefingPreferencesStatus = error.localizedDescription
                 }
             }
@@ -342,8 +580,9 @@ final class AutomationController: ObservableObject {
                     }
                 }
                 phase = .completed
-                detail = "Notion 브리핑을 생성했고 모델을 언로드했습니다."
+                detail = "브리핑 보관함에 저장했고 모델을 언로드했습니다."
                 lastBriefing = briefing
+                briefingArchive.reload()
                 briefingETA = 0
             } catch AgentError.cancelled {
                 phase = .cancelled
@@ -365,7 +604,10 @@ final class AutomationController: ObservableObject {
             // The service reports the real number of items it is about to classify,
             // so the estimate no longer depends on the wording of a progress line.
             if let count = pendingItemCount {
-                let perItem = briefingQualityMode == .thorough ? 13.0 : 9.0
+                // Measured end to end (분류 + 한국어 편집) on the MoE model: 3.5s and
+                // 3.8s per item on short items. Doubled for real message bodies,
+                // which are up to 1,200 characters and cost more prefill.
+                let perItem = briefingQualityMode == .thorough ? 6.0 : 6.5
                 briefingETA = count == 0 ? 30 : max(60, Double(count) * perItem - elapsed)
             }
         case .classifying:
@@ -411,9 +653,17 @@ final class AutomationController: ObservableObject {
         dictation.cancel()
     }
 
+    func refreshToday() {
+        todayEvents = CalendarSource().today()
+        briefingArchive.reload()
+    }
+
+    /// Used to open the Notion page in a browser. The result lives in the app
+    /// now, so this goes to the screen that shows it.
     func openLatestResult() {
-        guard let url = lastBriefing?.notionURL else { return }
-        NSWorkspace.shared.open(url)
+        briefingArchive.reload()
+        if let latest = briefingArchive.days.first { briefingArchive.selectedDateKey = latest.dateKey }
+        section = .archive
     }
 
     func cancelProcessingItem(_ id: UUID) {
@@ -499,7 +749,10 @@ final class AutomationController: ObservableObject {
         operation: @escaping @Sendable (MediaImporter, @escaping @Sendable (String) async -> Void) async throws -> MediaImporter.ImportedMedia,
         onSuccess: @escaping @MainActor () -> Void
     ) {
-        guard !isImportingMedia else { return }
+        guard !isImportingMedia else {
+            mediaImportError = "이미 영상을 가져오는 중입니다. 끝난 뒤에 다시 시도해 주세요."
+            return
+        }
         isImportingMedia = true
         mediaImportError = nil
         mediaImportStatus = status
@@ -548,7 +801,10 @@ final class AutomationController: ObservableObject {
     // MARK: - 문서 인식
 
     func recognizeDocument(fileURL: URL, removingSourceAfterwards removeSource: Bool = false) {
-        guard !isRecognizingDocument else { return }
+        guard !isRecognizingDocument else {
+            recognitionError = "문서를 인식하는 중입니다. 끝난 뒤에 넣어 주세요."
+            return
+        }
         guard DocumentRecognizer.isSupported(fileURL) else {
             recognitionError = "이미지 또는 PDF 파일만 인식할 수 있습니다."
             return
@@ -652,17 +908,26 @@ final class AutomationController: ObservableObject {
     /// resident model is the whole point, and running two 2048² passes at once
     /// would only make both slower.
     func removeBackground(fileURLs: [URL]) {
-        guard !isRemovingBackground else { return }
+        // Dropping onto a busy tab used to do nothing at all, with the drop well
+        // still lighting up as though it had been accepted.
+        guard !isRemovingBackground else {
+            cutoutError = "누끼를 따는 중입니다. 끝나거나 중단한 뒤에 넣어 주세요."
+            return
+        }
         let sources = fileURLs.filter(BackgroundRemovalService.isSupported)
         guard !sources.isEmpty else {
             cutoutError = "이미지 파일만 누끼를 딸 수 있습니다."
             return
         }
         cutoutError = nil
+        // A new batch replaces the old one, so say what was thrown away. Losing a
+        // dozen finished cutouts to a stray drop, silently, is the worst case here.
+        let discarded = cutoutItems.filter(\.isFinished).count
         cutoutItems = sources.map { CutoutItem(source: $0) }
         isRemovingBackground = true
         let model = mattingModel
-        cutoutStatus = sources.count == 1 ? "배경을 지우고 있습니다." : "\(sources.count)장을 순서대로 처리하고 있습니다."
+        let opening = sources.count == 1 ? "배경을 지우고 있습니다." : "\(sources.count)장을 순서대로 처리하고 있습니다."
+        cutoutStatus = discarded > 0 ? "\(opening) 저장하지 않은 이전 결과 \(discarded)장은 목록에서 내렸습니다." : opening
         cutoutTask = Task { [weak self] in
             guard let self else { return }
             let service = BackgroundRemovalService()
@@ -703,6 +968,15 @@ final class AutomationController: ObservableObject {
         }
     }
 
+    /// The 용량 줄이기 tab has had this since it shipped; the 누끼 tab was the odd
+    /// one out, with no way to put the grid back to empty.
+    func clearCutouts() {
+        guard !isRemovingBackground else { return }
+        cutoutItems = []
+        cutoutError = nil
+        cutoutStatus = "사진을 드롭하면 배경을 지운 PNG를 만듭니다."
+    }
+
     func stopBackgroundRemoval() {
         guard isRemovingBackground else { return }
         cutoutStatus = "누끼 따기를 중단하는 중"
@@ -718,7 +992,37 @@ final class AutomationController: ObservableObject {
     /// between 투명/흰색/직접 선택 is instant and never re-runs the model.
     func cutoutPNG(_ item: CutoutItem) -> Data? {
         guard let output = item.output, let image = CutoutComposer.load(output) else { return nil }
-        return CutoutComposer.pngData(from: image, background: cutoutBackgroundColor)
+        // Full resolution: the card and the editor both work on a downscaled copy,
+        // but what leaves the app is the original with the same crop applied.
+        return CutoutComposer.pngData(from: item.edit.apply(to: image), background: cutoutBackgroundColor)
+    }
+
+    /// The editor hands its result back here so every export path — copy, save,
+    /// save-all — picks it up from the one place the item lives.
+    func updateCutoutEdit(_ id: CutoutItem.ID, to edit: PhotoEdit) {
+        guard let index = cutoutItems.firstIndex(where: { $0.id == id }) else { return }
+        cutoutItems[index].edit = edit
+        cutoutStatus = edit.isIdentity
+            ? "편집을 되돌렸습니다: \(cutoutItems[index].source.lastPathComponent)"
+            : "편집을 적용했습니다: \(edit.summary ?? "")"
+    }
+
+    func updateCompressionEdit(_ id: CompressionItem.ID, to edit: PhotoEdit) {
+        guard let index = compressionItems.firstIndex(where: { $0.id == id }) else { return }
+        guard compressionItems[index].edit != edit else { return }
+        compressionItems[index].edit = edit
+        // A finished card would otherwise keep showing the result of the previous
+        // framing while claiming the edit was applied. Back to waiting says plainly
+        // that this one is going to be made again.
+        if compressionItems[index].isFinished {
+            compressionItems[index].state = .waiting
+            compressionItems[index].output = nil
+            compressionItems[index].compressedBytes = nil
+            compressionItems[index].outputDetail = nil
+        }
+        compressionStatus = edit.isIdentity
+            ? "편집을 되돌렸습니다. 줄이기를 다시 실행하면 반영됩니다."
+            : "편집을 적용했습니다: \(edit.summary ?? "") · 줄이기를 다시 실행하면 반영됩니다"
     }
 
     var cutoutBackgroundColor: CGColor? {
@@ -772,7 +1076,9 @@ final class AutomationController: ObservableObject {
         var saved = 0
         for item in finished {
             guard let data = cutoutPNG(item) else { continue }
-            let target = directory.appending(path: Self.cutoutFileName(for: item))
+            // Two photos from different folders can share a name, and writing
+            // straight to it silently replaced the first cutout with the second.
+            let target = CompressionWorkspace.uniqueURL(in: directory, name: Self.cutoutFileName(for: item))
             do {
                 try data.write(to: target, options: .atomic)
                 saved += 1
@@ -781,10 +1087,383 @@ final class AutomationController: ObservableObject {
             }
         }
         cutoutStatus = "\(saved)장을 저장했습니다: \(directory.lastPathComponent)"
+        NSWorkspace.shared.activateFileViewerSelecting([directory])
     }
 
     private static func cutoutFileName(for item: CutoutItem) -> String {
         "\(item.source.deletingPathExtension().lastPathComponent)-누끼.png"
+    }
+
+    // MARK: - 용량 줄이기
+
+    var compressionRequest: CompressionRequest {
+        CompressionRequest(
+            mode: compressionMode,
+            level: compressionLevel,
+            targetBytes: compressionTargetBytes,
+            imageFormat: compressionImageFormat,
+            videoCodec: compressionVideoCodec
+        )
+    }
+
+    var compressionETAString: String {
+        guard isCompressing, let compressionETA else { return "" }
+        return CompressionProgressEstimator.text(compressionETA)
+    }
+
+    var compressionProgressValue: Double {
+        guard !compressionItems.isEmpty else { return 0 }
+        let settled = compressionItems.filter { $0.isFinished || $0.isFailed }.count
+        let running = compressionItems.reduce(0.0) { total, item in
+            if case .working(let fraction) = item.state { return total + fraction }
+            return total
+        }
+        return min(1, (Double(settled) + running) / Double(compressionItems.count))
+    }
+
+    var compressionCountText: String {
+        let settled = compressionItems.filter { $0.isFinished || $0.isFailed }.count
+        return "\(settled)/\(compressionItems.count)개"
+    }
+
+    /// The running tally that makes the tab worth opening: what went in against
+    /// what came out, over everything finished so far.
+    var compressionSavingsText: String {
+        let finished = compressionItems.filter(\.isFinished)
+        guard !finished.isEmpty else { return "" }
+        let before = finished.reduce(0) { $0 + $1.originalBytes }
+        let after = finished.reduce(0) { $0 + ($1.compressedBytes ?? $1.originalBytes) }
+        guard before > 0 else { return "" }
+        let saved = Int(((1 - Double(after) / Double(before)) * 100).rounded())
+        return "총 \(CompressionFormat.bytes(before)) → \(CompressionFormat.bytes(after)) (−\(saved)%)"
+    }
+
+    var lastCompressionSaveFolder: URL? {
+        get {
+            UserDefaults.standard.string(forKey: "compressionSaveFolder").map { URL(fileURLWithPath: $0) }
+        }
+        set {
+            UserDefaults.standard.set(newValue?.path, forKey: "compressionSaveFolder")
+        }
+    }
+
+    static func compressor(for kind: CompressionKind) -> any FileCompressor {
+        switch kind {
+        case .image: ImageCompressor()
+        case .pdf: PDFCompressor()
+        case .video: VideoCompressor()
+        }
+    }
+
+    private static func outputExtension(for item: CompressionItem, request: CompressionRequest) -> String {
+        switch item.kind {
+        case .image: ImageOutputFormat.resolved(request.imageFormat, for: item.source).fileExtension
+        case .pdf: "pdf"
+        case .video: "mp4"
+        }
+    }
+
+    // MARK: 배치 실행
+
+    func compress(fileURLs: [URL]) {
+        guard !isCompressing else {
+            compressionError = "용량을 줄이는 중입니다. 끝나거나 중단한 뒤에 넣어 주세요."
+            return
+        }
+        let (files, truncated) = CompressionWorkspace.expand(fileURLs)
+        guard !files.isEmpty else {
+            compressionError = "사진·PDF·영상 파일만 압축할 수 있습니다."
+            return
+        }
+        compressionError = truncated ? "한 번에 500개까지만 처리합니다. 나머지는 다시 넣어 주세요." : nil
+        compressionItems = files.map {
+            CompressionItem(
+                source: $0,
+                kind: CompressionKind.of($0) ?? .image,
+                originalBytes: CompressionWorkspace.fileSize(of: $0),
+                originalDetail: ""
+            )
+        }
+        startCompressionRun()
+    }
+
+    /// Runs whatever is already on screen again.
+    ///
+    /// Editing a photo puts its card back to 대기 중, because showing the previous
+    /// framing while claiming the edit was applied would be a lie. Without this
+    /// there would be no way to then produce the new version, and the card would
+    /// sit at 대기 중 forever.
+    func recompress() {
+        guard !isCompressing, !compressionItems.isEmpty else { return }
+        for index in compressionItems.indices {
+            compressionItems[index].state = .waiting
+            compressionItems[index].output = nil
+            compressionItems[index].compressedBytes = nil
+            compressionItems[index].outputDetail = nil
+            compressionItems[index].note = nil
+        }
+        compressionError = nil
+        startCompressionRun()
+    }
+
+    private func startCompressionRun() {
+        let request = compressionRequest
+        let total = compressionItems.count
+        compressionEstimator = CompressionProgressEstimator()
+        compressionETA = nil
+        isCompressing = true
+        compressionStatus = "\(total)개를 확인하고 있습니다."
+
+        compressionTask = Task { [weak self] in
+            guard let self else { return }
+            let directory: URL
+            do {
+                directory = try CompressionWorkspace.directory()
+            } catch {
+                self.compressionError = "작업 폴더를 만들지 못했습니다: \(error.localizedDescription)"
+                self.isCompressing = false
+                self.compressionTask = nil
+                return
+            }
+            await self.inspectAll(request: request)
+            await self.runCompression(request: request, directory: directory)
+            self.finishCompression(total: total)
+        }
+    }
+
+    /// True while a card is waiting for a run that has to be asked for — after an
+    /// edit, or after the settings changed since the last pass.
+    var hasPendingCompression: Bool {
+        !isCompressing && compressionItems.contains { if case .waiting = $0.state { true } else { false } }
+    }
+
+    /// Headers only, before any encoding starts: this is what makes the estimate
+    /// size-aware, and it is also where a PDF's annotations get flagged while the
+    /// user can still change their mind.
+    private func inspectAll(request: CompressionRequest) async {
+        for index in compressionItems.indices {
+            if Task.isCancelled { return }
+            let item = compressionItems[index]
+            do {
+                let info = try await Self.compressor(for: item.kind).inspect(item.source, request: request)
+                updateCompression(at: index) {
+                    $0.originalBytes = info.bytes
+                    $0.originalDetail = info.detail
+                }
+                compressionEstimator.add(id: item.id, kind: item.kind, estimate: info.estimatedSeconds)
+            } catch {
+                updateCompression(at: index) { $0.state = .failed(error.localizedDescription) }
+                continue
+            }
+            if item.kind == .pdf, let warning = PDFCompressor.annotationWarning(for: item.source) {
+                updateCompression(at: index) { $0.note = warning }
+            }
+        }
+        refreshCompressionETA(force: true)
+        compressionStatus = "\(compressionItems.count)개를 압축하고 있습니다."
+    }
+
+    /// Photos and PDFs run several at a time because they are pure CPU work and
+    /// this Mac has cores to spare — unlike the 누끼 tab, there is no single
+    /// resident model to serialise around. Videos still go one at a time: there
+    /// is one hardware encoder, and queueing two only makes both slower.
+    private func runCompression(request: CompressionRequest, directory: URL) async {
+        let pending = compressionItems.indices.filter { !compressionItems[$0].isFailed }
+        let videos = pending.filter { compressionItems[$0].kind == .video }
+        let rest = pending.filter { compressionItems[$0].kind != .video }
+        let limit = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount / 2))
+
+        await withTaskGroup(of: Void.self) { lanes in
+            lanes.addTask { [weak self] in
+                guard let self else { return }
+                for index in videos {
+                    if Task.isCancelled { return }
+                    await self.compressOne(at: index, request: request, directory: directory)
+                }
+            }
+            lanes.addTask { [weak self] in
+                guard let self else { return }
+                await withTaskGroup(of: Void.self) { group in
+                    var next = 0
+                    while next < min(limit, rest.count) {
+                        let index = rest[next]
+                        next += 1
+                        group.addTask { await self.compressOne(at: index, request: request, directory: directory) }
+                    }
+                    while await group.next() != nil {
+                        guard !Task.isCancelled, next < rest.count else { continue }
+                        let index = rest[next]
+                        next += 1
+                        group.addTask { await self.compressOne(at: index, request: request, directory: directory) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func compressOne(at index: Int, request: CompressionRequest, directory: URL) async {
+        guard compressionItems.indices.contains(index) else { return }
+        let item = compressionItems[index]
+        let identifier = item.id
+        let warning = item.note
+        let destination = CompressionWorkspace.outputURL(
+            for: item.source, extension: Self.outputExtension(for: item, request: request), in: directory
+        )
+        let started = Date()
+        updateCompression(at: index) { $0.state = .working(0) }
+        // Per item: the crop belongs to this photo, not to the run.
+        var itemRequest = request
+        itemRequest.edit = item.edit
+        do {
+            let outcome = try await Self.compressor(for: item.kind).compress(
+                item.source, to: destination, request: itemRequest
+            ) { fraction, remaining in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    // These hops are unstructured, so one can land after the
+                    // file has already finished; without the guard a late report
+                    // would flip a completed card back to "처리 중".
+                    self.updateCompression(at: index) {
+                        if case .working = $0.state { $0.state = .working(fraction) }
+                    }
+                    if let remaining { self.compressionEstimator.note(id: identifier, remaining: remaining) }
+                    self.refreshCompressionETA()
+                }
+            }
+            updateCompression(at: index) {
+                $0.output = outcome.output
+                $0.compressedBytes = outcome.bytes
+                $0.outputDetail = outcome.detail
+                // A warning raised while reading the file still matters once it
+                // is done — the annotations really are gone from the result.
+                $0.note = outcome.note ?? warning
+                $0.state = .done
+            }
+            compressionEstimator.finish(id: identifier, actual: Date().timeIntervalSince(started))
+        } catch is CancellationError {
+            updateCompression(at: index) { $0.state = .skipped("중단했습니다.") }
+            compressionEstimator.drop(id: identifier)
+        } catch {
+            updateCompression(at: index) { $0.state = .failed(error.localizedDescription) }
+            compressionEstimator.drop(id: identifier)
+        }
+        refreshCompressionETA(force: true)
+    }
+
+    private func finishCompression(total: Int) {
+        let succeeded = compressionItems.filter(\.isFinished).count
+        if Task.isCancelled {
+            compressionStatus = "용량 줄이기를 중단했습니다."
+        } else if succeeded == total {
+            compressionStatus = "\(succeeded)개를 마쳤습니다. \(compressionSavingsText)"
+        } else {
+            compressionStatus = "\(succeeded)/\(total)개를 마쳤습니다."
+        }
+        isCompressing = false
+        compressionETA = nil
+        compressionTask = nil
+    }
+
+    func stopCompression() {
+        guard isCompressing else { return }
+        compressionStatus = "중단하는 중"
+        compressionTask?.cancel()
+        // ffmpeg is the only helper here that runs long enough to need chasing.
+        ActiveProcessRegistry.shared.terminateProcesses(containing: "-progress")
+    }
+
+    private func updateCompression(at index: Int, _ change: (inout CompressionItem) -> Void) {
+        guard compressionItems.indices.contains(index) else { return }
+        change(&compressionItems[index])
+    }
+
+    /// Throttled: ffmpeg reports twice a second and four photos can finish at
+    /// once, and republishing the estimate on every one of those makes the whole
+    /// tab flicker.
+    private func refreshCompressionETA(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(compressionETAUpdatedAt) >= 0.25 else { return }
+        compressionETAUpdatedAt = now
+        compressionETA = compressionEstimator.isEmpty ? nil : compressionEstimator.remainingSeconds
+    }
+
+    // MARK: 저장
+
+    func saveCompressed(_ item: CompressionItem) {
+        guard let output = item.output else {
+            compressionError = "결과 파일을 찾지 못했습니다."
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "압축한 파일 저장"
+        panel.nameFieldStringValue = CompressionWorkspace.saveName(for: item)
+        if let folder = lastCompressionSaveFolder { panel.directoryURL = folder }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try? FileManager.default.removeItem(at: url)
+            try FileManager.default.copyItem(at: output, to: url)
+            lastCompressionSaveFolder = url.deletingLastPathComponent()
+            compressionStatus = "저장했습니다: \(url.lastPathComponent)"
+        } catch {
+            compressionError = "저장하지 못했습니다: \(error.localizedDescription)"
+        }
+    }
+
+    func saveAllCompressed() {
+        let finished = compressionItems.filter(\.isFinished)
+        guard !finished.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.title = "압축한 파일을 저장할 폴더 선택"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "저장"
+        if let folder = lastCompressionSaveFolder { panel.directoryURL = folder }
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        var saved = 0
+        for item in finished {
+            guard let output = item.output else { continue }
+            let target = CompressionWorkspace.uniqueURL(in: directory, name: CompressionWorkspace.saveName(for: item))
+            do {
+                try FileManager.default.copyItem(at: output, to: target)
+                saved += 1
+            } catch {
+                compressionError = "저장하지 못했습니다: \(error.localizedDescription)"
+            }
+        }
+        lastCompressionSaveFolder = directory
+        compressionStatus = "\(saved)개를 저장했습니다: \(directory.lastPathComponent)"
+        NSWorkspace.shared.activateFileViewerSelecting([directory])
+    }
+
+    /// Two photos from different folders can share a name, and a batch save must
+    /// not have the second silently replace the first.
+    func copyCompressed(_ item: CompressionItem) {
+        guard let output = item.output else {
+            compressionError = "결과 파일을 찾지 못했습니다."
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([output as NSURL])
+        compressionStatus = "클립보드에 복사했습니다: \(item.source.lastPathComponent)"
+    }
+
+    func revealCompressed(_ item: CompressionItem) {
+        guard let output = item.output else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([output])
+    }
+
+    /// The Photos import runs in the view (that is where the picker lives) but
+    /// the status line belongs to the controller, so it gets one way in.
+    func reportCompressionStatus(_ text: String) {
+        compressionStatus = text
+    }
+
+    func clearCompression() {
+        guard !isCompressing else { return }
+        compressionItems = []
+        compressionError = nil
+        compressionStatus = "사진·PDF·영상을 넣으면 이 Mac에서 용량을 줄입니다."
     }
 
     // MARK: 색 저장
@@ -944,6 +1623,9 @@ final class AutomationController: ObservableObject {
     }
 
     func selectRecording(_ recording: RecordingItem) {
+        // Playback belongs to the take on screen: moving the selection must not
+        // leave the previous recording playing behind the new one.
+        recordingPlayer.stopUnless(recording)
         selectedRecordingID = recording.id
         selectLatestTranscript(for: recording)
     }
@@ -1076,21 +1758,7 @@ final class AutomationController: ObservableObject {
 
     func togglePlayback() {
         guard let recording = selectedRecording else { return }
-        guard recording.isLocallyAvailable else {
-            transcriptionError = "이 녹음은 iCloud에만 있습니다. 음성 메모 앱에서 먼저 재생해 다운로드해 주세요."
-            return
-        }
-        if let audioPlayer, audioPlayer.isPlaying {
-            audioPlayer.stop()
-            isPlayingRecording = false
-            return
-        }
-        do {
-            let player = try AVAudioPlayer(contentsOf: recording.url)
-            player.play()
-            audioPlayer = player
-            isPlayingRecording = true
-        } catch { transcriptionError = "녹음을 재생하지 못했습니다: \(error.localizedDescription)" }
+        recordingPlayer.toggle(recording)
     }
 
     func toggleRecording() {
@@ -1134,6 +1802,12 @@ final class AutomationController: ObservableObject {
                 : "\(self.recordings.count)개 녹음"
             if let url, let match = self.recordings.first(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
                 self.selectedRecordingID = match.id
+            }
+            // A take that left the library — deleted elsewhere, or on a volume that
+            // went away — must not keep playing behind a window that no longer
+            // shows it, where nothing can stop it.
+            if let playing = self.recordingPlayer.recordingID, !self.recordings.contains(where: { $0.id == playing }) {
+                self.recordingPlayer.stop()
             }
         }
     }
@@ -1214,6 +1888,7 @@ final class AutomationController: ObservableObject {
     func delete(_ recording: RecordingItem) {
         guard recording.source == .app else { return }
         do {
+            recordingPlayer.stop(ifPlaying: recording)
             try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
             transcriptArchive.runsByRecording.removeValue(forKey: recording.id)
             transcriptArchive.save()
@@ -1240,33 +1915,55 @@ final class AutomationController: ObservableObject {
 struct MenuContentView: View {
     @ObservedObject var controller: AutomationController
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack(spacing: Spacing.m) {
                 Image(systemName: controller.isRunning ? "arrow.triangle.2.circlepath.circle.fill" : "graduationcap.circle.fill")
-                    .font(.title2).foregroundStyle(Color.snuBlue)
-                VStack(alignment: .leading) {
+                    .font(.title2)
+                    .foregroundStyle(Color.snuBlueLabel)
+                    .symbolEffect(.rotate, options: .repeating, isActive: controller.isRunning)
+                VStack(alignment: .leading, spacing: 1) {
                     Text("서울대 로컬 에이전트").font(.headline)
                     Text(controller.phase.rawValue).font(.caption).foregroundStyle(.secondary)
                 }
+                Spacer()
             }
+
             Divider()
-            ProgressView(value: controller.progressValue)
-                .tint(.snuBlue)
-            VStack(alignment: .leading, spacing: 5) {
-                ProgressStep(title: "새 항목 수집", isCurrent: controller.phase == .collecting, isDone: controller.phase == .classifying || controller.phase == .writing || controller.phase == .completed)
-                ProgressStep(title: "로컬 모델 로드 · 분류", isCurrent: controller.phase == .classifying, isDone: controller.phase == .writing || controller.phase == .completed)
-                ProgressStep(title: "Notion 브리핑 작성", isCurrent: controller.phase == .writing, isDone: controller.phase == .completed)
-                ProgressStep(title: "모델 언로드", isCurrent: controller.phase == .completed, isDone: controller.phase == .completed)
+
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                ProgressView(value: controller.progressValue).tint(.snuBlue)
+                VStack(alignment: .leading, spacing: 5) {
+                    ProgressStep(title: "새 항목 수집", isCurrent: controller.phase == .collecting, isDone: controller.phase == .classifying || controller.phase == .writing || controller.phase == .completed)
+                    ProgressStep(title: "로컬 모델 로드 · 분류", isCurrent: controller.phase == .classifying, isDone: controller.phase == .writing || controller.phase == .completed)
+                    ProgressStep(title: "보관함에 저장", isCurrent: controller.phase == .writing, isDone: controller.phase == .completed)
+                    ProgressStep(title: "모델 언로드", isCurrent: controller.phase == .completed, isDone: controller.phase == .completed)
+                }
+                Text(controller.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let error = controller.errorMessage {
+                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(3)
+                }
+                Button(controller.isRunning ? "중지" : "인박스 정리 시작",
+                       systemImage: controller.isRunning ? "stop.fill" : "tray.full.fill") {
+                    controller.isRunning ? controller.stopBriefing() : controller.startBriefing()
+                }
+                .buttonStyle(.bordered)
+                .tint(controller.isRunning ? .red : .snuBlue)
+                .controlSize(.small)
             }
-            Text(controller.detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            if let error = controller.errorMessage { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
-            Divider()
-            HStack(spacing: 10) {
+            .padding(Spacing.m)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .glassPanel(Radius.card)
+
+            HStack(spacing: Spacing.m) {
                 Image(systemName: controller.dictation.isRecording ? "mic.fill" : "mic")
-                    .foregroundStyle(controller.dictation.isRecording ? Color.red : Color.snuBlue)
+                    .foregroundStyle(controller.dictation.isRecording ? AnyShapeStyle(Color.red) : AnyShapeStyle(Color.snuBlueLabel))
                     .frame(width: 16)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("받아쓰기").font(.subheadline)
@@ -1281,201 +1978,672 @@ struct MenuContentView: View {
                 } else {
                     Button(controller.dictation.isRecording ? "중지" : "시작") { controller.dictation.toggle() }
                         .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(controller.dictation.isRecording ? .red : nil)
                 }
             }
+            .padding(Spacing.m)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .glassPanel(Radius.card)
+
             if let error = controller.dictation.errorMessage {
                 Text(error).font(.caption2).foregroundStyle(.red).lineLimit(2)
             }
+
             Divider()
-            Button("앱 열기", systemImage: "macwindow") {
-                dismiss()
-                DispatchQueue.main.async {
-                    openWindow(id: "main")
+
+            HStack(spacing: Spacing.s) {
+                Button("앱 열기", systemImage: "macwindow") {
+                    dismiss()
+                    DispatchQueue.main.async {
+                        openWindow(id: "main")
+                        NSApp.activate()
+                    }
                 }
-            }
                 .buttonStyle(.borderedProminent)
                 .tint(.snuBlue)
-            Text("브리핑, 녹음·전사, 설정은 통합 앱에서 관리합니다.")
-                .font(.caption).foregroundStyle(.secondary)
-            Divider()
-            Button("종료", role: .destructive) { NSApplication.shared.terminate(nil) }
+                Button("설정…", systemImage: "gearshape") {
+                    dismiss()
+                    DispatchQueue.main.async { openSettings() }
+                }
+                .buttonStyle(.bordered)
+                .help("⌘, 로도 열 수 있습니다")
+                Spacer()
+                Button("종료", role: .destructive) { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.borderless)
+            }
         }
-        .padding(16)
-        .frame(width: 360)
+        .padding(Spacing.l)
+        .frame(width: 380)
+        .animation(.appControl, value: controller.phase)
+        .animation(.appControl, value: controller.dictation.isRecording)
     }
 }
 
+
 private struct MainWorkspaceView: View {
     @ObservedObject var controller: AutomationController
-    @State private var section: AppSection? = .overview
+
     var body: some View {
         NavigationSplitView {
-            List(AppSection.allCases, selection: $section) { item in
-                Label(item.title, systemImage: item.symbol).tag(item)
+            List(selection: Binding(get: { controller.section }, set: { controller.section = $0 ?? .overview })) {
+                // Grouped rather than a flat pile: 개요, four tools and the
+                // automation are not peers of one another.
+                ForEach(AppSection.Group.allCases) { group in
+                    Section(group.rawValue) {
+                        ForEach(group.members) { item in
+                            Label(item.title, systemImage: item.symbol).tag(item)
+                        }
+                    }
+                }
             }
-            .navigationTitle("서울대 로컬 에이전트")
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
         } detail: {
-            switch section ?? .overview {
-            case .overview: OverviewView(controller: controller)
-            case .transcription: TranscriptionWindowView(controller: controller, compact: false)
-            case .documents: DocumentRecognitionView(controller: controller)
-            case .cutout: CutoutView(controller: controller)
-            case .briefing: BriefingStatusWorkspaceView(controller: controller)
-            case .settings: TranscriptionSettingsPanel(controller: controller)
+            Group {
+                switch controller.section {
+                case .overview: OverviewView(controller: controller)
+                case .documents: DocumentRecognitionView(controller: controller)
+                case .scan: ScanCorrectionView(controller: controller)
+                case .pdf: PDFEditorView(controller: controller)
+                case .transcription: TranscriptionView(controller: controller)
+                case .audioCleanup: AudioCleanupView(controller: controller)
+                case .cutout: CutoutView(controller: controller)
+                case .upscale: UpscaleView(controller: controller)
+                case .compression: FileCompressionView(controller: controller)
+                case .convert: FileConversionView(controller: controller)
+                case .briefing: BriefingStatusWorkspaceView(controller: controller)
+                case .archive: BriefingArchiveView(controller: controller)
+                }
             }
+            // Screens now carry their own name into the title bar, so switching
+            // sections crossfades the body rather than swapping it instantly.
+            .animation(.appContent, value: controller.section)
         }
+        .task { controller.openLaunchFiles() }
         .navigationSplitViewStyle(.balanced)
+        // The window's minimum belongs to the window, not to whichever screen
+        // happens to be showing. It used to be a `minWidth: 760` buried inside
+        // 녹음·전사 alone, so picking that one tab raised the whole window's
+        // minimum while every other tab had none at all.
+        .frame(minWidth: 940, minHeight: 620)
     }
 }
 
 private struct OverviewView: View {
     @ObservedObject var controller: AutomationController
+    @Environment(\.openSettings) private var openSettings
+
+    private let columns = [GridItem(.adaptive(minimum: 210), spacing: Spacing.l)]
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("오늘의 로컬 에이전트").font(.largeTitle.weight(.semibold))
-            Text("녹음 전사와 개인 브리핑은 모두 이 Mac에서 처리됩니다.").foregroundStyle(.secondary)
-            HStack(spacing: 14) {
-                StatusTile(title: "녹음 보관함", value: "\(controller.recordings.count)개", symbol: "waveform")
-                StatusTile(title: "자동 브리핑", value: controller.phase.rawValue, symbol: "tray.full")
+        WorkspaceScreen(title: AppSection.overview.title, subtitle: AppSection.overview.subtitle) {
+            LazyVGrid(columns: columns, spacing: Spacing.l) {
+                StatusTile(
+                    title: "자동 브리핑",
+                    value: controller.phase.rawValue,
+                    detail: controller.isRunning ? controller.briefingETAString : controller.selectedRange.rawValue,
+                    symbol: "tray.full",
+                    isBusy: controller.isRunning
+                ) { controller.section = .briefing }
+
+                StatusTile(
+                    title: "녹음 보관함",
+                    value: "\(controller.recordings.count)개",
+                    detail: controller.recordings.first?.title ?? "아직 녹음이 없습니다",
+                    symbol: "waveform",
+                    isBusy: controller.isTranscribing || controller.audioRecorder.isRecording
+                ) { controller.section = .transcription }
+
                 StatusTile(
                     title: "받아쓰기 단축키",
                     value: controller.dictation.shortcut == .disabled ? "꺼짐" : controller.dictation.shortcut.title,
-                    symbol: "mic"
-                )
+                    detail: controller.dictation.status,
+                    symbol: controller.dictation.isRecording ? "mic.fill" : "mic",
+                    isBusy: controller.dictation.isRecording || controller.dictation.isTranscribing
+                ) { openSettings() }
             }
-            Text(controller.dictation.status).font(.caption).foregroundStyle(.secondary)
-            Spacer()
-        }.padding(32)
+
+            today
+
+            if !controller.processingQueue.isEmpty {
+                ProcessingQueueCard(controller: controller)
+                    .transition(.appCard)
+            }
+
+            recentRecordings
+
+            tools
+
+            GroupBox {
+                HStack(spacing: Spacing.s) {
+                    Button(controller.isRunning ? "브리핑 중지" : "인박스 정리 시작",
+                           systemImage: controller.isRunning ? "stop.fill" : "tray.full.fill") {
+                        controller.isRunning ? controller.stopBriefing() : controller.startBriefing()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(controller.isRunning ? .red : .snuBlue)
+                    .help(controller.isRunning ? "실행을 중지합니다 (⌘.)" : "지금 수집하고 정리합니다 (⌘R)")
+
+                    Button(controller.audioRecorder.isRecording ? "녹음 중지" : "녹음 시작",
+                           systemImage: controller.audioRecorder.isRecording ? "stop.circle.fill" : "record.circle") {
+                        controller.toggleRecording()
+                        controller.section = .transcription
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(controller.audioRecorder.isRecording ? .red : .primary)
+                    .help("녹음·전사 화면으로 이동하며 녹음을 시작합니다")
+
+                    Button("화면 영역 캡처", systemImage: "camera.viewfinder") {
+                        controller.section = .documents
+                        controller.captureScreenAndRecognize()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(controller.isRecognizingDocument)
+                    .help("화면 일부를 골라 바로 텍스트로 인식합니다")
+
+                    Spacer()
+
+                    if !controller.briefingArchive.days.isEmpty {
+                        Button("최근 브리핑", systemImage: "checklist", action: controller.openLatestResult)
+                            .buttonStyle(.link)
+                            .font(.callout)
+                            .help("가장 최근 브리핑을 보관함에서 엽니다 (⇧⌘B)")
+                    }
+                }
+            } label: {
+                Label("지금 할 수 있는 것", systemImage: "bolt").font(.headline)
+            }
+        }
+        .animation(.appContent, value: controller.processingQueue.map(\.id))
+        .animation(.appContent, value: controller.isRunning)
+        .task { controller.refreshToday() }
+    }
+
+    /// What is actually happening today: the Mac's own calendar, and whatever
+    /// the briefing says is due before the day is out.
+    ///
+    /// Both halves are already on this machine — the calendar is read for the
+    /// briefing anyway and the deadlines are in the archive — so this costs one
+    /// EventKit query and no network at all. It stays hidden on a day with
+    /// nothing in it rather than showing an empty box.
+    @ViewBuilder
+    private var today: some View {
+        let due = controller.briefingArchive.dueToday()
+        if !controller.todayEvents.isEmpty || !due.isEmpty {
+            GroupBox {
+                VStack(spacing: 0) {
+                    ForEach(Array(controller.todayEvents.enumerated()), id: \.element.id) { index, event in
+                        if index > 0 { Divider() }
+                        row(symbol: "calendar", tint: .snuBlueLabel, lead: event.timeText, title: event.title, trailing: event.calendarTitle) {
+                            NSWorkspace.shared.open(URL(string: "ical://")!)
+                        }
+                    }
+                    ForEach(Array(due.prefix(BriefingArchiveModel.dueTodayLimit).enumerated()), id: \.element.id) { index, entry in
+                        if index > 0 || !controller.todayEvents.isEmpty { Divider() }
+                        row(
+                            symbol: entry.isOverdue() ? "exclamationmark.triangle.fill" : "circle.badge.exclamationmark",
+                            tint: entry.isOverdue() ? .red : .orange,
+                            // A two-week-old deadline under a heading that says
+                            // 오늘 reads as a bug unless it says it is late.
+                            lead: entry.isOverdue() ? "지남 · \(entry.deadlineText ?? "")" : (entry.deadlineText ?? "오늘"),
+                            title: entry.title,
+                            trailing: entry.source
+                        ) {
+                            controller.briefingArchive.selectedDateKey = entry.dateKey
+                            controller.section = .archive
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: Spacing.s) {
+                    Label("오늘", systemImage: "calendar.day.timeline.left").font(.headline)
+                    if !due.isEmpty {
+                        let late = due.filter { $0.isOverdue() }.count
+                        Text(late > 0 ? "지난 마감 \(late)개" : "마감 \(due.count)개")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(late > 0 ? .red : .orange)
+                    }
+                }
+            }
+            .transition(.appCard)
+        }
+    }
+
+    private func row(symbol: String, tint: Color, lead: String, title: String, trailing: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: Spacing.m) {
+                Image(systemName: symbol).foregroundStyle(tint).frame(width: 16)
+                Text(lead)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .frame(width: 150, alignment: .leading)
+                Text(title).font(.callout).lineLimit(1)
+                Spacer(minLength: Spacing.s)
+                Text(trailing).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+            }
+            .padding(.vertical, 6)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Every tool, with a few words about what it is for.
+    ///
+    /// The sidebar lists the same names, but nine of them is past what anyone
+    /// holds in their head, and the sidebar has no room to say what any of them
+    /// does. This is the screen where the answer to "어디서 하지?" lives.
+    private var tools: some View {
+        GroupBox {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 215), spacing: Spacing.m)], spacing: Spacing.m) {
+                ForEach(AppSection.allCases.filter { $0 != .overview }) { section in
+                    ToolShortcut(section: section) { controller.section = section }
+                }
+            }
+            .padding(.top, Spacing.xs)
+        } label: {
+            Label("도구", systemImage: "square.grid.2x2").font(.headline)
+        }
+    }
+
+    /// The five most recent takes, so the first screen is a place to resume work
+    /// rather than a place to read three numbers and leave.
+    @ViewBuilder
+    private var recentRecordings: some View {
+        if !controller.recordings.isEmpty {
+            GroupBox {
+                VStack(spacing: 0) {
+                    ForEach(Array(controller.recordings.prefix(5).enumerated()), id: \.element.id) { index, recording in
+                        if index > 0 { Divider() }
+                        Button {
+                            controller.selectRecording(recording)
+                            controller.section = .transcription
+                        } label: {
+                            HStack(spacing: Spacing.m) {
+                                Image(systemName: recording.source == .app ? "mic.fill" : "waveform")
+                                    .foregroundStyle(Color.snuBlueLabel)
+                                    .frame(width: 18)
+                                Text(recording.title).lineLimit(1)
+                                Spacer(minLength: Spacing.s)
+                                let runs = controller.transcriptRuns(for: recording).count
+                                if runs > 0 {
+                                    Label("\(runs)", systemImage: "doc.on.doc.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.green)
+                                        .help("전사본 \(runs)개")
+                                }
+                                Text(recording.date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.vertical, Spacing.s)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("녹음·전사에서 이 녹음을 엽니다")
+                    }
+                }
+            } label: {
+                Label("최근 녹음", systemImage: "clock.arrow.circlepath").font(.headline)
+            }
+        }
     }
 }
 
-private struct StatusTile: View {
-    let title: String; let value: String; let symbol: String
-    var body: some View { VStack(alignment: .leading, spacing: 10) { Image(systemName: symbol).font(.title2).foregroundStyle(Color.snuBlue); Text(title).font(.caption).foregroundStyle(.secondary); Text(value).font(.title3.weight(.semibold)) }.frame(width: 180, alignment: .leading).padding(18).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous)) }
+/// One tool on the 개요 launcher: its symbol, its name, and what it is for.
+private struct ToolShortcut: View {
+    let section: AppSection
+    let open: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: open) {
+            HStack(spacing: Spacing.m) {
+                Image(systemName: section.symbol)
+                    .font(.title3)
+                    .foregroundStyle(Color.snuBlueLabel)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(section.title).font(.callout.weight(.medium))
+                    Text(section.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(Spacing.m)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentCard()
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .scaleEffect(isHovering ? 1.015 : 1)
+        .animation(.appControl, value: isHovering)
+        .help(section.subtitle)
+        .accessibilityLabel("\(section.title) 화면으로 이동")
+    }
 }
+
+/// A tile that is also the way into the screen it summarises. Fixed 180-point
+/// tiles used to sit in a row that could not reflow, and clicking one did
+/// nothing.
+private struct StatusTile: View {
+    let title: String
+    let value: String
+    var detail: String = ""
+    let symbol: String
+    var isBusy = false
+    let open: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: open) {
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                HStack {
+                    Image(systemName: symbol)
+                        .font(.title2)
+                        .foregroundStyle(Color.snuBlueLabel)
+                    Spacer()
+                    if isBusy { ProgressView().controlSize(.small) }
+                }
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                Text(value).font(.title3.weight(.semibold)).lineLimit(1)
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
+            .padding(Spacing.l)
+            .glassPanel()
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .scaleEffect(isHovering ? 1.015 : 1)
+        .animation(.appControl, value: isHovering)
+        .accessibilityLabel("\(title), \(value)")
+        .accessibilityHint("열려면 클릭하세요")
+    }
+}
+
 
 private struct BriefingStatusWorkspaceView: View {
     @ObservedObject var controller: AutomationController
+    @Environment(\.openSettings) private var openSettings
+
+    private var isDone: Bool { controller.phase == .completed }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            HStack {
-                VStack(alignment: .leading) { Text("자동 브리핑").font(.largeTitle.weight(.semibold)); Text("수집부터 결과 작성까지의 상태를 확인합니다.").foregroundStyle(.secondary) }
-                Spacer()
-                Button(controller.isRunning ? "중지" : "인박스 정리 시작", systemImage: controller.isRunning ? "stop.fill" : "tray.full.fill") { controller.isRunning ? controller.stopBriefing() : controller.startBriefing() }.buttonStyle(.borderedProminent).tint(controller.isRunning ? .red : .snuBlue)
+        WorkspaceScreen(title: AppSection.briefing.title, subtitle: AppSection.briefing.subtitle) {
+            conditions
+            progressPanel
+            if let error = controller.errorMessage {
+                DismissibleError(message: error) { controller.errorMessage = nil }
             }
- HStack {
- Label(controller.selectedRange.rawValue, systemImage: "calendar.badge.clock")
- Text("· \(controller.briefingQualityMode.title)").foregroundStyle(.secondary)
- Spacer()
- Text("설정에서 변경").font(.caption).foregroundStyle(.secondary)
- }
-            VStack(alignment: .leading, spacing: 12) {
-                HStack { Label(controller.phase.rawValue, systemImage: controller.isRunning ? "arrow.triangle.2.circlepath" : "checkmark.circle").font(.headline).foregroundStyle(Color.snuBlue); Spacer(); Text(controller.isRunning ? "실행 중" : "대기").font(.caption.weight(.medium)).foregroundStyle(.secondary) }
- ProgressView(value: controller.progressValue).tint(.snuBlue)
- if !controller.briefingETAString.isEmpty {
- Label(controller.briefingETAString, systemImage: "clock.arrow.circlepath")
- .font(.callout.weight(.medium)).foregroundStyle(.secondary).monospacedDigit()
- }
-                BriefingStatusRow(title: "새 항목 수집", active: controller.phase == .collecting, done: controller.phase == .classifying || controller.phase == .writing || controller.phase == .completed)
-                BriefingStatusRow(title: "로컬 모델 분류", active: controller.phase == .classifying, done: controller.phase == .writing || controller.phase == .completed)
-                BriefingStatusRow(title: "Notion 브리핑 작성", active: controller.phase == .writing, done: controller.phase == .completed)
-                BriefingStatusRow(title: "모델 언로드", active: controller.phase == .completed, done: controller.phase == .completed)
-                Text(controller.detail).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                if let error = controller.errorMessage { Text(error).font(.caption).foregroundStyle(.red) }
-            }.padding(20).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            if controller.lastBriefing?.notionURL != nil { Button("최근 브리핑 보기", systemImage: "doc.text.magnifyingglass", action: controller.openLatestResult).buttonStyle(.bordered) }
+        }
+        .animation(.appContent, value: controller.phase)
+        .animation(.appContent, value: controller.errorMessage)
+        .toolbar {
+            ToolbarItem {
+                Button("보관함 열기", systemImage: "checklist", action: controller.openLatestResult)
+                    .disabled(controller.briefingArchive.days.isEmpty)
+                    .help("정리된 결과를 브리핑 보관함에서 봅니다 (⇧⌘B)")
+            }
+            ToolbarSpacer(.flexible)
+            ToolbarItem {
+                if controller.isRunning {
+                    Button("중지", systemImage: "stop.fill") { controller.stopBriefing() }
+                        .tint(.red)
+                        .help("모델을 안전하게 해제하고 멈춥니다 (⌘.)")
+                } else {
+                    Button("인박스 정리 시작", systemImage: "tray.full.fill") { controller.startBriefing() }
+                        .buttonStyle(.glassProminent)
+                        .tint(.snuBlue)
+                        .help("지금 수집하고 분류해 보관함에 저장합니다 (⌘R)")
+                }
+            }
+        }
+    }
+
+    private var conditions: some View {
+        HStack(spacing: Spacing.s) {
+            Label(controller.selectedRange.rawValue, systemImage: "calendar.badge.clock")
+                .font(.callout)
+            Text("·").foregroundStyle(.tertiary)
+            Text(controller.briefingQualityMode.title)
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Spacer()
-        }.padding(32)
+            Button("설정에서 변경") { openSettings() }
+                .buttonStyle(.link)
+                .font(.caption)
+                .help("수집 범위와 분석 품질을 바꿉니다 (⌘,)")
+        }
+        .padding(.horizontal, Spacing.l)
+        .padding(.vertical, Spacing.m)
+        .glassPanel(Radius.card)
+    }
+
+    private var progressPanel: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack {
+                Label(controller.phase.rawValue, systemImage: controller.isRunning ? "arrow.triangle.2.circlepath" : (isDone ? "checkmark.circle.fill" : "circle.dashed"))
+                    .font(.headline)
+                    .foregroundStyle(isDone ? Color.green : Color.snuBlueLabel)
+                    .symbolEffect(.rotate, options: .repeating, isActive: controller.isRunning)
+                Spacer()
+                Text(controller.isRunning ? "실행 중" : "대기")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: controller.progressValue).tint(.snuBlue)
+            if !controller.briefingETAString.isEmpty {
+                Label(controller.briefingETAString, systemImage: "clock.arrow.circlepath")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .transition(.appBanner)
+            }
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                BriefingStatusRow(title: "새 항목 수집", active: controller.phase == .collecting, done: controller.phase == .classifying || controller.phase == .writing || isDone)
+                BriefingStatusRow(title: "로컬 모델 분류", active: controller.phase == .classifying, done: controller.phase == .writing || isDone)
+                BriefingStatusRow(title: "보관함에 저장", active: controller.phase == .writing, done: isDone)
+                BriefingStatusRow(title: "모델 언로드", active: isDone, done: isDone)
+            }
+            Text(controller.detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Spacing.l)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassPanel()
     }
 }
 
+
 private struct BriefingStatusRow: View {
-    let title: String; let active: Bool; let done: Bool
-    var body: some View { HStack(spacing: 9) { Image(systemName: done ? "checkmark.circle.fill" : (active ? "circle.inset.filled" : "circle")).foregroundStyle(done ? .green : (active ? Color.snuBlue : .secondary)); Text(title).foregroundStyle(active ? .primary : .secondary); Spacer() } }
+    let title: String
+    let active: Bool
+    let done: Bool
+
+    var body: some View {
+        HStack(spacing: Spacing.s) {
+            Image(systemName: done ? "checkmark.circle.fill" : (active ? "circle.inset.filled" : "circle"))
+                .foregroundStyle(done ? .green : (active ? Color.snuBlueLabel : .secondary))
+                .symbolEffect(.pulse, options: .repeating, isActive: active)
+            Text(title)
+                .font(.callout)
+                .foregroundStyle(active ? .primary : .secondary)
+            Spacer()
+        }
+        .animation(.appControl, value: done)
+        .animation(.appControl, value: active)
+    }
 }
 
-private struct TranscriptionSettingsPanel: View {
+/// The ⌘, window. These nine sections used to be one `Form` inside a sidebar
+/// row, with six `TextEditor`s in a single scroll that ran several screens long.
+/// Splitting them by subject is the difference between finding a setting and
+/// hunting for it.
+private struct SettingsWindow: View {
+    @ObservedObject var controller: AutomationController
+
+    var body: some View {
+        TabView {
+            Tab("브리핑", systemImage: "tray.full") {
+                BriefingSettingsTab(controller: controller)
+            }
+            Tab("분류 기준", systemImage: "line.3.horizontal.decrease.circle") {
+                ClassificationSettingsTab(controller: controller)
+            }
+            Tab("전사", systemImage: "waveform") {
+                TranscriptionSettingsTab(controller: controller)
+            }
+            Tab("받아쓰기", systemImage: "mic") {
+                Form { DictationSettingsSection(dictation: controller.dictation) }
+                    .formStyle(.grouped)
+            }
+            Tab("도구", systemImage: "wand.and.stars") {
+                ToolSettingsTab(controller: controller)
+            }
+        }
+        .frame(width: 620, height: 520)
+    }
+}
+
+private struct BriefingSettingsTab: View {
+    /// Read once per launch: the pane is rebuilt on every keystroke and must not
+    /// touch the disk each time.
+    private static let webNoticeSiteCount = WebNoticeConfiguration.load().filter(\.enabled).count
     @ObservedObject var controller: AutomationController
     @AppStorage("slackMentionUserID") private var slackMentionUserID = ""
-    @State private var diarizationToken = ""
-    @State private var diarizationTokenStatus = ""
+
     var body: some View {
         Form {
-            Section("자동 브리핑") {
+            Section("수집") {
                 Picker("수집 범위", selection: $controller.selectedRange) {
                     ForEach(CollectionRange.allCases) { Text($0.rawValue).tag($0) }
                 }
                 Picker("분석 품질", selection: $controller.briefingQualityMode) {
                     ForEach(BriefingQualityMode.allCases) { Text($0.title).tag($0) }
                 }
-                Text(controller.briefingQualityMode.explanation).foregroundStyle(.secondary)
+                Text(controller.briefingQualityMode.explanation).font(.caption).foregroundStyle(.secondary)
                 Stepper("TODO 최대 \(controller.briefingMaxActions)개", value: $controller.briefingMaxActions, in: 3...20)
                 Stepper("확인 항목 최대 \(controller.briefingMaxReferences)개", value: $controller.briefingMaxReferences, in: 3...20)
                 TextField("내 Slack Member ID (채널 멘션용)", text: $slackMentionUserID)
-                Text("Slack DM은 Member ID 없이 수집하며, 채널은 이 ID의 멘션만 수집합니다. 기본 수집 범위는 최근 7일입니다.")
-                    .foregroundStyle(.secondary)
+                Text("Slack DM은 Member ID 없이 수집하며, 채널은 이 ID의 멘션만 수집합니다. `마지막 성공 이후`는 직전 실행이 수동 재검토였어도 그 시점부터 이어서 수집하고, 기록이 없으면 최대 30일까지 거슬러 봅니다.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section("수집 연동") {
+            Section("연동") {
                 IntegrationStatusRow(symbol: "envelope", title: "Gmail", detail: "두 계정 · 읽기 전용", status: "읽기 전용")
                 IntegrationStatusRow(symbol: "bubble.left.and.bubble.right", title: "Slack", detail: "DM 및 내 멘션 · 읽기 전용", status: "읽기 전용")
                 IntegrationStatusRow(symbol: "message", title: "메시지", detail: "iMessage · SMS · RCS · 읽기 전용", status: "Full Disk Access 필요")
-                IntegrationStatusRow(symbol: "calendar", title: "캘린더", detail: "앞으로 14일 일정 · 읽기 전용", status: controller.calendarAuthorizationStatus) {
-                    Button("권한 허용") { controller.requestCalendarReadAccess() }
+                IntegrationStatusRow(
+                    symbol: "globe",
+                    title: "웹 공지",
+                    detail: "학교 공지 게시판 \(Self.webNoticeSiteCount)곳 · 공개 페이지만 읽음",
+                    status: "읽기 전용"
+                ) {
+                    Button("목록 편집") {
+                        NSWorkspace.shared.activateFileViewerSelecting([WebNoticeConfiguration.url])
+                    }
+                    .buttonStyle(.borderless)
+                    .help("web-notices.json을 Finder에서 엽니다")
+                }
+                IntegrationStatusRow(symbol: "calendar", title: "캘린더", detail: "앞으로 14일 일정 읽기 · 전용 캘린더에 쓰기", status: controller.calendarAuthorizationStatus) {
+                    Button("권한 허용") { controller.requestCalendarAccess() }
                         .buttonStyle(.bordered)
-                        .disabled(controller.calendarAuthorizationStatus == "읽기 허용됨")
+                        .disabled(controller.calendarAuthorizationStatus == "허용됨")
                 }
-                Text("캘린더 일정은 인박스 정리에 일정 맥락으로 포함됩니다. 이 버전은 어떤 원본도 생성·수정·삭제하지 않습니다.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                IntegrationStatusRow(symbol: "checklist", title: "미리 알림", detail: "전용 목록에 쓰기 전용", status: controller.reminderAuthorizationStatus) {
+                    Button("권한 허용") { controller.requestReminderAccess() }
+                        .buttonStyle(.bordered)
+                        .disabled(controller.reminderAuthorizationStatus == "허용됨")
+                }
+                Text("캘린더 일정은 인박스 정리에 일정 맥락으로 포함됩니다. 앱이 만드는 일정과 미리 알림은 전부 '\(AgentCalendar.title)' 이름의 전용 캘린더·목록에만 들어가며, 원래 쓰던 캘린더의 일정은 만들거나 고치거나 지우지 않습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section("분류 기준 · 직접 확인하고 수정") {
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct ClassificationSettingsTab: View {
+    @ObservedObject var controller: AutomationController
+
+    var body: some View {
+        Form {
+            Section("직접 확인하고 수정") {
                 Text("아래 내용만 개인 맞춤 분류에 사용합니다. 앱 내부에 숨은 중요/무시 발신자 목록을 두지 않습니다.")
-                    .foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $controller.briefingUserInstructions)
-                    .font(.body.monospaced()).frame(minHeight: 150)
-                LabeledContent("항상 중요") {
-                    TextEditor(text: $controller.briefingImportantPatternsText)
-                        .font(.body.monospaced()).frame(minHeight: 90)
-                }
+                    .font(.body.monospaced()).frame(minHeight: 130)
+            }
+            Section("항상 중요") {
+                TextEditor(text: $controller.briefingImportantPatternsText)
+                    .font(.body.monospaced()).frame(minHeight: 80)
                 Text("발신자·도메인·제목·본문에 포함될 문자열을 한 줄에 하나씩 입력합니다. 중요 규칙은 무시 규칙보다 우선합니다.")
-                    .foregroundStyle(.secondary)
-                LabeledContent("항상 무시") {
-                    TextEditor(text: $controller.briefingIgnoredPatternsText)
-                        .font(.body.monospaced()).frame(minHeight: 90)
-                }
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("항상 무시") {
+                TextEditor(text: $controller.briefingIgnoredPatternsText)
+                    .font(.body.monospaced()).frame(minHeight: 80)
                 Text("무시 규칙과 일치한 항목은 본문 요약과 모델 분석에서 제외되고 건수만 기록됩니다.")
-                    .foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
                 HStack {
-                    Button("분류 설정 저장", action: controller.saveBriefingPreferences).buttonStyle(.borderedProminent)
+                    Button("저장", action: controller.saveBriefingPreferences)
+                        .buttonStyle(.borderedProminent).tint(.snuBlue)
                     Button("기본값 복원", action: controller.resetBriefingPreferences)
+                    Spacer()
                     if !controller.briefingPreferencesStatus.isEmpty {
-                        Text(controller.briefingPreferencesStatus).font(.caption).foregroundStyle(.secondary)
+                        Text(controller.briefingPreferencesStatus)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .transition(.appBanner)
                     }
                 }
+                .animation(.appContent, value: controller.briefingPreferencesStatus)
             }
-            Section("기본 전사 설정") {
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct TranscriptionSettingsTab: View {
+    @ObservedObject var controller: AutomationController
+    @State private var diarizationToken = ""
+    @State private var diarizationTokenStatus = ""
+
+    var body: some View {
+        Form {
+            Section("기본값") {
                 Picker("언어", selection: $controller.transcriptionLanguage) { ForEach(TranscriptionLanguage.allCases) { Text($0.title).tag($0) } }
                 Picker("인식 모델", selection: $controller.asrModel) { ForEach(ASRModelChoice.allCases) { Text($0.title).tag($0) } }
-                Text(controller.asrModel.explanation).foregroundStyle(.secondary)
+                Text(controller.asrModel.explanation).font(.caption).foregroundStyle(.secondary)
                 Picker("시간 표시", selection: $controller.transcriptionTimestampMode) { ForEach(TranscriptionTimestampMode.allCases) { Text($0.title).tag($0) } }
-            }
-            Section("문서 인식") {
-                Picker("인식 방식", selection: $controller.documentMode) { ForEach(DocumentRecognitionMode.allCases) { Text($0.title).tag($0) } }
-                Text(controller.documentMode.detail).foregroundStyle(.secondary)
-            }
-            Section("누끼 따기") {
-                Picker("누끼 모델", selection: $controller.mattingModel) { ForEach(MattingModelChoice.allCases) { Text($0.title).tag($0) } }
-                Text(controller.mattingModel.detail).foregroundStyle(.secondary)
-                Text("모델은 마지막 사진 이후 5분이 지나면 스스로 메모리에서 내려가고, 앱을 끄면 함께 종료됩니다.")
+                Text("녹음·전사 화면에서 이번 전사만 다르게 지정할 수도 있습니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("화자 구분") {
                 Picker("분리 모델", selection: $controller.diarization) { ForEach(DiarizationChoice.allCases) { Text($0.title).tag($0) } }
-                Text(controller.diarization.explanation).foregroundStyle(.secondary)
-                Text("음성 인식 뒤에 별도 pyannote 모델로 실행됩니다.").foregroundStyle(.secondary)
+                Text(controller.diarization.explanation).font(.caption).foregroundStyle(.secondary)
                 SecureField("Hugging Face pyannote 토큰 (hf_…)", text: $diarizationToken)
                 HStack {
-                    Button("화자 분리 토큰을 Keychain에 저장") {
+                    Button("Keychain에 저장") {
                         do {
                             try TranscriptionService.saveDiarizationToken(diarizationToken)
                             diarizationToken = ""
@@ -1492,8 +2660,7 @@ private struct TranscriptionSettingsPanel: View {
                 Text("Community-1 또는 Legacy 3.1을 쓰려면 해당 Hugging Face 모델 약관을 승인한 토큰이 필요합니다. 토큰은 저장소가 아닌 macOS Keychain에만 저장됩니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            DictationSettingsSection(dictation: controller.dictation)
-            Section("전사 AI 정리") {
+            Section("AI 정리") {
                 Toggle("전사 완료 후 자동으로 AI 정리", isOn: $controller.automaticallyOrganizeTranscripts)
                 Picker("기본 정리 유형", selection: $controller.organizationKind) {
                     ForEach(TranscriptOrganizationKind.allCases) { Text($0.title).tag($0) }
@@ -1504,23 +2671,49 @@ private struct TranscriptionSettingsPanel: View {
                 Text("브리핑과 같은 로컬 모델을 사용합니다. 긴 전사는 구간별로 정리한 뒤 원문 순서대로 통합합니다.")
                     .font(.caption).foregroundStyle(.secondary)
                 DisclosureGroup("수업 정리 프롬프트") {
-                    TextEditor(text: $controller.lectureOrganizationPrompt).font(.body.monospaced()).frame(minHeight: 150)
+                    TextEditor(text: $controller.lectureOrganizationPrompt).font(.body.monospaced()).frame(minHeight: 130)
                 }
                 DisclosureGroup("회의 정리 프롬프트") {
-                    TextEditor(text: $controller.meetingOrganizationPrompt).font(.body.monospaced()).frame(minHeight: 150)
+                    TextEditor(text: $controller.meetingOrganizationPrompt).font(.body.monospaced()).frame(minHeight: 130)
                 }
                 DisclosureGroup("일반 정리 프롬프트") {
-                    TextEditor(text: $controller.generalOrganizationPrompt).font(.body.monospaced()).frame(minHeight: 150)
+                    TextEditor(text: $controller.generalOrganizationPrompt).font(.body.monospaced()).frame(minHeight: 130)
                 }
                 HStack {
-                    Button("AI 정리 설정 저장") { controller.saveOrganizationPreferences() }.buttonStyle(.borderedProminent)
+                    Button("저장") { controller.saveOrganizationPreferences() }
+                        .buttonStyle(.borderedProminent).tint(.snuBlue)
                     Button("기본 프롬프트로 복원") { controller.resetOrganizationPrompts() }
+                    Spacer()
                     if !controller.organizationPreferencesStatus.isEmpty {
-                        Text(controller.organizationPreferencesStatus).font(.caption).foregroundStyle(.secondary)
+                        Text(controller.organizationPreferencesStatus)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .transition(.appBanner)
                     }
                 }
+                .animation(.appContent, value: controller.organizationPreferencesStatus)
             }
-        }.formStyle(.grouped).padding(24).navigationTitle("설정")
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct ToolSettingsTab: View {
+    @ObservedObject var controller: AutomationController
+
+    var body: some View {
+        Form {
+            Section("문서 인식") {
+                Picker("인식 방식", selection: $controller.documentMode) { ForEach(DocumentRecognitionMode.allCases) { Text($0.title).tag($0) } }
+                Text(controller.documentMode.detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Section("누끼 따기") {
+                Picker("누끼 모델", selection: $controller.mattingModel) { ForEach(MattingModelChoice.allCases) { Text($0.title).tag($0) } }
+                Text(controller.mattingModel.detail).font(.caption).foregroundStyle(.secondary)
+                Text("모델은 마지막 사진 이후 5분이 지나면 스스로 메모리에서 내려가고, 앱을 끄면 함께 종료됩니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -1542,7 +2735,7 @@ private struct IntegrationStatusRow<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
-                .foregroundStyle(Color.snuBlue)
+                .foregroundStyle(Color.snuBlueLabel)
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -1565,301 +2758,529 @@ private extension IntegrationStatusRow where Trailing == EmptyView {
     }
 }
 
-private struct TranscriptionWindowView: View {
+/// 녹음·전사.
+///
+/// This used to exist twice: once as a sidebar screen and once as a separate
+/// `Window` scene that nothing in the app could open, and the two showed
+/// *different* controls — the unreachable window had the four transcription
+/// pickers, the sidebar one had none, so the only way to change the model from
+/// the main window was to go to 설정. There is now one screen, and it has them.
+private struct TranscriptionView: View {
     @ObservedObject var controller: AutomationController
-    var compact = true
     @State private var isDropTarget = false
+    @State private var showsAllRecordings = false
+    @State private var showsConditions = false
+
+    /// How many take cards to show before the list is folded. The grid used to
+    /// live inside its own `ScrollView` nested in the page's — the wheel then
+    /// scrolled whichever one the pointer happened to be over.
+    private static let collapsedRecordingCount = 8
+
+    private var visibleRecordings: [RecordingItem] {
+        showsAllRecordings ? controller.recordings : Array(controller.recordings.prefix(Self.collapsedRecordingCount))
+    }
 
     var body: some View {
-        ScrollView {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Label("녹음 전사", systemImage: "waveform")
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(Color.snuBlue)
-                Spacer()
-                if controller.isTranscribing { ProgressView().controlSize(.small) }
+        WorkspaceScreen(title: AppSection.transcription.title, subtitle: AppSection.transcription.subtitle) {
+            if controller.audioRecorder.isRecording { recordingBanner }
+            if let error = controller.audioRecorder.errorMessage {
+                DismissibleError(message: error) { controller.audioRecorder.dismissError() }
             }
-                Text("앱에서 바로 녹음하거나 파일을 드롭해 한국어 전사를 만듭니다. 여러 전사와 AI 자동요약은 대기열에 추가한 순서대로 하나씩 처리됩니다.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                if !controller.processingQueue.isEmpty {
-                    ProcessingQueueCard(controller: controller)
-                }
-                MediaImportCard(controller: controller)
-        if controller.audioRecorder.isRecording {
-            VStack(spacing: 12) {
-                HStack(spacing: 8) { Circle().fill(.red).frame(width: 9, height: 9); Text("녹음 중").font(.headline).foregroundStyle(.red) }
-                Image(systemName: "waveform").font(.system(size: 34, weight: .medium)).symbolEffect(.variableColor.iterative, options: .repeating).foregroundStyle(.red)
-                Text(Self.durationString(controller.audioRecorder.elapsed)).font(.system(size: 38, weight: .semibold, design: .rounded)).monospacedDigit()
-            }
-            .frame(maxWidth: .infinity).padding(20)
-            .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        }
-        HStack {
-            Button(controller.audioRecorder.isRecording ? "녹음 중지" : "녹음 시작", systemImage: controller.audioRecorder.isRecording ? "stop.circle.fill" : "record.circle") {
-                controller.toggleRecording()
-            }
-            .tint(controller.audioRecorder.isRecording ? .red : .snuBlue)
-            .buttonStyle(.borderedProminent)
 
-            if controller.audioRecorder.isRecording {
-                Text(Self.durationString(controller.audioRecorder.elapsed)).monospacedDigit().foregroundStyle(.red)
-            } else if let recording = controller.mostRecentRecording {
-                Text(recording.lastPathComponent).lineLimit(1).foregroundStyle(.secondary)
-                    Button("방금 녹음 전사 대기열 추가", systemImage: "text.badge.plus") { controller.transcribe(fileURL: recording) }
+            dropWell
+
+            if !controller.processingQueue.isEmpty {
+                ProcessingQueueCard(controller: controller)
+                    .transition(.appCard)
             }
-        }
-        if let error = controller.audioRecorder.errorMessage {
-            Text(error).font(.caption).foregroundStyle(.red)
-        }
-        HStack {
-            Text("녹음 보관함").font(.headline)
-            Text(controller.recordingLibraryStatus).font(.caption).foregroundStyle(.secondary)
-            Spacer()
-            Button("Voice Memos 폴더 연결", systemImage: "folder.badge.plus") { controller.chooseVoiceMemosFolder() }
-                .buttonStyle(.borderless)
-            Button("새로 고침", systemImage: "arrow.clockwise") { controller.refreshRecordings() }
-                .buttonStyle(.borderless)
-        }
-        ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 10) {
-                ForEach(controller.recordings) { recording in
-                    Button {
-                        controller.selectRecording(recording)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack {
-                                Image(systemName: recording.source == .app ? "mic.fill" : "waveform")
-                                    .foregroundStyle(recording.source == .app ? Color.snuBlue : .secondary)
-                        Text(recording.source.rawValue).font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                        if !recording.isLocallyAvailable {
-                            Label(controller.downloadingRecordingIDs.contains(recording.id) ? "다운로드 확인 중" : "iCloud 필요", systemImage: "icloud.and.arrow.down")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
-                                Spacer()
-                                if controller.transcribingRecordingID == recording.id {
-                                    ProgressView().controlSize(.small).tint(.snuBlue)
-                                }
-                                let runCount = controller.transcriptRuns(for: recording).count
-                                if runCount > 0 {
-                                    Label("\(runCount)", systemImage: "doc.on.doc.fill").font(.caption).foregroundStyle(.green)
-                                }
-                            }
-                            Text(recording.title).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                            HStack(spacing: 5) {
-                                Image(systemName: "calendar").imageScale(.small)
-                                Text(recording.date.formatted(date: .abbreviated, time: .shortened))
-                                Spacer()
-                                Image(systemName: "clock").imageScale(.small)
-                                Text(Self.durationString(recording.duration))
-                            }
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        .padding(12)
-                        .frame(maxWidth: .infinity, minHeight: 88, alignment: .leading)
-                        .background(controller.selectedRecordingID == recording.id ? Color.snuBlue.opacity(0.16) : Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-                .contextMenu {
-                    if !recording.isLocallyAvailable {
-                        Button("iCloud 녹음 받기", systemImage: "icloud.and.arrow.down") { controller.requestVoiceMemoDownload(recording) }
-                            .disabled(controller.downloadingRecordingIDs.contains(recording.id))
-                        Divider()
-                    }
-                            Button("전사 대기열 추가", systemImage: "text.badge.plus") { controller.transcribe(recording: recording) }
-                        .disabled(!recording.isLocallyAvailable)
-                        if recording.source == .app {
-                            Button("이름 변경…", systemImage: "pencil") { RenameRecordingPanel.present(recording: recording, controller: controller) }
-                            Divider()
-                            Button("휴지통으로 이동", systemImage: "trash", role: .destructive) { controller.delete(recording) }
-                        }
-                    }
-                }
+            if controller.isTranscribing {
+                TranscriptionProgressCard(
+                    step: controller.transcriptionStep,
+                    detail: controller.transcriptionDetail,
+                    timestamps: controller.transcriptionTimestampMode.includesTimestamps,
+                    diarizing: controller.diarization.isEnabled,
+                    eta: controller.transcriptionETA
+                )
+                .transition(.appCard)
             }
-        }
-        .frame(minHeight: 190, maxHeight: 260)
+
+            conditions
+            MediaImportCard(controller: controller)
+            library
+
             if let recording = controller.selectedRecording {
-                HStack {
-                    Text("선택: \(recording.title)").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    if !recording.isLocallyAvailable {
-                        Button(controller.downloadingRecordingIDs.contains(recording.id) ? "다운로드 확인 중" : "iCloud 녹음 받기", systemImage: "icloud.and.arrow.down") {
-                            controller.requestVoiceMemoDownload(recording)
-                        }
-                        .disabled(controller.downloadingRecordingIDs.contains(recording.id))
-                    }
-                    Button(controller.isPlayingRecording ? "재생 중지" : "재생", systemImage: controller.isPlayingRecording ? "stop.fill" : "play.fill") { controller.togglePlayback() }
-                    .disabled(!recording.isLocallyAvailable)
-                    .buttonStyle(.bordered)
-                Button("전사 대기열 추가", systemImage: "text.badge.plus") { controller.transcribe(recording: recording) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!recording.isLocallyAvailable)
+                selectedRecordingPanel(recording)
+            }
+
+            if let error = controller.transcriptionError {
+                DismissibleError(message: error) { controller.transcriptionError = nil }
+            }
+
+            if controller.selectedTranscript.isEmpty {
+                EmptyResults(symbol: "text.quote", message: controller.recordings.isEmpty
+                             ? "아직 녹음이 없습니다.\n툴바에서 녹음을 시작하거나 파일을 드롭하세요."
+                             : "보관함에서 녹음을 고르고 전사 대기열에 추가하세요.")
+            } else {
+                results
             }
         }
-        if compact {
-            Picker("음성 인식", selection: $controller.asrModel) {
-                ForEach(ASRModelChoice.allCases) { model in
-                    Text(model.title).tag(model)
+        .animation(.appContent, value: controller.selectedRecordingID)
+        .animation(.appContent, value: controller.isTranscribing)
+        .animation(.appContent, value: controller.processingQueue.map(\.id))
+        .animation(.appContent, value: controller.audioRecorder.isRecording)
+        .animation(.appContent, value: controller.transcriptionError)
+        .toolbar {
+            ToolbarItem {
+                Menu("보관함", systemImage: "ellipsis") {
+                    Button("새로 고침", systemImage: "arrow.clockwise") { controller.refreshRecordings() }
+                    Button("Voice Memos 폴더 연결…", systemImage: "folder.badge.plus") { controller.chooseVoiceMemosFolder() }
+                } 
+                .help("녹음 보관함을 다시 읽거나 Voice Memos 폴더를 연결합니다")
+            }
+            ToolbarItem {
+                if controller.isTranscribing {
+                    Button("전사 중단", systemImage: "stop.fill") { controller.stopTranscription() }
+                        .tint(.red)
+                        .help("실행 중인 음성 인식을 중단합니다")
                 }
             }
-            .pickerStyle(.segmented)
-            .disabled(controller.isTranscribing)
+            ToolbarSpacer(.flexible)
+            ToolbarItem {
+                Button(controller.audioRecorder.isRecording ? "녹음 중지" : "녹음 시작",
+                       systemImage: controller.audioRecorder.isRecording ? "stop.circle.fill" : "record.circle") {
+                    controller.toggleRecording()
+                }
+                .buttonStyle(.glassProminent)
+                .tint(controller.audioRecorder.isRecording ? .red : .snuBlue)
+                .help(controller.audioRecorder.isRecording ? "녹음을 끝내고 보관함에 넣습니다" : "이 Mac의 마이크로 바로 녹음합니다")
+            }
+        }
+    }
 
-            Text(controller.asrModel.explanation)
+    // MARK: 녹음 중
+
+    private var recordingBanner: some View {
+        HStack(spacing: Spacing.l) {
+            Image(systemName: "waveform")
+                .font(.system(size: 30, weight: .medium))
+                .symbolEffect(.variableColor.iterative, options: .repeating)
+                .foregroundStyle(.red)
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                HStack(spacing: Spacing.s) {
+                    Circle().fill(.red).frame(width: 8, height: 8)
+                    Text("녹음 중").font(.headline).foregroundStyle(.red)
+                }
+                Text(Self.durationString(controller.audioRecorder.elapsed))
+                    .font(.system(size: 30, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+            Spacer()
+            Button("녹음 중지", systemImage: "stop.circle.fill") { controller.toggleRecording() }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+        }
+        .padding(Spacing.l)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.red.opacity(0.10), in: RoundedRectangle(cornerRadius: Radius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Radius.panel, style: .continuous)
+                .strokeBorder(Color.red.opacity(0.25))
+        )
+        .transition(.appCard)
+    }
+
+    // MARK: 넣기
+
+    private var dropWell: some View {
+        VStack(spacing: Spacing.s) {
+            Image(systemName: "waveform.badge.plus")
+                .font(.system(size: 26, weight: .light))
+                .foregroundStyle(isDropTarget ? AnyShapeStyle(Color.snuBlueLabel) : AnyShapeStyle(.tertiary))
+            // Kept live during a recording too: dropping a file only adds to the
+            // queue, which runs alongside the mic.
+            Text("오디오 또는 영상 파일을 드롭하세요 · 여러 개도 됩니다")
+                .font(.callout)
+            Text("영상은 오디오만 추출해 전사합니다")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
-            Picker("화자 구분", selection: $controller.diarization) {
-                ForEach(DiarizationChoice.allCases) { choice in
-                    Text(choice.title).tag(choice)
+        }
+        .frame(maxWidth: .infinity, minHeight: 110)
+        .multilineTextAlignment(.center)
+        .padding(Spacing.l)
+        .dropWell(isTargeted: isDropTarget)
+        .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
+            // Every file, not just the first: this tab has a real queue, and
+            // dropping five recordings used to silently transcribe one.
+            guard !providers.isEmpty else { return false }
+            for provider in providers {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    Task { @MainActor in controller.transcribe(fileURL: url) }
                 }
             }
-            .disabled(controller.isTranscribing)
-
-            Text(controller.diarization.explanation)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        Picker("시간 표시", selection: $controller.transcriptionTimestampMode) {
-            ForEach(TranscriptionTimestampMode.allCases) { mode in
-                Text(mode.title).tag(mode)
-            }
-        }
-        .pickerStyle(.segmented)
-        .disabled(controller.isTranscribing)
-        Picker("언어", selection: $controller.transcriptionLanguage) {
-            ForEach(TranscriptionLanguage.allCases) { language in Text(language.title).tag(language) }
-        }
-        .pickerStyle(.segmented)
-        .disabled(controller.isTranscribing)
-        }
-
-        if controller.isTranscribing {
-            HStack {
-                Spacer()
-                Button("전사 중단", systemImage: "stop.fill") { controller.stopTranscription() }
-                    .buttonStyle(.borderedProminent).tint(.red)
-            }
-            TranscriptionProgressCard(step: controller.transcriptionStep, detail: controller.transcriptionDetail, timestamps: controller.transcriptionTimestampMode.includesTimestamps, diarizing: controller.diarization.isEnabled, eta: controller.transcriptionETA)
-        }
-        // Kept visible during a recording too: dropping a file only adds to the
-        // queue, which now runs alongside the mic.
-        Text("오디오 또는 영상 파일을 드롭하세요\n영상은 오디오만 추출해 전사합니다")
-                .font(.headline)
-                .frame(maxWidth: .infinity, minHeight: 140)
-                .multilineTextAlignment(.center)
-                .padding()
-                .background(isDropTarget ? Color.snuBlue.opacity(0.16) : Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
-                .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
-                    guard let provider = providers.first else { return false }
-                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                        guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                        Task { @MainActor in controller.transcribe(fileURL: url) }
-                    }
             return true
         }
-            if let error = controller.transcriptionError {
-                Text(error).font(.callout).foregroundStyle(.red)
-            }
-        if controller.selectedTranscript.isEmpty {
-                Spacer()
-            } else {
-                if let transcript = controller.selectedTranscriptRun, let recording = controller.selectedRecording {
-                    HStack {
-                        Picker("전사 버전", selection: Binding(
-                            get: { controller.selectedTranscriptRunID ?? transcript.id },
-                            set: { controller.selectTranscript($0) }
-                        )) {
-                            ForEach(controller.transcriptRuns(for: recording)) { run in
-                                Text(Self.transcriptVersionLabel(run)).tag(run.id)
-                            }
-                        }
-                        .frame(maxWidth: 520)
-                        Spacer()
-                        Text(transcript.settings.displayName).font(.caption).foregroundStyle(.secondary)
+    }
+
+    // MARK: 이번 전사 조건
+
+    private var conditions: some View {
+        DisclosureGroup(isExpanded: $showsConditions) {
+            VStack(alignment: .leading, spacing: Spacing.m) {
+                LabeledContent("음성 인식") {
+                    Picker("음성 인식", selection: $controller.asrModel) {
+                        ForEach(ASRModelChoice.allCases) { Text($0.title).tag($0) }
                     }
-                GroupBox {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(spacing: 10) {
+                    .labelsHidden()
+                    .frame(maxWidth: 320)
+                }
+                Text(controller.asrModel.explanation).font(.caption).foregroundStyle(.secondary)
+                LabeledContent("화자 구분") {
+                    Picker("화자 구분", selection: $controller.diarization) {
+                        ForEach(DiarizationChoice.allCases) { Text($0.title).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 320)
+                }
+                Text(controller.diarization.explanation).font(.caption).foregroundStyle(.secondary)
+                LabeledContent("시간 표시") {
+                    Picker("시간 표시", selection: $controller.transcriptionTimestampMode) {
+                        ForEach(TranscriptionTimestampMode.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 320)
+                }
+                LabeledContent("언어") {
+                    Picker("언어", selection: $controller.transcriptionLanguage) {
+                        ForEach(TranscriptionLanguage.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 320)
+                }
+                Text("여기서 바꾼 값은 설정의 기본값과 같은 값입니다.")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+            .disabled(controller.isTranscribing)
+            .padding(.top, Spacing.s)
+        } label: {
+            HStack(spacing: Spacing.s) {
+                Label("전사 조건", systemImage: "slider.horizontal.3").font(.headline)
+                Spacer()
+                Text("\(controller.asrModel.title)  /  \(controller.diarization.title)  /  \(controller.transcriptionLanguage.title)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(Spacing.l)
+        .glassPanel()
+        .animation(.appControl, value: showsConditions)
+    }
+
+    // MARK: 보관함
+
+    private var library: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack(spacing: Spacing.s) {
+                Label("녹음 보관함", systemImage: "tray.2").font(.headline)
+                Text(controller.recordingLibraryStatus).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if controller.recordings.count > Self.collapsedRecordingCount {
+                    Button(showsAllRecordings ? "접기" : "전체 \(controller.recordings.count)개 보기") {
+                        showsAllRecordings.toggle()
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
+            }
+            if controller.recordings.isEmpty {
+                EmptyResults(symbol: "waveform", message: "보관함이 비어 있습니다.\n녹음을 시작하거나 Voice Memos 폴더를 연결하세요.")
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: Spacing.m)], spacing: Spacing.m) {
+                    ForEach(visibleRecordings) { recording in
+                        RecordingCard(controller: controller, recording: recording)
+                    }
+                }
+            }
+        }
+        .animation(.appContent, value: showsAllRecordings)
+        .animation(.appContent, value: controller.recordings.map(\.id))
+    }
+
+    @ViewBuilder
+    private func selectedRecordingPanel(_ recording: RecordingItem) -> some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack(spacing: Spacing.s) {
+                Label(recording.title, systemImage: "checkmark.circle.fill")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(Color.snuBlueLabel)
+                    .lineLimit(1)
+                Spacer()
+                if !recording.isLocallyAvailable {
+                    Button(controller.downloadingRecordingIDs.contains(recording.id) ? "다운로드 확인 중" : "iCloud 녹음 받기", systemImage: "icloud.and.arrow.down") {
+                        controller.requestVoiceMemoDownload(recording)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(controller.downloadingRecordingIDs.contains(recording.id))
+                    .help("iCloud에만 있는 녹음을 이 Mac으로 내려받습니다")
+                }
+                Button("전사 대기열 추가", systemImage: "text.badge.plus") { controller.transcribe(recording: recording) }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.snuBlue)
+                    .disabled(!recording.isLocallyAvailable)
+                    .help("현재 전사 조건으로 이 녹음을 대기열에 넣습니다")
+            }
+            RecordingPlaybackBar(player: controller.recordingPlayer, recording: recording)
+        }
+        .padding(Spacing.l)
+        .glassPanel()
+        .transition(.appCard)
+    }
+
+    // MARK: 결과
+
+    @ViewBuilder
+    private var results: some View {
+        if let transcript = controller.selectedTranscriptRun, let recording = controller.selectedRecording {
+            HStack {
+                Picker("전사 버전", selection: Binding(
+                    get: { controller.selectedTranscriptRunID ?? transcript.id },
+                    set: { controller.selectTranscript($0) }
+                )) {
+                    ForEach(controller.transcriptRuns(for: recording)) { run in
+                        Text(Self.transcriptVersionLabel(run)).tag(run.id)
+                    }
+                }
+                .frame(maxWidth: 520)
+                Spacer()
+                Text(transcript.settings.displayName).font(.caption).foregroundStyle(.secondary)
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    HStack(spacing: Spacing.s) {
                         Label("\(controller.organizationKind.title) · \(controller.organizationDetailLevel.title)", systemImage: "slider.horizontal.3")
                             .font(.caption).foregroundStyle(.secondary)
-                        Text("설정에서 변경").font(.caption2).foregroundStyle(.tertiary)
                         Spacer()
-                        Button("AI 자동요약 대기열 추가", systemImage: "sparkles") {
+                        if let eta = controller.organizationETA {
+                            Text("약 \(Self.durationString(eta)) 남음").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                        }
+                        if controller.isOrganizingTranscript { ProgressView().controlSize(.small) }
+                        Button("AI 자동요약", systemImage: "sparkles") {
                             controller.organizeSelectedTranscript()
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(.accentColor)
-                        if controller.isOrganizingTranscript { ProgressView().controlSize(.small) }
-                        if let eta = controller.organizationETA {
-                            Text("약 \(Self.durationString(eta)) 남음").font(.caption).foregroundStyle(.secondary)
-                        }
+                        .tint(.snuBlue)
+                        .help("이 전사를 로컬 모델로 정리해 대기열에 넣습니다")
                     }
                     if controller.isOrganizingTranscript || !controller.organizationDetail.isEmpty {
                         Text(controller.organizationDetail).font(.caption).foregroundStyle(.secondary)
                     }
-                    if let error = controller.organizationError { Text(error).font(.caption).foregroundStyle(.red) }
+                    if let error = controller.organizationError {
+                        DismissibleError(message: error) { controller.organizationError = nil }
+                    }
                 }
-                } label: {
-                    Label("AI 정리", systemImage: "sparkles")
-                        .font(.headline).foregroundStyle(Color.snuBlue)
-                }
-                if let selected = controller.selectedOrganizationRun {
-                    GroupBox {
-                    VStack(alignment: .leading, spacing: 12) {
+            } label: {
+                Label("AI 정리", systemImage: "sparkles").font(.headline).foregroundStyle(Color.snuBlueLabel)
+            }
+
+            if let selected = controller.selectedOrganizationRun {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: Spacing.m) {
                         HStack {
-                        Picker("정리 버전", selection: Binding(
+                            Picker("정리 버전", selection: Binding(
                                 get: { controller.selectedOrganizationRunID ?? selected.id },
                                 set: { controller.selectedOrganizationRunID = $0 }
                             )) {
                                 ForEach(controller.organizationRuns(for: transcript)) { run in
                                     Text("\(run.kind.title) · \(run.completedAt.formatted(date: .abbreviated, time: .shortened))").tag(run.id)
                                 }
-                        }.labelsHidden().frame(maxWidth: 320)
-                        Spacer()
-                        Button("복사", systemImage: "doc.on.doc", action: controller.copySelectedOrganization)
-                            .buttonStyle(.bordered)
+                            }
+                            .labelsHidden().frame(maxWidth: 320)
+                            Spacer()
+                            Button("복사", systemImage: "doc.on.doc", action: controller.copySelectedOrganization)
+                                .buttonStyle(.bordered)
                         }
-                        Text(controller.selectedOrganizationRun?.text ?? "")
+                        Text(selected.text)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 4)
+                            .padding(.vertical, Spacing.xs)
                     }
-                    } label: {
-                        Label("AI 정리 결과", systemImage: "text.document.fill").font(.headline)
-                    }
+                } label: {
+                    Label("AI 정리 결과", systemImage: "text.document.fill").font(.headline)
                 }
+                .transition(.appCard)
             }
-            GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
+        }
+
+        GroupBox {
+            VStack(alignment: .leading, spacing: Spacing.m) {
                 HStack {
-                Text("선택한 전사 버전").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("복사", systemImage: "doc.on.doc", action: controller.copyTranscription).buttonStyle(.bordered)
+                    Text("선택한 전사 버전").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("복사", systemImage: "doc.on.doc", action: controller.copyTranscription)
+                        .buttonStyle(.bordered)
                 }
                 Text(controller.selectedTranscript)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, Spacing.xs)
             }
-            } label: {
-                Label("전사 원문", systemImage: "quote.bubble").font(.headline)
-            }
+        } label: {
+            Label("전사 원문", systemImage: "quote.bubble").font(.headline)
         }
-        }
-        .padding(24)
-        }
-        .frame(minWidth: 760, minHeight: 560)
     }
 
-    private static func durationString(_ seconds: TimeInterval) -> String {
+    static func durationString(_ seconds: TimeInterval) -> String {
         String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60)
     }
 
     private static func transcriptVersionLabel(_ run: TranscriptRun) -> String {
         if run.isLegacy { return "이전 전사 · 조건 미상" }
         return "\(run.completedAt.formatted(date: .abbreviated, time: .shortened)) · \(run.settings.asrModel?.title ?? "모델 미상") · \(Int(run.duration))초"
+    }
+}
+
+/// One take in the 녹음 보관함 grid.
+private struct RecordingCard: View {
+    @ObservedObject var controller: AutomationController
+    let recording: RecordingItem
+    @State private var isHovering = false
+
+    private var isSelected: Bool { controller.selectedRecordingID == recording.id }
+
+    var body: some View {
+        Button {
+            controller.selectRecording(recording)
+        } label: {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                HStack(spacing: Spacing.xs) {
+                    Image(systemName: recording.source == .app ? "mic.fill" : "waveform")
+                        .foregroundStyle(recording.source == .app ? AnyShapeStyle(Color.snuBlueLabel) : AnyShapeStyle(.secondary))
+                    Text(recording.source.rawValue).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                    if !recording.isLocallyAvailable {
+                        Label(controller.downloadingRecordingIDs.contains(recording.id) ? "확인 중" : "iCloud",
+                              systemImage: "icloud.and.arrow.down")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                    if controller.transcribingRecordingID == recording.id {
+                        ProgressView().controlSize(.small).tint(.snuBlue)
+                    }
+                    let runCount = controller.transcriptRuns(for: recording).count
+                    if runCount > 0 {
+                        Label("\(runCount)", systemImage: "doc.on.doc.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                            .help("이 녹음의 전사본 \(runCount)개")
+                    }
+                }
+                Text(recording.title).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: Spacing.xs) {
+                    Image(systemName: "calendar").imageScale(.small)
+                    Text(recording.date.formatted(date: .abbreviated, time: .shortened))
+                    Spacer()
+                    Image(systemName: "clock").imageScale(.small)
+                    Text(TranscriptionView.durationString(recording.duration)).monospacedDigit()
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(Spacing.m)
+            .frame(maxWidth: .infinity, minHeight: 88, alignment: .leading)
+            .contentCard(Radius.card, selected: isSelected)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .scaleEffect(isHovering ? 1.012 : 1)
+        .animation(.appControl, value: isHovering)
+        .animation(.appControl, value: isSelected)
+        .accessibilityLabel("\(recording.title), \(recording.source.rawValue)")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .contextMenu {
+            if !recording.isLocallyAvailable {
+                Button("iCloud 녹음 받기", systemImage: "icloud.and.arrow.down") { controller.requestVoiceMemoDownload(recording) }
+                    .disabled(controller.downloadingRecordingIDs.contains(recording.id))
+                Divider()
+            }
+            Button("전사 대기열 추가", systemImage: "text.badge.plus") { controller.transcribe(recording: recording) }
+                .disabled(!recording.isLocallyAvailable)
+            if recording.source == .app {
+                Button("이름 변경…", systemImage: "pencil") { RenameRecordingPanel.present(recording: recording, controller: controller) }
+                Divider()
+                Button("휴지통으로 이동", systemImage: "trash", role: .destructive) { controller.delete(recording) }
+            }
+        }
+    }
+}
+
+
+/// The 재생바 for the selected take: play/pause, ±15초 이동 and a scrubber that
+/// seeks inside the recording. It observes the player directly rather than going
+/// through the controller, so the position update ten times a second repaints
+/// this row alone instead of the whole 녹음 전사 window.
+private struct RecordingPlaybackBar: View {
+    @ObservedObject var player: RecordingPlayer
+    let recording: RecordingItem
+    /// Non-nil only while the thumb is held, so the running take cannot drag the
+    /// slider out from under the pointer.
+    @State private var scrubTime: TimeInterval?
+
+    private var isPlaying: Bool { player.isPlaying(recording) }
+    private var duration: TimeInterval { player.duration(of: recording) }
+    private var position: TimeInterval { scrubTime ?? player.position(of: recording) }
+
+    private var scrubBinding: Binding<Double> {
+        Binding(get: { min(position, max(duration, 0.1)) }, set: { scrubTime = $0 })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    player.toggle(recording)
+                } label: {
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 13, height: 13)
+                }
+                .buttonStyle(.bordered)
+                .help(isPlaying ? "일시정지" : "재생")
+                .accessibilityLabel(isPlaying ? "일시정지" : "재생")
+                Button { player.skip(recording, by: -15) } label: { Image(systemName: "gobackward.15") }
+                    .buttonStyle(.borderless)
+                    .help("15초 뒤로")
+                    .accessibilityLabel("15초 뒤로")
+                Button { player.skip(recording, by: 15) } label: { Image(systemName: "goforward.15") }
+                    .buttonStyle(.borderless)
+                    .help("15초 앞으로")
+                    .accessibilityLabel("15초 앞으로")
+                Text(position.playbackTimeLabel)
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    .frame(minWidth: 38, alignment: .trailing)
+                Slider(value: scrubBinding, in: 0...max(duration, 0.1)) { isEditing in
+                    if isEditing {
+                        scrubTime = player.position(of: recording)
+                    } else if let scrubTime {
+                        player.seek(recording, to: scrubTime)
+                        self.scrubTime = nil
+                    }
+                }
+                .controlSize(.small)
+                .accessibilityLabel("재생 위치")
+                Text("-\(max(0, duration - position).playbackTimeLabel)")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    .frame(minWidth: 44, alignment: .leading)
+            }
+            .disabled(!recording.isLocallyAvailable)
+            if let error = player.errorMessage {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .padding(.horizontal, Spacing.m)
+        .padding(.vertical, Spacing.s)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
     }
 }
 
@@ -1882,22 +3303,23 @@ private struct ProcessingQueueCard: View {
     @ObservedObject var controller: AutomationController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack(spacing: Spacing.s) {
                 Label("작업 대기열", systemImage: "tray.full.fill")
                     .font(.headline)
                 Spacer()
                 Text("\(controller.processingQueue.count)개")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color.snuBlue)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .foregroundStyle(Color.snuBlueLabel)
+                    .padding(.horizontal, Spacing.s)
+                    .padding(.vertical, Spacing.xs)
                     .background(Color.snuBlue.opacity(0.12), in: Capsule())
+                    .monospacedDigit()
                 if !controller.waitingProcessingItems.isEmpty {
                     Button("대기 항목 지우기") { controller.clearWaitingProcessingItems() }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.link)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .help("아직 시작하지 않은 항목을 모두 제거합니다")
                 }
             }
 
@@ -1905,20 +3327,21 @@ private struct ProcessingQueueCard: View {
                 ProcessingQueueRow(item: active, status: "처리 중", isActive: true) {
                     controller.cancelProcessingItem(active.id)
                 }
+                .transition(.appCard)
             }
 
             ForEach(Array(controller.waitingProcessingItems.enumerated()), id: \.element.id) { index, item in
                 ProcessingQueueRow(item: item, status: "대기 \(index + 1)번", isActive: false) {
                     controller.cancelProcessingItem(item.id)
                 }
+                .transition(.appCard)
             }
         }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.snuBlue.opacity(0.16))
-        }
+        .padding(Spacing.l)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassPanel()
+        .animation(.appContent, value: controller.activeProcessingItemID)
+        .animation(.appContent, value: controller.processingQueue.map(\.id))
     }
 }
 
@@ -1929,9 +3352,9 @@ private struct ProcessingQueueRow: View {
     let cancel: () -> Void
 
     var body: some View {
-        HStack(spacing: 11) {
+        HStack(spacing: Spacing.m) {
             ZStack {
-                Circle().fill(isActive ? Color.snuBlue.opacity(0.16) : Color.secondary.opacity(0.10))
+                Circle().fill(isActive ? AnyShapeStyle(Color.snuBlue.opacity(0.16)) : AnyShapeStyle(.quaternary))
                 if isActive {
                     ProgressView().controlSize(.small).tint(.snuBlue)
                 } else {
@@ -1941,28 +3364,32 @@ private struct ProcessingQueueRow: View {
             .frame(width: 34, height: 34)
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
+                HStack(spacing: Spacing.xs) {
                     Text(item.title).font(.callout.weight(.medium)).lineLimit(1)
                     Text(item.kind.title)
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(item.kind == .transcription ? Color.snuBlue : Color.purple)
+                        .foregroundStyle(item.kind == .transcription ? Color.snuBlueLabel : Color.purple)
                 }
                 Text(item.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            Spacer(minLength: 8)
+            Spacer(minLength: Spacing.s)
             Text(status)
                 .font(.caption.weight(isActive ? .semibold : .regular))
-                .foregroundStyle(isActive ? Color.snuBlue : .secondary)
+                .foregroundStyle(isActive ? Color.snuBlueLabel : .secondary)
             Button(action: cancel) {
                 Image(systemName: isActive ? "stop.circle.fill" : "xmark.circle.fill")
                     .foregroundStyle(isActive ? Color.red : Color.secondary)
             }
             .buttonStyle(.plain)
             .help(isActive ? "현재 작업 중단" : "대기열에서 제거")
+            .accessibilityLabel(isActive ? "현재 작업 중단" : "대기열에서 제거")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(isActive ? Color.snuBlue.opacity(0.07) : Color.clear, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.horizontal, Spacing.m)
+        .padding(.vertical, Spacing.s)
+        .background(
+            isActive ? Color.snuBlue.opacity(0.08) : Color.clear,
+            in: RoundedRectangle(cornerRadius: Radius.small, style: .continuous)
+        )
     }
 }
 
@@ -1972,28 +3399,24 @@ private struct TranscriptionProgressCard: View {
     let timestamps: Bool
     let diarizing: Bool
     let eta: TimeInterval?
-    init(step: Int, detail: String, timestamps: Bool, diarizing: Bool, eta: TimeInterval?) {
-        self.step = step
-        self.detail = detail
-        self.timestamps = timestamps
-        self.diarizing = diarizing
-        self.eta = eta
-    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Spacing.m) {
             HStack {
-                Label("전사 진행 중", systemImage: "waveform.badge.magnifyingglass").font(.headline).foregroundStyle(Color.snuBlue)
+                Label("전사 진행 중", systemImage: "waveform.badge.magnifyingglass")
+                    .font(.headline)
+                    .foregroundStyle(Color.snuBlueLabel)
                 Spacer()
-                Text("\(min(step, 4)) / 4").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                Text("\(min(step, 4)) / 4").font(.caption.weight(.medium)).foregroundStyle(.secondary).monospacedDigit()
             }
             if let eta, step >= 2 {
-                Label("약 \(Self.etaString(eta)) 남음", systemImage: "clock").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                Label("약 \(Self.etaString(eta)) 남음", systemImage: "clock")
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary).monospacedDigit()
             } else if step == 1 {
                 Text("예상 시간 계산 중").font(.caption).foregroundStyle(.secondary)
             }
             ProgressView(value: Double(step), total: 4).tint(.snuBlue)
-            HStack(spacing: 8) {
+            HStack(spacing: Spacing.s) {
                 ProgressPill(title: "준비", isActive: step == 1, isDone: step > 1)
                 ProgressPill(title: timestamps ? "음성·시간" : "음성 인식", isActive: step == 2, isDone: step > 2)
                 ProgressPill(title: diarizing ? "화자 분리" : "화자 건너뜀", isActive: step == 3, isDone: step > 3)
@@ -2001,9 +3424,10 @@ private struct TranscriptionProgressCard: View {
             }
             Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
         }
-        .padding(16)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.snuBlue.opacity(0.15)))
+        .padding(Spacing.l)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassPanel()
+        .animation(.appControl, value: step)
     }
 
     private static func etaString(_ seconds: TimeInterval) -> String {
@@ -2016,15 +3440,16 @@ private struct ProgressPill: View {
     let title: String
     let isActive: Bool
     let isDone: Bool
+
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: Spacing.xs) {
             Image(systemName: isDone ? "checkmark" : (isActive ? "circle.inset.filled" : "circle")).imageScale(.small)
             Text(title).lineLimit(1)
         }
         .font(.caption2.weight(isActive ? .semibold : .regular))
-        .foregroundStyle(isDone ? .green : (isActive ? Color.snuBlue : .secondary))
+        .foregroundStyle(isDone ? .green : (isActive ? Color.snuBlueLabel : .secondary))
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 6)
+        .padding(.vertical, Spacing.xs + 2)
         .background(isActive ? Color.snuBlue.opacity(0.12) : .clear, in: Capsule())
     }
 }
@@ -2035,9 +3460,9 @@ private struct ProgressStep: View {
     let isDone: Bool
 
     var body: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: Spacing.s) {
             Image(systemName: isDone ? "checkmark.circle.fill" : (isCurrent ? "circle.inset.filled" : "circle"))
-                .foregroundStyle(isDone ? Color.green : (isCurrent ? Color.snuBlue : Color.secondary))
+                .foregroundStyle(isDone ? Color.green : (isCurrent ? Color.snuBlueLabel : Color.secondary))
             Text(title).font(.caption).foregroundStyle(isCurrent ? .primary : .secondary)
         }
     }
@@ -2049,13 +3474,13 @@ private struct MediaImportCard: View {
     private var toolsMissing: Bool { MediaImporter.ytDLPPath == nil || MediaImporter.ffmpegPath == nil }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Spacing.s) {
             Label("영상에서 가져오기", systemImage: "play.rectangle.on.rectangle")
                 .font(.headline)
-            Text("강의 영상 주소를 붙여넣으면 오디오만 이 Mac으로 내려받아 전사 대기열에 넣습니다. 영상 파일을 드롭해도 같습니다.")
+            Text("강의 영상 주소를 붙여넣으면 오디오만 이 Mac으로 내려받아 전사 대기열에 넣습니다.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            HStack(spacing: 8) {
+            HStack(spacing: Spacing.s) {
                 TextField("https://…", text: $controller.mediaURLText)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { controller.importMediaFromURL() }
@@ -2064,162 +3489,189 @@ private struct MediaImportCard: View {
                     Button("중단", systemImage: "stop.fill") { controller.stopMediaImport() }
                         .buttonStyle(.bordered)
                         .tint(.red)
+                        .help("내려받기를 중단합니다")
                 } else {
                     Button("가져오기", systemImage: "arrow.down.circle") { controller.importMediaFromURL() }
                         .buttonStyle(.borderedProminent)
                         .tint(.snuBlue)
                         .disabled(toolsMissing || controller.mediaURLText.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .help("이 주소의 오디오만 내려받아 전사 대기열에 넣습니다")
                 }
             }
             if controller.isImportingMedia || !controller.mediaImportStatus.isEmpty {
-                HStack(spacing: 8) {
+                HStack(spacing: Spacing.s) {
                     if controller.isImportingMedia { ProgressView().controlSize(.small) }
                     Text(controller.mediaImportStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                .transition(.appBanner)
             }
             if let error = controller.mediaImportError {
-                Text(error).font(.caption).foregroundStyle(.red).lineLimit(3)
+                DismissibleError(message: error) { controller.mediaImportError = nil }
             }
             if toolsMissing {
-                Text("yt-dlp와 ffmpeg가 필요합니다 · 터미널에서 `brew install yt-dlp ffmpeg`")
+                Label("yt-dlp와 ffmpeg가 필요합니다 · 터미널에서 `brew install yt-dlp ffmpeg`", systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
         }
-        .padding(16)
+        .padding(Spacing.l)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .glassPanel()
+        .animation(.appContent, value: controller.isImportingMedia)
+        .animation(.appContent, value: controller.mediaImportError)
     }
 }
+
 
 private struct DocumentRecognitionView: View {
     @ObservedObject var controller: AutomationController
     @State private var isDropTarget = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Label("문서 인식", systemImage: "text.viewfinder")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(Color.snuBlue)
-                    Spacer()
-                    if controller.isRecognizingDocument { ProgressView().controlSize(.small) }
-                }
-                Text("강의 슬라이드 사진, 스캔한 유인물 PDF, 화면의 일부를 텍스트로 바꿉니다. 어느 쪽을 고르든 이미지가 이 Mac을 벗어나지 않습니다.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+        WorkspaceScreen(title: AppSection.documents.title, subtitle: AppSection.documents.subtitle) {
+            dropWell
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Picker("인식 방식", selection: $controller.documentMode) {
-                        ForEach(DocumentRecognitionMode.allCases) { Text($0.title).tag($0) }
+            HStack(spacing: Spacing.s) {
+                if !controller.recognizedSourceName.isEmpty {
+                    Text(controller.recognizedSourceName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text("·").font(.caption).foregroundStyle(.tertiary)
+                }
+                Text(controller.recognitionStatus).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+            }
+
+            if let error = controller.recognitionError {
+                DismissibleError(message: error) { controller.recognitionError = nil }
+            }
+
+            if controller.recognizedText.isEmpty && controller.recognizedNoteText.isEmpty && !controller.isRecognizingDocument {
+                EmptyResults(symbol: "text.viewfinder", message: "아직 인식한 문서가 없습니다.\n위에 파일을 드롭하거나 툴바에서 화면 영역을 캡처하세요.")
+            }
+
+            if !controller.recognizedText.isEmpty {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: Spacing.m) {
+                        HStack(spacing: Spacing.s) {
+                            Button("AI로 정리", systemImage: "sparkles") { controller.organizeRecognizedText() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.snuBlue)
+                                .disabled(controller.isOrganizingTranscript)
+                                .help("인식한 텍스트를 로컬 모델로 정리해 대기열에 넣습니다")
+                            Button("복사", systemImage: "doc.on.doc", action: controller.copyRecognizedText)
+                                .buttonStyle(.bordered)
+                            Button("텍스트로 저장…", systemImage: "square.and.arrow.down", action: controller.saveRecognizedText)
+                                .buttonStyle(.bordered)
+                            Spacer()
+                            if controller.isOrganizingTranscript { ProgressView().controlSize(.small) }
+                        }
+                        if controller.isOrganizingTranscript || !controller.organizationDetail.isEmpty {
+                            Text(controller.organizationDetail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(controller.recognizedText)
+                            .font(controller.recognizedTextIsMarkdown ? .body.monospaced() : .body)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, Spacing.xs)
                     }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 360)
+                } label: {
+                    Label(
+                        controller.recognizedTextIsMarkdown ? "인식한 Markdown (수식은 LaTeX)" : "인식한 텍스트",
+                        systemImage: controller.recognizedTextIsMarkdown ? "function" : "doc.plaintext"
+                    ).font(.headline)
+                }
+                .transition(.appCard)
+            }
+
+            if !controller.recognizedNoteText.isEmpty {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: Spacing.m) {
+                        HStack {
+                            Spacer()
+                            Button("복사", systemImage: "doc.on.doc", action: controller.copyRecognizedNote)
+                                .buttonStyle(.bordered)
+                        }
+                        Text(controller.recognizedNoteText)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, Spacing.xs)
+                    }
+                } label: {
+                    Label("AI 정리 결과", systemImage: "sparkles").font(.headline).foregroundStyle(Color.snuBlueLabel)
+                }
+                .transition(.appCard)
+            }
+        }
+        .animation(.appContent, value: controller.recognizedText)
+        .animation(.appContent, value: controller.recognizedNoteText)
+        .animation(.appContent, value: controller.recognitionError)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("인식 방식", selection: $controller.documentMode) {
+                    ForEach(DocumentRecognitionMode.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .disabled(controller.isRecognizingDocument)
+                .help(controller.documentMode.detail)
+            }
+            ToolbarSpacer(.flexible)
+            ToolbarItem {
+                Button("파일 선택…", systemImage: "doc.badge.plus") { chooseFile() }
                     .disabled(controller.isRecognizingDocument)
-                    Text(controller.documentMode.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 10) {
+                    .help("인식할 이미지 또는 PDF를 고릅니다")
+            }
+            ToolbarItem {
+                if controller.isRecognizingDocument {
+                    Button("중단", systemImage: "stop.fill") { controller.stopDocumentRecognition() }
+                        .tint(.red)
+                        .help("인식을 중단합니다")
+                } else {
                     Button("화면 영역 캡처", systemImage: "camera.viewfinder") { controller.captureScreenAndRecognize() }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.glassProminent)
                         .tint(.snuBlue)
-                        .disabled(controller.isRecognizingDocument)
-                    Button("파일 선택…", systemImage: "doc.badge.plus") { chooseFile() }
-                        .buttonStyle(.bordered)
-                        .disabled(controller.isRecognizingDocument)
-                    if controller.isRecognizingDocument {
-                        Button("중단", systemImage: "stop.fill") { controller.stopDocumentRecognition() }
-                            .buttonStyle(.bordered)
-                            .tint(.red)
-                    }
-                    Spacer()
+                        .help("화면의 일부를 끌어 선택해 바로 인식합니다")
                 }
+            }
+        }
+    }
 
-                Text("여기로 이미지 또는 PDF를 드롭하세요")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 120)
-                    .multilineTextAlignment(.center)
-                    .padding()
-                    .background(
-                        isDropTarget ? Color.snuBlue.opacity(0.16) : Color.secondary.opacity(0.10),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    )
-                    .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
-                        guard let provider = providers.first else { return false }
-                        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                            guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                            Task { @MainActor in controller.recognizeDocument(fileURL: url) }
-                        }
-                        return true
-                    }
-
-                HStack(spacing: 8) {
-                    if !controller.recognizedSourceName.isEmpty {
-                        Text(controller.recognizedSourceName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Text(controller.recognitionStatus).font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                }
-                if let error = controller.recognitionError {
-                    Text(error).font(.callout).foregroundStyle(.red)
-                }
-
-                if !controller.recognizedText.isEmpty {
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 10) {
-                                Button("AI로 정리 대기열 추가", systemImage: "sparkles") { controller.organizeRecognizedText() }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(.accentColor)
-                                    .disabled(controller.isOrganizingTranscript)
-                                Button("복사", systemImage: "doc.on.doc", action: controller.copyRecognizedText)
-                                    .buttonStyle(.bordered)
-                                Button("텍스트로 저장…", systemImage: "square.and.arrow.down", action: controller.saveRecognizedText)
-                                    .buttonStyle(.bordered)
-                                Spacer()
-                                if controller.isOrganizingTranscript { ProgressView().controlSize(.small) }
-                            }
-                            if controller.isOrganizingTranscript || !controller.organizationDetail.isEmpty {
-                                Text(controller.organizationDetail).font(.caption).foregroundStyle(.secondary)
-                            }
-                            Text(controller.recognizedText)
-                                .font(controller.recognizedTextIsMarkdown ? .body.monospaced() : .body)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 4)
-                        }
-                    } label: {
-                        Label(
-                            controller.recognizedTextIsMarkdown ? "인식한 Markdown (수식은 LaTeX)" : "인식한 텍스트",
-                            systemImage: controller.recognizedTextIsMarkdown ? "function" : "doc.plaintext"
-                        ).font(.headline)
-                    }
-                }
-
-                if !controller.recognizedNoteText.isEmpty {
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                Spacer()
-                                Button("복사", systemImage: "doc.on.doc", action: controller.copyRecognizedNote)
-                                    .buttonStyle(.bordered)
-                            }
-                            Text(controller.recognizedNoteText)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 4)
-                        }
-                    } label: {
-                        Label("AI 정리 결과", systemImage: "sparkles").font(.headline).foregroundStyle(Color.snuBlue)
+    private var dropWell: some View {
+        VStack(spacing: Spacing.s) {
+            if controller.isRecognizingDocument {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "doc.viewfinder")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(isDropTarget ? AnyShapeStyle(Color.snuBlueLabel) : AnyShapeStyle(.tertiary))
+            }
+            Text(controller.isRecognizingDocument
+                 ? "문서를 인식하는 중입니다 · 끝난 뒤에 넣어 주세요"
+                 : "여기로 이미지 또는 PDF를 드롭하세요 · 한 번에 한 개")
+                .font(.callout)
+                .foregroundStyle(controller.isRecognizingDocument ? .secondary : .primary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 110)
+        .multilineTextAlignment(.center)
+        .padding(Spacing.l)
+        .dropWell(isTargeted: isDropTarget, enabled: !controller.isRecognizingDocument)
+        .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
+            guard let provider = providers.first else { return false }
+            // The recogniser handles one document at a time, so the rest of a
+            // multi-file drop is dropped — say so instead of leaving the user to
+            // notice four missing results.
+            let extras = providers.count - 1
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                Task { @MainActor in
+                    controller.recognizeDocument(fileURL: url)
+                    if extras > 0 {
+                        controller.recognitionError = "문서 인식은 한 번에 한 개만 처리합니다. 첫 번째 파일만 인식했고 나머지 \(extras)개는 넣지 않았습니다."
                     }
                 }
             }
-            .padding(32)
+            return true
         }
     }
 
@@ -2236,97 +3688,112 @@ private struct DocumentRecognitionView: View {
 
 // MARK: - 누끼 따기
 
-/// Deliberately built from the same pieces as `DocumentRecognitionView`: the
-/// `snuBlue` title label, one prominent action, a highlighted drop well and a
-/// caption-sized status line. Only the preview grid and the background picker
-/// are new.
+/// Built from the same pieces as every other tool screen: the name in the title
+/// bar, the primary action in the toolbar, a drop well first in the body, a
+/// caption status line, then results.
 private struct CutoutView: View {
     @ObservedObject var controller: AutomationController
     @State private var isDropTarget = false
 
-    private let columns = [GridItem(.adaptive(minimum: 220), spacing: 16)]
+    private let columns = [GridItem(.adaptive(minimum: 220), spacing: Spacing.l)]
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Label("누끼 따기", systemImage: "person.and.background.dotted")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(Color.snuBlue)
-                    Spacer()
-                    if controller.isRemovingBackground { ProgressView().controlSize(.small) }
-                }
-                Text("사진을 드롭하면 배경을 지운 투명 PNG를 만듭니다. 모델은 이 Mac에서만 실행되고 사진은 기기를 벗어나지 않습니다.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+        WorkspaceScreen(title: AppSection.cutout.title, subtitle: AppSection.cutout.subtitle) {
+            dropWell
+            backgroundPicker
 
-                HStack(spacing: 10) {
-                    Button("사진 선택…", systemImage: "photo.badge.plus") { choosePhotos() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.snuBlue)
-                        .disabled(controller.isRemovingBackground)
-                    if controller.isRemovingBackground {
-                        Button("중단", systemImage: "stop.fill") { controller.stopBackgroundRemoval() }
-                            .buttonStyle(.bordered)
-                            .tint(.red)
-                    }
-                    if controller.cutoutItems.contains(where: \.isFinished) {
-                        Button("모두 저장…", systemImage: "square.and.arrow.down.on.square") { controller.saveAllCutouts() }
-                            .buttonStyle(.bordered)
-                    }
-                    Spacer()
-                }
+            HStack(spacing: Spacing.s) {
+                Text(controller.cutoutStatus).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(controller.mattingModel.title).font(.caption).foregroundStyle(.tertiary)
+            }
 
-                Text("여기로 사진을 드롭하세요 · 여러 장도 됩니다")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 120)
-                    .multilineTextAlignment(.center)
-                    .padding()
-                    .background(
-                        isDropTarget ? Color.snuBlue.opacity(0.16) : Color.secondary.opacity(0.10),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    )
-                    .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
-                        load(providers)
-                        return true
-                    }
+            if let error = controller.cutoutError {
+                DismissibleError(message: error) { controller.cutoutError = nil }
+            }
 
-                backgroundPicker
-
-                HStack(spacing: 8) {
-                    Text(controller.cutoutStatus).font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Text(controller.mattingModel.title).font(.caption).foregroundStyle(.secondary)
-                }
-                if let error = controller.cutoutError {
-                    Text(error).font(.callout).foregroundStyle(.red)
-                }
-
-                if !controller.cutoutItems.isEmpty {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(controller.cutoutItems) { item in
-                            CutoutCard(controller: controller, item: item)
-                        }
+            if controller.cutoutItems.isEmpty {
+                EmptyResults(symbol: "person.and.background.dotted", message: "아직 누끼를 딴 사진이 없습니다.\n위에 사진을 드롭하거나 툴바에서 골라 주세요.")
+            } else {
+                LazyVGrid(columns: columns, spacing: Spacing.l) {
+                    ForEach(controller.cutoutItems) { item in
+                        CutoutCard(controller: controller, item: item)
+                            .transition(.appCard)
                     }
                 }
             }
-            .padding(32)
+        }
+        .animation(.appContent, value: controller.cutoutItems.map(\.id))
+        .animation(.appContent, value: controller.cutoutError)
+        .toolbar {
+            ToolbarItem {
+                Menu("결과", systemImage: "ellipsis") {
+                    Button("모두 저장…", systemImage: "square.and.arrow.down.on.square") { controller.saveAllCutouts() }
+                        .disabled(!controller.cutoutItems.contains(where: \.isFinished))
+                    Button("목록 비우기", systemImage: "trash", role: .destructive) { controller.clearCutouts() }
+                        .disabled(controller.cutoutItems.isEmpty || controller.isRemovingBackground)
+                }
+                .help("누끼 결과를 한꺼번에 저장하거나 목록을 비웁니다")
+            }
+            ToolbarSpacer(.flexible)
+            ToolbarItem {
+                if controller.isRemovingBackground {
+                    Button("중단", systemImage: "stop.fill") { controller.stopBackgroundRemoval() }
+                        .tint(.red)
+                        .help("남은 사진 처리를 중단합니다")
+                } else {
+                    Button("사진 선택…", systemImage: "photo.badge.plus") { choosePhotos() }
+                        .buttonStyle(.glassProminent)
+                        .tint(.snuBlue)
+                        .help("누끼를 딸 사진을 고릅니다 · 여러 장 가능")
+                }
+            }
+        }
+    }
+
+    private var dropWell: some View {
+        VStack(spacing: Spacing.s) {
+            if controller.isRemovingBackground {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "photo.badge.plus")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(isDropTarget ? AnyShapeStyle(Color.snuBlueLabel) : AnyShapeStyle(.tertiary))
+            }
+            Text(controller.isRemovingBackground
+                 ? "누끼를 따는 중입니다 · 끝나거나 중단한 뒤에 넣어 주세요"
+                 : "여기로 사진을 드롭하세요 · 여러 장도 됩니다")
+                .font(.callout)
+                .foregroundStyle(controller.isRemovingBackground ? .secondary : .primary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 110)
+        .multilineTextAlignment(.center)
+        .padding(Spacing.l)
+        .dropWell(isTargeted: isDropTarget, enabled: !controller.isRemovingBackground)
+        .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
+            load(providers)
+            return true
         }
     }
 
     private var backgroundPicker: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: Spacing.m) {
+            Text("배경").font(.callout).foregroundStyle(.secondary)
             Picker("배경", selection: $controller.cutoutBackground) {
                 ForEach(CutoutBackground.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(maxWidth: 360)
+            .labelsHidden()
+            .frame(maxWidth: 340)
+            .help("누끼 뒤에 깔 배경입니다. 저장할 때 함께 적용됩니다")
             if controller.cutoutBackground == .custom {
                 ColorPicker("배경색", selection: $controller.cutoutCustomColor, supportsOpacity: false)
                     .labelsHidden()
+                    .transition(.opacity)
             }
             Spacer()
         }
+        .animation(.appControl, value: controller.cutoutBackground)
     }
 
     private func choosePhotos() {
@@ -2360,32 +3827,16 @@ private struct CutoutView: View {
     }
 }
 
-/// Each provider reports back on its own queue, so the collected list needs a
-/// lock rather than a plain captured array.
-private final class DroppedURLs: @unchecked Sendable {
-    private let lock = NSLock()
-    private var urls: [URL] = []
-
-    func append(_ url: URL) {
-        lock.lock()
-        urls.append(url)
-        lock.unlock()
-    }
-
-    var all: [URL] {
-        lock.lock()
-        defer { lock.unlock() }
-        return urls
-    }
-}
 
 private struct CutoutCard: View {
     @ObservedObject var controller: AutomationController
     let item: CutoutItem
     @State private var preview: CGImage?
+    @State private var showsEditor = false
+    @State private var isHovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Spacing.s) {
             ZStack {
                 CheckerboardBackground()
                 if let image = preview {
@@ -2400,30 +3851,97 @@ private struct CutoutCard: View {
                 }
             }
             .frame(height: 170)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
+            .overlay(alignment: .topTrailing) {
+                if item.isFinished {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.caption2.weight(.semibold))
+                        .padding(5)
+                        .background(.thinMaterial, in: Circle())
+                        .padding(6)
+                        .opacity(isHovering ? 1 : 0.55)
+                }
+            }
+            // A 170-point card is too small to judge a cutout edge, so the picture
+            // itself is the way into the large view.
+            .onTapGesture { if item.isFinished { showsEditor = true } }
+            .onHover { isHovering = $0 }
+            .scaleEffect(isHovering && item.isFinished ? 1.012 : 1)
+            .animation(.appControl, value: isHovering)
+            .help(item.isFinished ? "클릭하면 크게 보고 자르기·뒤집기를 할 수 있습니다" : "")
+            .accessibilityLabel("\(item.source.lastPathComponent) 누끼 결과")
+            .accessibilityAddTraits(item.isFinished ? .isButton : [])
 
-            Text(item.source.lastPathComponent).font(.caption).lineLimit(1).truncationMode(.middle)
+            HStack(spacing: Spacing.xs) {
+                Text(item.source.lastPathComponent).font(.caption).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: Spacing.xs)
+                if let preview {
+                    // The card shows a thumbnail, so the real size of what would be
+                    // saved is otherwise invisible.
+                    Text(pixelSizeText(preview)).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+            if let summary = item.edit.summary {
+                Label(summary, systemImage: "crop").font(.caption2).foregroundStyle(Color.snuBlueLabel).lineLimit(1)
+            }
             Text(item.statusText)
                 .font(.caption2)
                 .foregroundStyle(isFailed ? Color.red : .secondary)
                 .lineLimit(2)
             if item.isFinished {
-                HStack(spacing: 8) {
-                    Button("복사", systemImage: "doc.on.doc") { controller.copyCutout(item) }
+                // One primary action plus a menu, rather than three equal buttons
+                // fighting for a 220-point row.
+                HStack(spacing: Spacing.s) {
+                    Button("크게 보기", systemImage: "arrow.up.left.and.arrow.down.right") { showsEditor = true }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                    Button("저장…", systemImage: "square.and.arrow.down") { controller.saveCutout(item) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
+                        .help("크게 보고 자르기·뒤집기")
+                    Spacer(minLength: Spacing.xs)
+                    Menu {
+                        Button("복사", systemImage: "doc.on.doc") { controller.copyCutout(item) }
+                        Button("저장…", systemImage: "square.and.arrow.down") { controller.saveCutout(item) }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("복사하거나 파일로 저장합니다")
+                    .accessibilityLabel("이 누끼의 추가 동작")
                 }
             }
         }
-        .padding(10)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(Spacing.m)
+        .contentCard()
         .task(id: previewKey) { await loadPreview() }
+        .sheet(isPresented: $showsEditor) {
+            PhotoEditorSheet(
+                title: item.source.lastPathComponent,
+                subtitle: "누끼 결과",
+                load: { [output = item.output, choice = controller.cutoutBackground, custom = controller.cutoutCustomColorComponents] in
+                    guard let output else { return nil }
+                    return CutoutComposer.preview(of: output, maxPixel: 1800, background: choice.color(custom: custom))
+                },
+                edit: Binding(
+                    get: { item.edit },
+                    set: { controller.updateCutoutEdit(item.id, to: $0) }
+                ),
+                showsCheckerboard: controller.cutoutBackground == .transparent
+            )
+        }
     }
 
     private var isFailed: Bool { if case .failed = item.state { true } else { false } }
+
+    /// The thumbnail is downscaled, so its own size says nothing; this reports what
+    /// the exported PNG will actually be.
+    private func pixelSizeText(_ preview: CGImage) -> String {
+        guard let output = item.output, let full = CutoutComposer.size(of: output) else {
+            return "\(preview.width)×\(preview.height)"
+        }
+        let size = item.edit.resultSize(of: full)
+        return "\(Int(size.width))×\(Int(size.height))"
+    }
 
     /// Rebuilt only when the cutout or the chosen background actually changes,
     /// and always off the main thread: a phone photo is big enough that doing
@@ -2432,7 +3950,7 @@ private struct CutoutCard: View {
         let colour = controller.cutoutBackground == .custom
             ? AutomationController.hex(from: controller.cutoutCustomColor)
             : ""
-        return "\(item.output?.path ?? "")|\(controller.cutoutBackground.rawValue)|\(colour)"
+        return "\(item.output?.path ?? "")|\(controller.cutoutBackground.rawValue)|\(colour)|\(item.edit)"
     }
 
     private func loadPreview() async {
@@ -2442,28 +3960,454 @@ private struct CutoutCard: View {
         }
         let choice = controller.cutoutBackground
         let custom = controller.cutoutCustomColorComponents
+        let edit = item.edit
         preview = await Task.detached(priority: .userInitiated) {
-            CutoutComposer.preview(of: output, maxPixel: 640, background: choice.color(custom: custom))
+            CutoutComposer.preview(of: output, maxPixel: 640, background: choice.color(custom: custom), edit: edit)
         }.value
     }
 }
 
-/// The usual light/dark grey squares, so transparent regions read as
-/// transparent rather than as white.
-private struct CheckerboardBackground: View {
+
+// MARK: - 용량 줄이기
+
+/// Built from the same pieces as `CutoutView`: the name in the title bar, the
+/// primary action in the toolbar, a drop well first in the body, a caption
+/// status line and a card grid. What is different is where files come *from* —
+/// the Photos library and the folders they actually live in — and the
+/// before/after numbers.
+private struct FileCompressionView: View {
+    @ObservedObject var controller: AutomationController
+    @State private var isDropTarget = false
+    @State private var photoSelection: [PhotosPickerItem] = []
+
+    private let columns = [GridItem(.adaptive(minimum: 240), spacing: Spacing.l)]
+
     var body: some View {
-        Canvas { context, size in
-            let square = 10.0
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.white.opacity(0.9)))
-            for row in 0 ... Int(size.height / square) {
-                for column in 0 ... Int(size.width / square) where (row + column).isMultiple(of: 2) {
-                    let rect = CGRect(x: Double(column) * square, y: Double(row) * square, width: square, height: square)
-                    context.fill(Path(rect), with: .color(.gray.opacity(0.30)))
+        WorkspaceScreen(title: AppSection.compression.title, subtitle: AppSection.compression.subtitle) {
+            dropWell
+            quickFolders
+            settings
+            statusLine
+
+            if controller.compressionItems.isEmpty {
+                EmptyResults(symbol: "arrow.down.right.and.arrow.up.left", message: "아직 줄인 파일이 없습니다.\n위에 파일을 드롭하거나 툴바에서 사진 앱·파일을 고르세요.")
+            } else {
+                LazyVGrid(columns: columns, spacing: Spacing.l) {
+                    ForEach(controller.compressionItems) { item in
+                        CompressionCard(controller: controller, item: item)
+                            .transition(.appCard)
+                    }
+                }
+            }
+        }
+        .animation(.appContent, value: controller.compressionItems.map(\.id))
+        .animation(.appContent, value: controller.compressionError)
+        .onChange(of: photoSelection) { _, selection in
+            guard !selection.isEmpty else { return }
+            importFromPhotos(selection)
+        }
+        .toolbar {
+            ToolbarItem {
+                Menu("결과", systemImage: "ellipsis") {
+                    Button("모두 저장…", systemImage: "square.and.arrow.down.on.square") { controller.saveAllCompressed() }
+                        .disabled(!controller.compressionItems.contains(where: \.isFinished))
+                    Button("목록 비우기", systemImage: "trash", role: .destructive) { controller.clearCompression() }
+                        .disabled(controller.compressionItems.isEmpty || controller.isCompressing)
+                }
+                .help("줄인 파일을 한꺼번에 저장하거나 목록을 비웁니다")
+            }
+            ToolbarItem {
+                // Editing a photo puts its card back to 대기 중; this is how the
+                // new version actually gets made. Prominent only when something
+                // is genuinely waiting for it.
+                Button("다시 실행", systemImage: "arrow.clockwise") { controller.recompress() }
+                    .disabled(controller.compressionItems.isEmpty || controller.isCompressing)
+                    .tint(controller.hasPendingCompression ? Color.snuBlue : nil)
+                    .help(controller.hasPendingCompression
+                          ? "편집한 사진이 아직 반영되지 않았습니다 · 지금 다시 실행합니다"
+                          : "목록의 파일을 현재 설정으로 다시 처리합니다")
+            }
+            ToolbarSpacer(.flexible)
+            ToolbarItem {
+                Button("파일 선택…", systemImage: "folder") { choose(startingAt: nil) }
+                    .disabled(controller.isCompressing)
+                    .help("줄일 파일이나 폴더를 고릅니다")
+            }
+            ToolbarItem {
+                if controller.isCompressing {
+                    Button("중단", systemImage: "stop.fill") { controller.stopCompression() }
+                        .tint(.red)
+                        .help("남은 파일 처리를 중단합니다")
+                } else {
+                    PhotosPicker(selection: $photoSelection, matching: .any(of: [.images, .videos])) {
+                        Label("사진 앱에서", systemImage: "photo.stack")
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(.snuBlue)
+                    .help("사진 보관함에서 직접 고릅니다 · 사진 권한 없이 동작합니다")
                 }
             }
         }
     }
+
+    private var dropWell: some View {
+        VStack(spacing: Spacing.s) {
+            if controller.isCompressing {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "square.and.arrow.down.on.square")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(isDropTarget ? AnyShapeStyle(Color.snuBlueLabel) : AnyShapeStyle(.tertiary))
+            }
+            Text(controller.isCompressing
+                 ? "용량을 줄이는 중입니다 · 끝나거나 중단한 뒤에 넣어 주세요"
+                 : "여기로 파일이나 폴더를 드롭하세요 · 사진 · PDF · 영상")
+                .font(.callout)
+                .foregroundStyle(controller.isCompressing ? .secondary : .primary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 110)
+        .multilineTextAlignment(.center)
+        .padding(Spacing.l)
+        .dropWell(isTargeted: isDropTarget, enabled: !controller.isCompressing)
+        .onDrop(of: [UTType.fileURL], isTargeted: $isDropTarget) { providers in
+            load(providers)
+            return true
+        }
+    }
+
+    private var quickFolders: some View {
+        HStack(spacing: Spacing.s) {
+            Text("빠른 폴더").font(.caption).foregroundStyle(.secondary)
+            ForEach(QuickFolder.available) { folder in
+                Button(folder.title) { choose(startingAt: folder.url) }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .disabled(controller.isCompressing)
+                    .help("\(folder.title) 폴더에서 바로 고릅니다")
+            }
+            if let recent = controller.lastCompressionSaveFolder {
+                Button("최근 저장 폴더") { choose(startingAt: recent) }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .disabled(controller.isCompressing)
+                    .help(recent.path)
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: 설정
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack(spacing: Spacing.l) {
+                LabeledContent("방식") {
+                    Picker("방식", selection: $controller.compressionMode) {
+                        ForEach(CompressionMode.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+                .fixedSize()
+
+                if controller.compressionMode == .level {
+                    LabeledContent("정도") {
+                        Picker("정도", selection: $controller.compressionLevel) {
+                            ForEach(CompressionLevel.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 220)
+                    }
+                    .fixedSize()
+                } else {
+                    LabeledContent("목표") {
+                        Picker("목표", selection: $controller.compressionTargetBytes) {
+                            ForEach(Self.targetChoices, id: \.bytes) { Text($0.title).tag($0.bytes) }
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                    }
+                    .fixedSize()
+                }
+                Spacer()
+            }
+            .disabled(controller.isCompressing)
+            .animation(.appControl, value: controller.compressionMode)
+
+            HStack(spacing: Spacing.l) {
+                Picker("사진 형식", selection: $controller.compressionImageFormat) {
+                    ForEach(ImageOutputFormat.allCases) { format in
+                        Text(format == .webp && !ImageOutputFormat.isWebPAvailable ? "WebP (brew install webp 필요)" : format.title)
+                            .tag(format)
+                    }
+                }
+                .frame(maxWidth: 260)
+
+                Picker("영상 코덱", selection: $controller.compressionVideoCodec) {
+                    ForEach(VideoOutputCodec.allCases) { Text($0.title).tag($0) }
+                }
+                .frame(maxWidth: 260)
+                Spacer()
+            }
+            .disabled(controller.isCompressing)
+
+            Text(explanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Spacing.l)
+        .glassPanel()
+    }
+
+    /// Says out loud what the current combination will actually do, including
+    /// the two cases that would otherwise look like bugs: PNG ignoring the
+    /// quality steps, and WebP needing a Homebrew package.
+    private var explanation: String {
+        var lines: [String] = []
+        if controller.compressionMode == .level {
+            lines.append(controller.compressionLevel.detail)
+        } else {
+            lines.append("각 파일을 목표 용량 아래로 맞춥니다. 사진은 품질을 자동으로 탐색하고 영상은 비트레이트를 계산합니다.")
+        }
+        if controller.compressionImageFormat == .png {
+            lines.append("PNG는 무손실이라 단계는 해상도만 바꿉니다. 용량을 줄이려면 JPEG·HEIC·WebP·AVIF를 고르세요.")
+        }
+        if controller.compressionImageFormat == .webp, !ImageOutputFormat.isWebPAvailable {
+            lines.append("WebP로 저장하려면 터미널에서 `brew install webp`를 실행해 주세요.")
+        }
+        if MediaImporter.ffmpegPath == nil {
+            lines.append("영상을 압축하려면 `brew install ffmpeg`가 필요합니다.")
+        }
+        return lines.joined(separator: " ")
+    }
+
+    static let targetChoices: [(title: String, bytes: Int)] = [
+        ("500 KB", 512_000), ("1 MB", 1_048_576), ("2 MB", 2_097_152),
+        ("5 MB", 5_242_880), ("10 MB", 10_485_760), ("25 MB", 26_214_400),
+    ]
+
+    // MARK: 진행 상황
+
+    @ViewBuilder
+    private var statusLine: some View {
+        if controller.isCompressing || !controller.compressionItems.isEmpty {
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                if controller.isCompressing {
+                    ProgressView(value: controller.compressionProgressValue).tint(.snuBlue)
+                }
+                HStack(spacing: Spacing.m) {
+                    Text(controller.compressionCountText)
+                        .font(.callout.weight(.medium))
+                        .monospacedDigit()
+                    if !controller.compressionETAString.isEmpty {
+                        Label(controller.compressionETAString, systemImage: "clock.arrow.circlepath")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Spacer()
+                    if !controller.compressionSavingsText.isEmpty {
+                        Text(controller.compressionSavingsText)
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(Color.snuBlueLabel)
+                            .monospacedDigit()
+                    }
+                }
+            }
+            .padding(Spacing.m)
+            .glassPanel(Radius.card)
+            .transition(.appCard)
+        }
+        Text(controller.compressionStatus).font(.caption).foregroundStyle(.secondary)
+        if let error = controller.compressionError {
+            DismissibleError(message: error) { controller.compressionError = nil }
+        }
+    }
+
+    // MARK: 입력 처리
+
+    private func choose(startingAt directory: URL?) {
+        let panel = NSOpenPanel()
+        panel.title = "용량을 줄일 파일 선택"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = directory
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        controller.compress(fileURLs: panel.urls)
+    }
+
+    /// Every provider is collected before starting, so a multi-file drop runs as
+    /// one batch with one estimate rather than several rejected calls.
+    private func load(_ providers: [NSItemProvider]) {
+        let group = DispatchGroup()
+        let collected = DroppedURLs()
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                collected.append(url)
+            }
+        }
+        group.notify(queue: .main) {
+            let urls = collected.all
+            guard !urls.isEmpty else { return }
+            Task { @MainActor in controller.compress(fileURLs: urls) }
+        }
+    }
+
+    /// `PhotosPicker` runs out of process, so this reaches the library without
+    /// asking for photo permission and without adding anything to Info.plist.
+    /// Items arrive as files rather than as `Data` so a two-gigabyte recording
+    /// never has to sit in memory.
+    private func importFromPhotos(_ selection: [PhotosPickerItem]) {
+        photoSelection = []
+        Task { @MainActor in
+            controller.reportCompressionStatus("사진 앱에서 \(selection.count)개를 가져오는 중")
+            var urls: [URL] = []
+            for item in selection {
+                if let picked = try? await item.loadTransferable(type: PickedFile.self) {
+                    urls.append(picked.url)
+                }
+            }
+            guard !urls.isEmpty else {
+                controller.compressionError = "사진 앱에서 파일을 가져오지 못했습니다."
+                return
+            }
+            controller.compress(fileURLs: urls)
+        }
+    }
 }
+
+
+private struct CompressionCard: View {
+    @ObservedObject var controller: AutomationController
+    let item: CompressionItem
+    @State private var preview: CGImage?
+    @State private var showsEditor = false
+    @State private var isHovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            thumbnail
+            HStack(spacing: Spacing.xs) {
+                Image(systemName: item.kind.symbol).font(.caption2).foregroundStyle(.secondary)
+                Text(item.source.lastPathComponent).font(.caption).lineLimit(1).truncationMode(.middle)
+            }
+            Text(item.sizeText)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(item.isFinished ? Color.snuBlueLabel : .secondary)
+                .monospacedDigit()
+            if !item.specText.isEmpty {
+                Text(item.specText).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if let summary = item.edit.summary {
+                Label(summary, systemImage: "crop").font(.caption2).foregroundStyle(Color.snuBlueLabel).lineLimit(1)
+            }
+            if item.isFailed || item.note != nil || !item.isFinished {
+                Text(item.statusText)
+                    .font(.caption2)
+                    .foregroundStyle(item.isFailed ? Color.red : .secondary)
+                    .lineLimit(2)
+            }
+            actions
+        }
+        .padding(Spacing.m)
+        .contentCard()
+        .task(id: previewKey) { await loadPreview() }
+        .sheet(isPresented: $showsEditor) {
+            PhotoEditorSheet(
+                title: item.source.lastPathComponent,
+                subtitle: item.originalDetail,
+                // The source, not the result: the edit is applied while compressing,
+                // so what the user frames here is what goes into that pass.
+                load: { [source = item.source] in
+                    try? ImageCompressor.decode(source, maxPixel: 1800).image
+                },
+                edit: Binding(
+                    get: { item.edit },
+                    set: { controller.updateCompressionEdit(item.id, to: $0) }
+                )
+            )
+        }
+    }
+
+    /// One visible action at most, with the rest behind a menu: three equal
+    /// buttons never fitted a 240-point card without wrapping.
+    @ViewBuilder
+    private var actions: some View {
+        if item.kind == .image || item.isFinished {
+            HStack(spacing: Spacing.s) {
+                if item.kind == .image {
+                    // Photos only: cropping a PDF or a video is a different job and
+                    // this editor cannot show either of them.
+                    Button("편집…", systemImage: "crop") { showsEditor = true }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(controller.isCompressing)
+                        .help("자르기·뒤집기를 하고 다시 실행하면 반영됩니다")
+                }
+                Spacer(minLength: Spacing.xs)
+                if item.isFinished {
+                    Menu {
+                        Button("저장…", systemImage: "square.and.arrow.down") { controller.saveCompressed(item) }
+                        Button("복사", systemImage: "doc.on.doc") { controller.copyCompressed(item) }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("결과를 저장하거나 복사합니다")
+                    .accessibilityLabel("이 파일의 추가 동작")
+                }
+            }
+        }
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: Radius.small, style: .continuous).fill(.quaternary.opacity(0.6))
+            if let preview {
+                Image(decorative: preview, scale: 1)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(6)
+            } else if item.isFailed {
+                Image(systemName: "exclamationmark.triangle").font(.title).foregroundStyle(.red)
+            } else {
+                Image(systemName: item.kind.symbol).font(.title).foregroundStyle(.tertiary)
+            }
+            if case .working(let fraction) = item.state {
+                VStack {
+                    Spacer()
+                    ProgressView(value: fraction).tint(.snuBlue).padding(.horizontal, 10).padding(.bottom, 8)
+                }
+            }
+        }
+        .frame(height: 150)
+        .clipShape(RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
+        .onTapGesture { if item.kind == .image && !controller.isCompressing { showsEditor = true } }
+        .onHover { isHovering = $0 }
+        .scaleEffect(isHovering && item.kind == .image ? 1.012 : 1)
+        .animation(.appControl, value: isHovering)
+        .help(item.kind == .image ? "클릭하면 크게 보고 자르기·뒤집기를 할 수 있습니다" : "")
+        .accessibilityLabel("\(item.source.lastPathComponent) 미리보기")
+    }
+
+    /// Rebuilt only when the result actually changes, and always off the main
+    /// thread: these are full-size photos and video frames.
+    private var previewKey: String { item.output?.path ?? item.source.path }
+
+    private func loadPreview() async {
+        preview = await CompressionThumbnail.image(for: item, maxPixel: 640)
+    }
+}
+
 
 private struct DictationSettingsSection: View {
     @ObservedObject var dictation: DictationController
@@ -2499,6 +4443,3 @@ private struct DictationSettingsSection: View {
     }
 }
 
-extension Color {
-    static let snuBlue = Color(red: 0.05, green: 0.24, blue: 0.54)
-}
