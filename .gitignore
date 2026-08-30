@@ -23,3 +23,15 @@ openclaw-workspace-state.json
 
 # 토큰 카운팅 툴 로컬 캐시
 .tokensave/
+
+# OpenClaw 에이전트 워크스페이스 파일
+# 이 폴더는 앱 저장소이면서 OpenClaw 워크스페이스이기도 하다. 아래 파일들은
+# 에이전트가 사용자·환경 정보를 채워 넣도록 설계된 것이라(USER.md는 사람에 대한
+# 메모, TOOLS.md는 카메라·SSH 호스트·기기 별칭), 공개 저장소에서 추적하면
+# 채워지는 순간 그대로 공개된다. 디스크에는 남기고 추적만 하지 않는다.
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+HEARTBEAT.md
+TOOLS.md
