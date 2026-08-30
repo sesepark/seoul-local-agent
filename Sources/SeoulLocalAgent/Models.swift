@@ -110,9 +110,18 @@ struct PersistentState: Codable {
     var lastSuccessAt: Date?
     var lastError: String?
 
-    /// Only recent days are ever reread (same-day merge and one-day carry-forward),
-    /// so keeping every briefing forever would grow the state file without bound.
-    static let retainedBriefingDays = 30
+    /// How many days of briefings the archive keeps.
+    ///
+    /// The pipeline itself only ever rereads the last day or two — same-day merge
+    /// and one-day carry-forward — so this number is not about the pipeline. It
+    /// is the depth of the 브리핑 보관함, whose whole point is answering "그때 그
+    /// 메일이 언제였더라" months later, and thirty days made that a rolling
+    /// window that quietly dropped the oldest day, with its notes and ticks, on
+    /// the thirty-first morning of daily use. At roughly a hundred kilobytes a
+    /// day this is single-digit megabytes, which is a fair price for a term's
+    /// worth of history. The screen says the number out loud rather than letting
+    /// the reader discover it by loss.
+    static let retainedBriefingDays = 90
 
     static func pruned(_ briefings: [String: DailyBriefing], keeping limit: Int = retainedBriefingDays) -> [String: DailyBriefing] {
         guard briefings.count > limit else { return briefings }

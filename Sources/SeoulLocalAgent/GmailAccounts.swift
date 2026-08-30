@@ -28,6 +28,10 @@ struct GmailAccountStore: Sendable {
         url = root.appending(path: "gmail-accounts.json")
     }
 
+    /// Where the file lives, so 연결 상태 can offer to reveal it when it is
+    /// missing rather than only naming it in prose.
+    var debugURL: URL { url }
+
     func load() -> [GmailAccount] {
         guard let data = try? Data(contentsOf: url),
               let value = try? JSONDecoder().decode([GmailAccount].self, from: data) else { return [] }

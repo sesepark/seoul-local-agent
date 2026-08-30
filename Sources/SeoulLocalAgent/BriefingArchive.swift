@@ -21,12 +21,21 @@ struct BriefingMark: Codable, Equatable {
     /// When the calendar entry sits, kept here so the archive can say
     /// "9월 3일 14시" without opening EventKit for every visible row.
     var scheduledAt: Date?
+    /// Where the reader put this item when the model put it somewhere else.
+    ///
+    /// Kept with the reader's marks rather than written back into the stored
+    /// briefing, for the same reason `BriefingQualityGate` runs at display time:
+    /// the briefing is what the pipeline produced and stays that, while this is
+    /// what the reader decided, and it survives a re-run that re-analyses the
+    /// same thread. It is also the honest record — the archive can still say
+    /// what the model thought and what the reader changed it to.
+    var categoryOverride: BriefCategory?
     var updatedAt = Date()
 
     var isPlaced: Bool { calendarEventID != nil || reminderID != nil }
     /// A mark with nothing in it is not worth storing, and pruning it keeps the
     /// file proportional to what the user actually touched.
-    var isBlank: Bool { !isDone && note.isEmpty && !isPlaced }
+    var isBlank: Bool { !isDone && note.isEmpty && !isPlaced && categoryOverride == nil }
 
     init() {}
 
@@ -41,6 +50,7 @@ struct BriefingMark: Codable, Equatable {
         calendarEventID = try container.decodeIfPresent(String.self, forKey: .calendarEventID)
         reminderID = try container.decodeIfPresent(String.self, forKey: .reminderID)
         scheduledAt = try container.decodeIfPresent(Date.self, forKey: .scheduledAt)
+        categoryOverride = try container.decodeIfPresent(BriefCategory.self, forKey: .categoryOverride)
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
     }
 }
@@ -116,11 +126,49 @@ final class BriefingArchiveModel: ObservableObject {
 
         var id: String { rawValue }
 
+        /// The pipeline's category this heading stands for. Reclassifying an item
+        /// from the screen moves it between these, so the two vocabularies have to
+        /// be joined in exactly one place.
+        var category: BriefCategory {
+            switch self {
+            case .action: .action
+            case .reference: .reference
+            case .other: .excluded
+            }
+        }
+
+        init(_ category: BriefCategory) {
+            switch category {
+            case .action: self = .action
+            case .reference: self = .reference
+            case .excluded: self = .other
+            }
+        }
+
         var symbol: String {
             switch self {
             case .action: "checkmark.circle"
             case .reference: "eye"
             case .other: "tray"
+            }
+        }
+
+        /// What a row offers to do with an item filed here, in the order the two
+        /// buttons should read. One step at a time in either direction, which is
+        /// how the reader asked for promotions and demotions to work.
+        var neighbours: [Bucket] {
+            switch self {
+            case .action: [.reference]
+            case .reference: [.action, .other]
+            case .other: [.reference]
+            }
+        }
+
+        var moveVerb: String {
+            switch self {
+            case .action: "오늘 꼭 할 일로 올리기"
+            case .reference: "확인해야 할 것으로 옮기기"
+            case .other: "기타로 내리기"
             }
         }
 
@@ -139,6 +187,18 @@ final class BriefingArchiveModel: ObservableObject {
         var mark: BriefingMark
 
         var id: String { item.trackingID }
+
+        /// Where this item actually sits: what the reader decided if they
+        /// decided anything, otherwise what the pipeline concluded.
+        var category: BriefCategory { mark.categoryOverride ?? item.category }
+        var bucket: Bucket { Bucket(category) }
+        /// True only when the reader moved it somewhere the model did not put it,
+        /// so the row can say so instead of quietly disagreeing with the report.
+        var isReclassified: Bool {
+            guard let override = mark.categoryOverride else { return false }
+            return override != item.category
+        }
+
         var title: String { BriefPresentation.title(for: item) }
         var summary: String { BriefPresentation.summary(for: item) }
         var deadlineText: String? { BriefPresentation.deadlineText(item.deadline) }
@@ -231,6 +291,9 @@ final class BriefingArchiveModel: ObservableObject {
     @Published var status = ""
     @Published var error: String?
     @Published var isExporting = false
+    /// One at a time: re-analysis loads the model, and two rows racing would
+    /// mean two copies of it in memory for no benefit.
+    @Published private(set) var isReanalyzing = false
     /// Non-nil while the confirm-the-date sheet is up.
     @Published var scheduling: Entry?
     /// Which of the two destinations the sheet opens on, so "미리 알림으로
@@ -252,7 +315,7 @@ final class BriefingArchiveModel: ObservableObject {
     /// Bumped whenever the days or the marks change. Both caches below key on it.
     private var revision = 0
     private var visibleCache: (key: String, entries: [Entry])?
-    private var dueCache: (key: String, entries: [Entry])?
+    private var dueCache: (key: String, groups: (due: [Entry], overdue: [Entry]))?
 
     /// Both stores are injectable so a test can point them at a temporary
     /// directory. Without that, running the suite would read — and the write
@@ -282,6 +345,23 @@ final class BriefingArchiveModel: ObservableObject {
         if days.first(where: { $0.dateKey == selectedDateKey }) == nil {
             selectedDateKey = days.first?.dateKey ?? ""
         }
+        dropOrphanedMarks()
+    }
+
+    /// Marks whose item is gone.
+    ///
+    /// Briefings are pruned by day; marks were pruned only by count, so a mark
+    /// outlived the item it belonged to and the file grew with every retired
+    /// briefing while the reader could no longer see any of it. Only marks older
+    /// than the oldest surviving day are dropped, so a tick made on an item that
+    /// is merely absent from today's run is never mistaken for an orphan.
+    private func dropOrphanedMarks() {
+        guard let oldest = days.compactMap({ Self.date(fromKey: $0.dateKey) }).min() else { return }
+        let alive = Set(days.flatMap { $0.items.map(\.trackingID) })
+        let kept = marks.filter { alive.contains($0.key) || $0.value.updatedAt >= oldest }
+        guard kept.count != marks.count else { return }
+        marks = kept
+        persist()
     }
 
     private func sortKey(_ briefing: DailyBriefing) -> Date {
@@ -308,6 +388,28 @@ final class BriefingArchiveModel: ObservableObject {
     }
 
     var selectedDay: DailyBriefing? { days.first { $0.dateKey == selectedDateKey } }
+
+    /// Whether what is on screen is old enough to warn about. Measured from when
+    /// the briefing was produced, not from the calendar day it was filed under,
+    /// so re-running an old day's briefing today clears the warning honestly.
+    func isStale(_ day: DailyBriefing, now: Date = Date()) -> Bool {
+        daysSince(day, now: now) >= BriefingHealth.staleAfterDays
+    }
+
+    func stalenessSummary(_ day: DailyBriefing, now: Date = Date()) -> String {
+        let days = daysSince(day, now: now)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.timeZone = KoreanDeadline.timeZone
+        formatter.dateFormat = "M월 d일 HH:mm"
+        return "\(days)일 전에 정리한 브리핑입니다 · \(formatter.string(from: day.updatedAt))"
+    }
+
+    private func daysSince(_ day: DailyBriefing, now: Date) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = KoreanDeadline.timeZone
+        return calendar.dateComponents([.day], from: calendar.startOfDay(for: day.updatedAt), to: calendar.startOfDay(for: now)).day ?? 0
+    }
 
     var isSearching: Bool { !search.trimmingCharacters(in: .whitespaces).isEmpty }
 
@@ -357,13 +459,7 @@ final class BriefingArchiveModel: ObservableObject {
     }
 
     func entries(_ bucket: Bucket) -> [Entry] {
-        let matching = visible.filter { entry in
-            switch bucket {
-            case .action: entry.item.category == .action
-            case .reference: entry.item.category == .reference
-            case .other: entry.item.category == .excluded
-            }
-        }
+        let matching = visible.filter { $0.bucket == bucket }
         let shown = hidesDone ? matching.filter { !$0.mark.isDone } : matching
         // Finished items sink; among the rest the most important comes first, and
         // ties break on when the thing arrived.
@@ -374,6 +470,42 @@ final class BriefingArchiveModel: ObservableObject {
         }
     }
 
+    /// Which headings the reader has asked to see in full.
+    @Published var expandedBuckets: Set<Bucket> = []
+
+    /// How many rows a heading shows before it stops.
+    ///
+    /// `TODO 최대 개수` / `확인 항목 최대 개수` in 설정 used to reach only the Notion
+    /// export. Once the briefing moved into the app, the one screen that reads it
+    /// every morning ignored both settings, which is how a day with twelve action
+    /// items and eighteen reference items got presented as a briefing. 기타 is a
+    /// counted tray and keeps its own fixed ceiling.
+    func limit(for bucket: Bucket) -> Int? {
+        // A search is an explicit request for everything that matches, so it is
+        // the one case where a cap would be wrong.
+        guard !isSearching, !expandedBuckets.contains(bucket) else { return nil }
+        switch bucket {
+        case .action: return AppConfig.briefingMaxActions
+        case .reference: return AppConfig.briefingMaxReferences
+        case .other: return Self.otherBucketLimit
+        }
+    }
+
+    static let otherBucketLimit = 5
+
+    /// The rows actually drawn under a heading, and how many were held back.
+    func shown(_ bucket: Bucket) -> (entries: [Entry], hidden: Int) {
+        let all = entries(bucket)
+        guard let limit = limit(for: bucket), all.count > limit else { return (all, 0) }
+        return (Array(all.prefix(limit)), all.count - limit)
+    }
+
+    func toggleBucketExpansion(_ bucket: Bucket) {
+        if expandedBuckets.contains(bucket) { expandedBuckets.remove(bucket) } else { expandedBuckets.insert(bucket) }
+    }
+
+    /// Counted over everything in the bucket, never over the capped view: the
+    /// number in the day bar answers "how much is left", not "how much fits".
     var openActionCount: Int { entries(.action).filter { !$0.mark.isDone }.count }
 
     /// Everything on screen as plain text, in the order it is shown.
@@ -397,44 +529,149 @@ final class BriefingArchiveModel: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    /// What the 개요 screen shows: everything still open whose deadline is today
-    /// or already past. Capped, because 개요 is a glance and a backlog of thirty
-    /// would push every other card off the screen — the full list is one click
-    /// away in the archive.
+    /// What the 개요 screen shows, in two separate lists.
+    ///
+    /// It used to be one list under a heading that said 오늘, with no lower
+    /// bound on the deadline, so a mail whose deadline passed a fortnight ago
+    /// sat there forever labelled "지남 ·" and there was no day on which the box
+    /// emptied. A deadline from two weeks ago is real and worth showing, but it
+    /// is not today's work and it must not crowd today's work out: they are now
+    /// two headings with two ceilings.
     static let dueTodayLimit = 6
+    static let overdueLimit = 4
 
-    func dueToday(now: Date = Date()) -> [Entry] {
+    /// Open action items whose deadline falls inside today.
+    func dueToday(now: Date = Date()) -> [Entry] { deadlineGroups(now: now).due }
+
+    /// Open action items whose deadline has already passed, newest miss first.
+    func overdue(now: Date = Date()) -> [Entry] { deadlineGroups(now: now).overdue }
+
+    private func deadlineGroups(now: Date) -> (due: [Entry], overdue: [Entry]) {
         var dayCalendar = Calendar(identifier: .gregorian)
         dayCalendar.timeZone = KoreanDeadline.timeZone
         // Keyed by the day, not the instant: 개요 asks this on every redraw, but
         // the answer only changes when the data changes or the date rolls over.
         let key = "\(revision)|\(dayCalendar.startOfDay(for: now).timeIntervalSince1970)"
-        if let cached = dueCache, cached.key == key { return cached.entries }
-        let computed = computeDueToday(now: now)
+        if let cached = dueCache, cached.key == key { return cached.groups }
+        let computed = computeDeadlineGroups(now: now)
         dueCache = (key, computed)
         return computed
     }
 
-    private func computeDueToday(now: Date) -> [Entry] {
+    private func computeDeadlineGroups(now: Date) -> (due: [Entry], overdue: [Entry]) {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = KoreanDeadline.timeZone
-        guard let endOfDay = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)) else { return [] }
+        let startOfDay = calendar.startOfDay(for: now)
+        guard let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay) else { return ([], []) }
         var seen = Set<String>()
-        var found: [Entry] = []
+        var due: [Entry] = []
+        var late: [Entry] = []
         for day in days {
-            for item in day.items where item.category == .action && seen.insert(item.trackingID).inserted {
+            // The same normalisation the archive shows through. Without it 개요
+            // could chase the reader about an item that 보관함 has already filed
+            // under 확인해야 할 것, and the two screens would disagree about the
+            // same mail. Walking every day is affordable because the result is
+            // cached per revision and per calendar day.
+            for item in BriefingQualityGate.normalized(day.items, preferences: preferences)
+            where seen.insert(item.trackingID).inserted {
                 let mark = marks[item.trackingID] ?? BriefingMark()
-                guard !mark.isDone, let due = KoreanDeadline.parse(item.deadline, now: now), due.date < endOfDay else { continue }
-                found.append(Entry(item: item, dateKey: day.dateKey, mark: mark))
+                // The reader's own filing wins here too: an item they pushed down
+                // to 기타 has stopped being something 개요 should chase them about.
+                guard (mark.categoryOverride ?? item.category) == .action, !mark.isDone,
+                      let parsed = KoreanDeadline.parse(item.deadline, now: now), parsed.date < endOfDay else { continue }
+                let entry = Entry(item: item, dateKey: day.dateKey, mark: mark)
+                if entry.isOverdue(now: now) && parsed.date < startOfDay { late.append(entry) } else { due.append(entry) }
             }
         }
-        // Overdue first, then by importance: the thing that is already late is
-        // the thing to look at.
-        return found.sorted { lhs, rhs in
-            let lateLeft = lhs.isOverdue(now: now)
-            if lateLeft != rhs.isOverdue(now: now) { return lateLeft }
-            return lhs.item.importance > rhs.item.importance
+        let byImportance: (Entry, Entry) -> Bool = { $0.item.importance > $1.item.importance }
+        // Most recently missed first: a deadline from yesterday is still worth
+        // rescuing, one from a month ago is history.
+        return (due.sorted(by: byImportance), late.sorted { lhs, rhs in
+            let leftDate = KoreanDeadline.parse(lhs.item.deadline, now: now)?.date ?? .distantPast
+            let rightDate = KoreanDeadline.parse(rhs.item.deadline, now: now)?.date ?? .distantPast
+            return leftDate > rightDate
+        })
+    }
+
+    // MARK: - 분류 교정
+
+    /// Move one item to another heading.
+    ///
+    /// The reader had no way to do this at all: five misfiled items last week had
+    /// to be corrected by editing the classifier's instructions in 설정 and
+    /// waiting for the next run. This is the direct route, and because it is
+    /// stored as a mark rather than written into the briefing, tomorrow's run
+    /// cannot quietly undo it.
+    func move(_ entry: Entry, to bucket: Bucket) {
+        let target = bucket.category
+        mutate(entry.id) { mark in
+            // Agreeing with the model is not an override; recording it as one
+            // would mean a later prompt change could never move the item again.
+            mark.categoryOverride = target == entry.item.category ? nil : target
         }
+        status = target == entry.item.category
+            ? "모델 분류로 되돌렸습니다."
+            : "\(bucket.rawValue)(으)로 옮겼습니다. 다음 실행에도 유지됩니다."
+    }
+
+    func clearCategoryOverride(_ entry: Entry) {
+        mutate(entry.id) { $0.categoryOverride = nil }
+        status = "모델 분류로 되돌렸습니다."
+    }
+
+    /// Send one stored item back through the local model.
+    ///
+    /// A batch that ran past the generation ceiling used to close as valid JSON
+    /// with empty fields, so the item reached the archive titled "Gmail 확인: …"
+    /// with "원문을 확인해 주세요." for a summary — and stayed that way forever,
+    /// because nothing short of deleting the state file would make the pipeline
+    /// look at it again. The evidence it runs on is the stored excerpt: the full
+    /// body is deliberately not kept, and re-reading Gmail for one row would mean
+    /// the archive quietly reaching back out to the network.
+    func reanalyze(_ entry: Entry) async {
+        guard !isReanalyzing else { return }
+        let excerpt = entry.bodyText
+        guard !excerpt.isEmpty else {
+            error = "이 항목은 저장된 본문이 없어 다시 분석할 수 없습니다. 원문을 열어 확인해 주세요."
+            return
+        }
+        isReanalyzing = true
+        status = "이 항목을 다시 분석하고 있습니다…"
+        defer { isReanalyzing = false }
+        let original = entry.item.sourceItem
+        let rebuilt = SourceItem(
+            id: original.id, source: original.source, account: original.account, author: original.author,
+            timestamp: original.timestamp, subject: original.subject, body: excerpt, link: original.link,
+            stableID: original.stableID, audience: original.audience
+        )
+        do {
+            let classifier = LocalClassifier()
+            let answered = try await classifier.classify([rebuilt], userInstructions: preferences.userInstructions)
+            await classifier.unload()
+            guard var replacement = BriefingQualityGate.normalized(answered, preferences: preferences).first else {
+                error = "모델이 이 항목에 대한 결과를 돌려주지 않았습니다."
+                return
+            }
+            replacement.contentFingerprint = entry.item.contentFingerprint
+            replacement.bodyExcerpt = entry.item.bodyExcerpt
+            try store(replacement, on: entry.dateKey)
+            reload()
+            status = "다시 분석했습니다."
+        } catch {
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Writes one re-analysed item back into the day it belongs to. Everything
+    /// else in the checkpoint is left exactly as it was.
+    private func store(_ item: ClassifiedItem, on dateKey: String) throws {
+        var state = stateStore.load()
+        guard var day = state.dailyBriefings[dateKey],
+              let index = day.items.firstIndex(where: { $0.trackingID == item.trackingID }) else { return }
+        day.items[index] = item
+        day.updatedAt = Date()
+        state.dailyBriefings[dateKey] = day
+        try stateStore.save(state)
     }
 
     // MARK: - 표시

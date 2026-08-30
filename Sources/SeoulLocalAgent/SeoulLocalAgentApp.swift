@@ -27,6 +27,29 @@ struct SeoulLocalAgentApp: App {
                 exit(EXIT_SUCCESS)
             }
         }
+        // The same probes 설정 › 연결 상태 runs, on the terminal. Worth having
+        // separately: this is the check you want when the app will not start, or
+        // when you want to see the answer without a window in the way.
+        if CommandLine.arguments.contains("--connection-check") {
+            Task {
+                var failed = false
+                for check in await ConnectionHealthReport.run() {
+                    let mark = switch check.state {
+                    case .ok: "✅"
+                    case .warning: "⚠️"
+                    case .failed: "❌"
+                    case .checking: "…"
+                    }
+                    if check.state == .failed { failed = true }
+                    print("\(mark) \(check.title): \(check.summary)")
+                    if let detail = check.detail, !detail.isEmpty {
+                        detail.split(separator: "\n").forEach { print("     \($0)") }
+                    }
+                }
+                print("• \(BriefingHealth.load().summary())")
+                exit(failed ? EXIT_FAILURE : EXIT_SUCCESS)
+            }
+        }
         // `--briefing-shadow` runs the whole pipeline and prints the report
         // without touching stored state; `--briefing-write` also saves it and
         // exports it to Notion, which is now an explicit extra step rather than
@@ -132,6 +155,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if CommandLine.arguments.contains("--force-light") {
             NSApp.appearance = NSAppearance(named: .aqua)
         }
+        // Same purpose as `--section`: reaching a screen without a keystroke, so
+        // the app can be looked at while it runs without taking the machine away
+        // from whoever is using it.
+        if CommandLine.arguments.contains("--settings") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            }
+        }
         // Process discovery performs blocking system I/O and must never hold
         // SwiftUI's main thread during launch.
         DispatchQueue.global(qos: .utility).async {
@@ -193,10 +224,21 @@ final class AutomationController: ObservableObject {
     @Published var lastBriefing: DailyBriefing?
     /// The briefings themselves, and what the reader has done with them.
     let briefingArchive = BriefingArchiveModel()
+    /// Names and tags for the recording library, which had neither.
+    let recordingOrganizer = RecordingOrganizer()
     /// Today's schedule for the 개요 screen. Read on demand rather than kept in
     /// sync: EventKit is the source of truth and the screen is not always up.
     @Published var todayEvents: [CalendarGlance] = []
     @Published var errorMessage: String?
+    /// What the last run managed, read back out of the checkpoint the pipeline
+    /// already writes. `lastSuccessAt` and `lastError` were recorded from the
+    /// first version and displayed by nothing, which is how a briefing went
+    /// seventeen days stale while both screens said 대기 중.
+    @Published var briefingHealth = BriefingHealth.load()
+    /// Which pane ⌘, lands on. Lives here because the buttons that need to steer
+    /// it — 연결 상태 점검 on 개요, 설정에서 변경 on 자동 브리핑 — are outside the
+    /// settings window's own view tree.
+    @Published var settingsTab: SettingsTab = .briefing
     @Published var isRunning = false
     @Published var isTranscribing = false
     @Published var asrModel: ASRModelChoice {
@@ -587,17 +629,26 @@ final class AutomationController: ObservableObject {
                     }
                 }
                 phase = .completed
-                detail = "브리핑 보관함에 저장했고 모델을 언로드했습니다."
+                // A run where Gmail failed and iMessage answered used to end on
+                // the word 완료 and nothing else, with the reason buried in a
+                // caption below thirty rows in another screen. Partial success is
+                // still success, but it has to say what it missed.
+                detail = briefing.failures.isEmpty
+                    ? "브리핑 보관함에 저장했고 모델을 언로드했습니다."
+                    : "브리핑 보관함에 저장했지만 \(briefing.failures.count)개 소스에 문제가 있었습니다. 아래를 확인해 주세요."
                 lastBriefing = briefing
                 briefingArchive.reload()
+                briefingHealth = BriefingHealth.load()
                 briefingETA = 0
             } catch AgentError.cancelled {
                 phase = .cancelled
                 detail = "작업을 중지하고 로컬 모델을 해제했습니다."
+                briefingHealth = BriefingHealth.load()
             } catch {
                 phase = .failed
                 errorMessage = error.localizedDescription
                 detail = "원본 서비스는 변경하지 않았습니다."
+                briefingHealth = BriefingHealth.load()
             }
             isRunning = false
             task = nil
@@ -1668,7 +1719,11 @@ final class AutomationController: ObservableObject {
     }
 
     private func enqueueOrganization(_ run: TranscriptRun, titleOverride: String? = nil) {
-        let recordingTitle = titleOverride ?? recordings.first { $0.id == run.recordingID }?.title ?? "저장된 전사"
+        // The reader's own name for the take, so an exported transcript is
+        // filed as 회로이론 3주차 rather than as 녹음 2026-08-25 154002.
+        let recordingTitle = titleOverride
+            ?? recordings.first { $0.id == run.recordingID }.map { recordingOrganizer.displayTitle(for: $0) }
+            ?? "저장된 전사"
         let item = ProcessingQueueItem(
             id: UUID(),
             kind: .organization,
@@ -2088,15 +2143,19 @@ private struct OverviewView: View {
                 StatusTile(
                     title: "자동 브리핑",
                     value: controller.phase.rawValue,
-                    detail: controller.isRunning ? controller.briefingETAString : controller.selectedRange.rawValue,
+                    // When it is not running, the useful number is not the
+                    // collection range — that is a setting, and it never changes
+                    // on its own. It is when this last worked.
+                    detail: controller.isRunning ? controller.briefingETAString : controller.briefingHealth.summary(),
                     symbol: "tray.full",
-                    isBusy: controller.isRunning
+                    isBusy: controller.isRunning,
+                    isAlarming: !controller.isRunning && controller.briefingHealth.isStale()
                 ) { controller.section = .briefing }
 
                 StatusTile(
                     title: "녹음 보관함",
                     value: "\(controller.recordings.count)개",
-                    detail: controller.recordings.first?.title ?? "아직 녹음이 없습니다",
+                    detail: controller.recordings.first.map { controller.recordingOrganizer.displayTitle(for: $0) } ?? "아직 녹음이 없습니다",
                     symbol: "waveform",
                     isBusy: controller.isTranscribing || controller.audioRecorder.isRecording
                 ) { controller.section = .transcription }
@@ -2110,7 +2169,11 @@ private struct OverviewView: View {
                 ) { openSettings() }
             }
 
+            runProblems
+
             today
+
+            overdue
 
             if !controller.processingQueue.isEmpty {
                 ProcessingQueueCard(controller: controller)
@@ -2163,7 +2226,63 @@ private struct OverviewView: View {
         }
         .animation(.appContent, value: controller.processingQueue.map(\.id))
         .animation(.appContent, value: controller.isRunning)
-        .task { controller.refreshToday() }
+        .task {
+            controller.refreshToday()
+            // Re-read rather than trust what was loaded at launch: a run started
+            // from the menu bar, or the date rolling over, both change the answer.
+            controller.briefingHealth = BriefingHealth.load()
+        }
+    }
+
+    /// What the last run could not reach.
+    ///
+    /// This is the surface the sixteen-day Gmail outage needed and did not have.
+    /// A source that failed is named here, on the first screen, until a run
+    /// succeeds without it — not in a caption at the foot of another screen.
+    @ViewBuilder
+    private var runProblems: some View {
+        let health = controller.briefingHealth
+        if let error = health.lastError, !error.isEmpty {
+            problemBox(symbol: "xmark.octagon.fill", tint: .red,
+                       title: "\(health.when())의 실행이 실패했습니다", lines: [error])
+        } else if !health.failures.isEmpty {
+            // Dated, not just "마지막". A seventeen-day-old failure written as
+            // "마지막 브리핑에서" reads as a problem happening now — and the one
+            // this actually showed, a missing Slack token, had been fixed days
+            // before. The reader has to be able to tell those apart.
+            problemBox(symbol: "exclamationmark.triangle.fill", tint: .orange,
+                       title: "\(health.when()) 브리핑에서 \(health.failures.count)개 소스에 문제가 있었습니다",
+                       lines: health.failures)
+        }
+    }
+
+    private func problemBox(symbol: String, tint: Color, title: String, lines: [String]) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                ForEach(lines.prefix(4), id: \.self) { line in
+                    Text(line)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                HStack(spacing: Spacing.s) {
+                    Button("연결 상태 점검", systemImage: "stethoscope") {
+                        controller.settingsTab = .connections
+                        openSettings()
+                    }
+                    .buttonStyle(.bordered)
+                    Button("다시 정리", systemImage: "arrow.clockwise") { controller.startBriefing() }
+                        .buttonStyle(.bordered)
+                        .disabled(controller.isRunning)
+                    Spacer()
+                }
+                .padding(.top, Spacing.xs)
+            }
+        } label: {
+            Label(title, systemImage: symbol).font(.headline).foregroundStyle(tint)
+        }
+        .transition(.appCard)
     }
 
     /// What is actually happening today: the Mac's own calendar, and whatever
@@ -2173,6 +2292,10 @@ private struct OverviewView: View {
     /// briefing anyway and the deadlines are in the archive — so this costs one
     /// EventKit query and no network at all. It stays hidden on a day with
     /// nothing in it rather than showing an empty box.
+    ///
+    /// Deadlines that have already passed are *not* here; they have their own
+    /// heading below. A box called 오늘 that fills up with a fortnight-old
+    /// deadline and never empties stops being read.
     @ViewBuilder
     private var today: some View {
         let due = controller.briefingArchive.dueToday()
@@ -2205,11 +2328,51 @@ private struct OverviewView: View {
                 HStack(spacing: Spacing.s) {
                     Label("오늘", systemImage: "calendar.day.timeline.left").font(.headline)
                     if !due.isEmpty {
-                        let late = due.filter { $0.isOverdue() }.count
-                        Text(late > 0 ? "지난 마감 \(late)개" : "마감 \(due.count)개")
+                        Text("마감 \(due.count)개")
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(late > 0 ? .red : .orange)
+                            .foregroundStyle(.orange)
                     }
+                }
+            }
+            .transition(.appCard)
+        }
+    }
+
+    /// Deadlines already gone. Separated from 오늘 on purpose and capped
+    /// separately, so a backlog cannot squeeze out the day's actual work; the
+    /// full list is in the archive.
+    @ViewBuilder
+    private var overdue: some View {
+        let late = controller.briefingArchive.overdue()
+        if !late.isEmpty {
+            GroupBox {
+                VStack(spacing: 0) {
+                    ForEach(Array(late.prefix(BriefingArchiveModel.overdueLimit).enumerated()), id: \.element.id) { index, entry in
+                        if index > 0 { Divider() }
+                        row(
+                            symbol: "exclamationmark.triangle.fill", tint: .red,
+                            lead: "지남 · \(entry.deadlineText ?? "")",
+                            title: entry.title, trailing: entry.source
+                        ) {
+                            controller.briefingArchive.selectedDateKey = entry.dateKey
+                            controller.section = .archive
+                        }
+                    }
+                    if late.count > BriefingArchiveModel.overdueLimit {
+                        Divider()
+                        Button("보관함에서 \(late.count)개 모두 보기") { controller.section = .archive }
+                            .buttonStyle(.link)
+                            .font(.callout)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, Spacing.s)
+                    }
+                }
+            } label: {
+                HStack(spacing: Spacing.s) {
+                    Label("밀린 것", systemImage: "clock.badge.exclamationmark").font(.headline)
+                    Text("\(late.count)개")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.red)
                 }
             }
             .transition(.appCard)
@@ -2236,15 +2399,19 @@ private struct OverviewView: View {
         .buttonStyle(.plain)
     }
 
-    /// Every tool, with a few words about what it is for.
+    /// Every file tool, with a few words about what it is for.
     ///
     /// The sidebar lists the same names, but nine of them is past what anyone
     /// holds in their head, and the sidebar has no room to say what any of them
     /// does. This is the screen where the answer to "어디서 하지?" lives.
+    ///
+    /// 자동 브리핑 and 브리핑 보관함 are deliberately not here. They already have
+    /// a status tile at the top of this screen and a button in 지금 할 수 있는 것,
+    /// so a third copy was duplication for its own sake.
     private var tools: some View {
         GroupBox {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 215), spacing: Spacing.m)], spacing: Spacing.m) {
-                ForEach(AppSection.allCases.filter { $0 != .overview }) { section in
+                ForEach(AppSection.allCases.filter { $0 != .overview && $0 != .briefing && $0 != .archive }) { section in
                     ToolShortcut(section: section) { controller.section = section }
                 }
             }
@@ -2271,7 +2438,13 @@ private struct OverviewView: View {
                                 Image(systemName: recording.source == .app ? "mic.fill" : "waveform")
                                     .foregroundStyle(Color.snuBlueLabel)
                                     .frame(width: 18)
-                                Text(recording.title).lineLimit(1)
+                                Text(controller.recordingOrganizer.displayTitle(for: recording)).lineLimit(1)
+                                ForEach(controller.recordingOrganizer.tags(for: recording.id).prefix(2), id: \.self) { tag in
+                                    Text(tag)
+                                        .font(.caption2.weight(.medium))
+                                        .padding(.horizontal, 6).padding(.vertical, 1)
+                                        .background(Color.snuBlue.opacity(0.16), in: Capsule())
+                                }
                                 Spacer(minLength: Spacing.s)
                                 let runs = controller.transcriptRuns(for: recording).count
                                 if runs > 0 {
@@ -2348,6 +2521,9 @@ private struct StatusTile: View {
     var detail: String = ""
     let symbol: String
     var isBusy = false
+    /// Draws attention to the tile's own detail line. Used when the number on it
+    /// is the problem — a briefing that has not succeeded in days.
+    var isAlarming = false
     let open: () -> Void
 
     @State private var isHovering = false
@@ -2358,18 +2534,22 @@ private struct StatusTile: View {
                 HStack {
                     Image(systemName: symbol)
                         .font(.title2)
-                        .foregroundStyle(Color.snuBlueLabel)
+                        .foregroundStyle(isAlarming ? Color.orange : Color.snuBlueLabel)
                     Spacer()
                     if isBusy { ProgressView().controlSize(.small) }
                 }
                 Text(title).font(.caption).foregroundStyle(.secondary)
                 Text(value).font(.title3.weight(.semibold)).lineLimit(1)
                 if !detail.isEmpty {
-                    Text(detail)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Label {
+                        Text(detail)
+                    } icon: {
+                        if isAlarming { Image(systemName: "exclamationmark.triangle.fill") }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(isAlarming ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
@@ -2424,19 +2604,47 @@ private struct BriefingStatusWorkspaceView: View {
         }
     }
 
+    /// The run's conditions, and — new — when it last worked.
+    ///
+    /// This screen's own subtitle promises "수집부터 저장까지의 상태", and it used
+    /// to show two settings and a progress bar: nothing about whether any source
+    /// could be reached, and nothing about when a run last succeeded.
     private var conditions: some View {
-        HStack(spacing: Spacing.s) {
-            Label(controller.selectedRange.rawValue, systemImage: "calendar.badge.clock")
-                .font(.callout)
-            Text("·").foregroundStyle(.tertiary)
-            Text(controller.briefingQualityMode.title)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("설정에서 변경") { openSettings() }
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            HStack(spacing: Spacing.s) {
+                Label(controller.selectedRange.rawValue, systemImage: "calendar.badge.clock")
+                    .font(.callout)
+                Text("·").foregroundStyle(.tertiary)
+                Text(controller.briefingQualityMode.title)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("설정에서 변경") {
+                    controller.settingsTab = .briefing
+                    openSettings()
+                }
                 .buttonStyle(.link)
                 .font(.caption)
                 .help("수집 범위와 분석 품질을 바꿉니다 (⌘,)")
+            }
+            Divider()
+            HStack(spacing: Spacing.s) {
+                let stale = controller.briefingHealth.isStale()
+                Image(systemName: stale ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(stale ? Color.orange : Color.green)
+                    .font(.caption)
+                Text(controller.briefingHealth.summary())
+                    .font(.callout)
+                    .foregroundStyle(stale ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+                Spacer()
+                Button("연결 상태 점검") {
+                    controller.settingsTab = .connections
+                    openSettings()
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .help("각 소스에 실제로 닿는지 지금 확인합니다")
+            }
         }
         .padding(.horizontal, Spacing.l)
         .padding(.vertical, Spacing.m)
@@ -2501,6 +2709,12 @@ private struct BriefingStatusRow: View {
     }
 }
 
+/// Which pane ⌘, opens on, so a button elsewhere can send the reader somewhere
+/// specific rather than to wherever they were last.
+enum SettingsTab: String, Hashable {
+    case briefing, connections, classification, transcription, dictation, tools
+}
+
 /// The ⌘, window. These nine sections used to be one `Form` inside a sidebar
 /// row, with six `TextEditor`s in a single scroll that ran several screens long.
 /// Splitting them by subject is the difference between finding a setting and
@@ -2509,21 +2723,27 @@ private struct SettingsWindow: View {
     @ObservedObject var controller: AutomationController
 
     var body: some View {
-        TabView {
-            Tab("브리핑", systemImage: "tray.full") {
+        // Bound, not free: a button that says 연결 상태 점검 has to land on that
+        // tab. `openSettings()` alone reopens whichever tab was left showing, so
+        // the promise the button makes was one it could not keep.
+        TabView(selection: $controller.settingsTab) {
+            Tab("브리핑", systemImage: "tray.full", value: SettingsTab.briefing) {
                 BriefingSettingsTab(controller: controller)
             }
-            Tab("분류 기준", systemImage: "line.3.horizontal.decrease.circle") {
+            Tab("연결 상태", systemImage: "stethoscope", value: SettingsTab.connections) {
+                ConnectionSettingsTab(controller: controller)
+            }
+            Tab("분류 기준", systemImage: "line.3.horizontal.decrease.circle", value: SettingsTab.classification) {
                 ClassificationSettingsTab(controller: controller)
             }
-            Tab("전사", systemImage: "waveform") {
+            Tab("전사", systemImage: "waveform", value: SettingsTab.transcription) {
                 TranscriptionSettingsTab(controller: controller)
             }
-            Tab("받아쓰기", systemImage: "mic") {
+            Tab("받아쓰기", systemImage: "mic", value: SettingsTab.dictation) {
                 Form { DictationSettingsSection(dictation: controller.dictation) }
                     .formStyle(.grouped)
             }
-            Tab("도구", systemImage: "wand.and.stars") {
+            Tab("도구", systemImage: "wand.and.stars", value: SettingsTab.tools) {
                 ToolSettingsTab(controller: controller)
             }
         }
@@ -2554,15 +2774,20 @@ private struct BriefingSettingsTab: View {
                 Text("Slack DM은 Member ID 없이 수집하며, 채널은 이 ID의 멘션만 수집합니다. `마지막 성공 이후`는 직전 실행이 수동 재검토였어도 그 시점부터 이어서 수집하고, 기록이 없으면 최대 30일까지 거슬러 봅니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("연동") {
-                IntegrationStatusRow(symbol: "envelope", title: "Gmail", detail: "두 계정 · 읽기 전용", status: "읽기 전용")
-                IntegrationStatusRow(symbol: "bubble.left.and.bubble.right", title: "Slack", detail: "DM 및 내 멘션 · 읽기 전용", status: "읽기 전용")
-                IntegrationStatusRow(symbol: "message", title: "메시지", detail: "iMessage · SMS · RCS · 읽기 전용", status: "Full Disk Access 필요")
+            Section("무엇을 읽는가") {
+                // These rows say what each source is *for*. What each source can
+                // actually reach right now is a live question with a live answer,
+                // and it belongs in 연결 상태 — printing a fixed "읽기 전용" here
+                // and calling it a status is exactly what hid a dead Gmail token
+                // for sixteen days.
+                IntegrationStatusRow(symbol: "envelope", title: "Gmail", detail: "설정한 계정의 새 메일 · 읽기 전용", status: "")
+                IntegrationStatusRow(symbol: "bubble.left.and.bubble.right", title: "Slack", detail: "DM 및 내 멘션 · 읽기 전용", status: "")
+                IntegrationStatusRow(symbol: "message", title: "메시지", detail: "iMessage · SMS · RCS 수신 · 읽기 전용", status: "")
                 IntegrationStatusRow(
                     symbol: "globe",
                     title: "웹 공지",
                     detail: "학교 공지 게시판 \(Self.webNoticeSiteCount)곳 · 공개 페이지만 읽음",
-                    status: "읽기 전용"
+                    status: ""
                 ) {
                     Button("목록 편집") {
                         NSWorkspace.shared.activateFileViewerSelecting([WebNoticeConfiguration.url])
@@ -2570,21 +2795,154 @@ private struct BriefingSettingsTab: View {
                     .buttonStyle(.borderless)
                     .help("web-notices.json을 Finder에서 엽니다")
                 }
-                IntegrationStatusRow(symbol: "calendar", title: "캘린더", detail: "앞으로 14일 일정 읽기 · 전용 캘린더에 쓰기", status: controller.calendarAuthorizationStatus) {
-                    Button("권한 허용") { controller.requestCalendarAccess() }
-                        .buttonStyle(.bordered)
-                        .disabled(controller.calendarAuthorizationStatus == "허용됨")
-                }
-                IntegrationStatusRow(symbol: "checklist", title: "미리 알림", detail: "전용 목록에 쓰기 전용", status: controller.reminderAuthorizationStatus) {
-                    Button("권한 허용") { controller.requestReminderAccess() }
-                        .buttonStyle(.bordered)
-                        .disabled(controller.reminderAuthorizationStatus == "허용됨")
-                }
-                Text("캘린더 일정은 인박스 정리에 일정 맥락으로 포함됩니다. 앱이 만드는 일정과 미리 알림은 전부 '\(AgentCalendar.title)' 이름의 전용 캘린더·목록에만 들어가며, 원래 쓰던 캘린더의 일정은 만들거나 고치거나 지우지 않습니다.")
+                IntegrationStatusRow(symbol: "calendar", title: "캘린더 · 미리 알림", detail: "앞으로 14일 일정 읽기 · 전용 캘린더와 목록에만 쓰기", status: "")
+                Text("캘린더 일정은 인박스 정리에 일정 맥락으로 포함됩니다. 앱이 만드는 일정과 미리 알림은 전부 '\(AgentCalendar.title)' 이름의 전용 캘린더·목록에만 들어가며, 원래 쓰던 캘린더의 일정은 만들거나 고치거나 지우지 않습니다. 지금 각 소스에 실제로 닿는지는 **연결 상태** 탭에서 점검합니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// 설정 › 연결 상태.
+///
+/// Every row here performs the read the briefing performs and reports what came
+/// back, because the pane this replaces printed fixed strings. The check is
+/// manual: it spawns `gog` per account and fetches fifteen notice boards, and
+/// neither should happen merely because a settings window was opened.
+private struct ConnectionSettingsTab: View {
+    @ObservedObject var controller: AutomationController
+    @StateObject private var model = ConnectionHealthModel()
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+                    Image(systemName: model.briefing.isStale() ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(model.briefing.isStale() ? Color.orange : Color.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.briefing.summary()).font(.callout.weight(.medium))
+                        if let error = model.briefing.lastError, !error.isEmpty {
+                            Text("마지막 오류: \(error)").font(.caption).foregroundStyle(.red)
+                        } else if !model.briefing.failures.isEmpty {
+                            Text(model.briefing.failures.joined(separator: "\n"))
+                                .font(.caption).foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer()
+                }
+            } header: {
+                Text("마지막 인박스 정리")
+            }
+
+            Section {
+                ForEach(model.checks) { check in
+                    ConnectionCheckRow(check: check) { remedy in apply(remedy) }
+                }
+            } header: {
+                HStack {
+                    Text("소스")
+                    Spacer()
+                    if let checkedAt = model.lastCheckedAt {
+                        Text("점검 \(checkedAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            } footer: {
+                Text("점검은 각 소스에 실제로 한 번씩 읽기를 시도합니다. Gmail은 계정마다 `gog`를 한 번 실행하고, 웹 공지는 등록한 게시판을 모두 받아 봅니다. 여기서 보내는 것은 없습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
+                HStack(spacing: Spacing.s) {
+                    Button(model.isChecking ? "점검 중…" : "지금 점검", systemImage: "stethoscope") { model.check() }
+                        .buttonStyle(.borderedProminent).tint(.snuBlue)
+                        .disabled(model.isChecking)
+                    if model.isChecking {
+                        ProgressView().controlSize(.small)
+                        Button("중지") { model.cancel() }.buttonStyle(.bordered)
+                    }
+                    Spacer()
+                    if !model.status.isEmpty {
+                        Text(model.status).font(.caption).foregroundStyle(.secondary)
+                    } else if !model.isChecking, model.lastCheckedAt != nil {
+                        Text(model.problemCount == 0 ? "모든 소스 정상" : "문제 \(model.problemCount)건")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(model.problemCount == 0 ? .green : .orange)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .animation(.appContent, value: model.checks.map(\.state.rawValue))
+    }
+
+    private func apply(_ remedy: ConnectionCheck.Remedy) {
+        switch remedy {
+        case .openPrivacySettings(let url):
+            if let target = URL(string: url) { NSWorkspace.shared.open(target) }
+        case .revealFile(let url):
+            // Reveal rather than open: the parent folder is what the user needs
+            // when the file does not exist yet.
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        case .copyCommand(let command):
+            ArchiveClipboard.put(command)
+            model.status = "터미널에 붙여넣어 실행해 주세요."
+        case .requestCalendarAccess:
+            controller.requestCalendarAccess()
+            Task { try? await Task.sleep(for: .seconds(1)); model.refreshPermissions() }
+        case .requestReminderAccess:
+            controller.requestReminderAccess()
+            Task { try? await Task.sleep(for: .seconds(1)); model.refreshPermissions() }
+        }
+    }
+}
+
+private struct ConnectionCheckRow: View {
+    let check: ConnectionCheck
+    let apply: (ConnectionCheck.Remedy) -> Void
+
+    private var tint: Color {
+        switch check.state {
+        case .checking: .secondary
+        case .ok: .green
+        case .warning: .orange
+        case .failed: .red
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Spacing.m) {
+            Image(systemName: check.state.symbol)
+                .foregroundStyle(tint)
+                .frame(width: 18)
+                .symbolEffect(.pulse, options: .repeating, isActive: check.state == .checking)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: Spacing.xs) {
+                    Image(systemName: check.symbol).foregroundStyle(.secondary).font(.caption)
+                    Text(check.title).font(.callout.weight(.medium))
+                }
+                Text(check.summary)
+                    .font(.caption)
+                    .foregroundStyle(check.state == .ok ? AnyShapeStyle(.secondary) : AnyShapeStyle(tint))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = check.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: Spacing.s)
+            if let remedy = check.remedy, check.state != .ok || remedy.isAlwaysOffered {
+                Button(remedy.title) { apply(remedy) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -2756,9 +3114,14 @@ private struct IntegrationStatusRow<Trailing: View>: View {
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
-                Text(status)
-                    .font(.caption)
-                    .foregroundStyle(status == "읽기 허용됨" || status == "읽기 전용" ? .green : .secondary)
+                // Empty on purpose for the rows that describe scope rather than
+                // state: a row with nothing live to report should print nothing,
+                // not a reassuring constant.
+                if !status.isEmpty {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(status == "허용됨" ? .green : .secondary)
+                }
                 trailing()
             }
         }
@@ -2789,8 +3152,17 @@ private struct TranscriptionView: View {
     /// scrolled whichever one the pointer happened to be over.
     private static let collapsedRecordingCount = 8
 
+    /// Filtering is an explicit request for what matches, so it is never folded:
+    /// hiding half of a five-result search behind 전체 보기 would be a second
+    /// filter the reader did not ask for.
+    private var matchingRecordings: [RecordingItem] {
+        controller.recordingOrganizer.filtered(controller.recordings)
+    }
+
     private var visibleRecordings: [RecordingItem] {
-        showsAllRecordings ? controller.recordings : Array(controller.recordings.prefix(Self.collapsedRecordingCount))
+        let matching = matchingRecordings
+        guard !showsAllRecordings, !controller.recordingOrganizer.isFiltering else { return matching }
+        return Array(matching.prefix(Self.collapsedRecordingCount))
     }
 
     var body: some View {
@@ -2998,9 +3370,12 @@ private struct TranscriptionView: View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             HStack(spacing: Spacing.s) {
                 Label("녹음 보관함", systemImage: "tray.2").font(.headline)
-                Text(controller.recordingLibraryStatus).font(.caption).foregroundStyle(.secondary)
+                Text(controller.recordingOrganizer.isFiltering
+                     ? "\(matchingRecordings.count) / \(controller.recordings.count)개"
+                     : controller.recordingLibraryStatus)
+                    .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                if controller.recordings.count > Self.collapsedRecordingCount {
+                if !controller.recordingOrganizer.isFiltering, controller.recordings.count > Self.collapsedRecordingCount {
                     Button(showsAllRecordings ? "접기" : "전체 \(controller.recordings.count)개 보기") {
                         showsAllRecordings.toggle()
                     }
@@ -3008,25 +3383,47 @@ private struct TranscriptionView: View {
                     .font(.caption)
                 }
             }
+            if !controller.recordings.isEmpty { RecordingFilterBar(organizer: controller.recordingOrganizer) }
             if controller.recordings.isEmpty {
                 EmptyResults(symbol: "waveform", message: "보관함이 비어 있습니다.\n녹음을 시작하거나 Voice Memos 폴더를 연결하세요.")
-            } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: Spacing.m)], spacing: Spacing.m) {
-                    ForEach(visibleRecordings) { recording in
-                        RecordingCard(controller: controller, recording: recording)
+            } else if visibleRecordings.isEmpty {
+                EmptyResults(symbol: "magnifyingglass", message: "조건에 맞는 녹음이 없습니다.")
+            } else if controller.recordingOrganizer.groupsByTag {
+                ForEach(controller.recordingOrganizer.grouped(visibleRecordings), id: \.tag) { group in
+                    VStack(alignment: .leading, spacing: Spacing.s) {
+                        HStack(spacing: Spacing.xs) {
+                            Image(systemName: group.tag == RecordingOrganizer.untaggedGroup ? "tray" : "tag.fill")
+                                .imageScale(.small)
+                                .foregroundStyle(group.tag == RecordingOrganizer.untaggedGroup ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Color.snuBlueLabel))
+                            Text(group.tag).font(.callout.weight(.semibold))
+                            Text("\(group.recordings.count)").font(.caption).foregroundStyle(.secondary)
+                        }
+                        grid(group.recordings)
                     }
                 }
+            } else {
+                grid(visibleRecordings)
             }
         }
         .animation(.appContent, value: showsAllRecordings)
         .animation(.appContent, value: controller.recordings.map(\.id))
+        .animation(.appContent, value: controller.recordingOrganizer.selectedTags)
+        .animation(.appContent, value: controller.recordingOrganizer.groupsByTag)
+    }
+
+    private func grid(_ recordings: [RecordingItem]) -> some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: Spacing.m)], spacing: Spacing.m) {
+            ForEach(recordings) { recording in
+                RecordingCard(controller: controller, recording: recording)
+            }
+        }
     }
 
     @ViewBuilder
     private func selectedRecordingPanel(_ recording: RecordingItem) -> some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             HStack(spacing: Spacing.s) {
-                Label(recording.title, systemImage: "checkmark.circle.fill")
+                Label(controller.recordingOrganizer.displayTitle(for: recording), systemImage: "checkmark.circle.fill")
                     .font(.callout.weight(.medium))
                     .foregroundStyle(Color.snuBlueLabel)
                     .lineLimit(1)
@@ -3046,6 +3443,8 @@ private struct TranscriptionView: View {
                     .help("현재 전사 조건으로 이 녹음을 대기열에 넣습니다")
             }
             RecordingPlaybackBar(player: controller.recordingPlayer, recording: recording)
+            Divider()
+            RecordingLabelEditor(organizer: controller.recordingOrganizer, recording: recording)
         }
         .padding(Spacing.l)
         .glassPanel()
@@ -3157,6 +3556,219 @@ private struct TranscriptionView: View {
 }
 
 /// One take in the 녹음 보관함 grid.
+/// Search, tag chips and grouping for 녹음 보관함.
+///
+/// Fifty recordings sorted only by date is a pile; this is what turns it into a
+/// library. The chips are the tags actually in use, so the bar stays empty until
+/// there is something to filter by rather than presenting an empty apparatus.
+private struct RecordingFilterBar: View {
+    @ObservedObject var organizer: RecordingOrganizer
+    @State private var showsTagManager = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            HStack(spacing: Spacing.m) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("이름·태그로 찾기", text: $organizer.search)
+                    .textFieldStyle(.plain)
+                if !organizer.search.isEmpty {
+                    Button("지우기", systemImage: "xmark.circle.fill") { organizer.search = "" }
+                        .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.tertiary)
+                }
+                Divider().frame(height: 16)
+                Toggle("태그별로 묶기", isOn: $organizer.groupsByTag)
+                    .toggleStyle(.checkbox)
+                    .font(.callout)
+                    .disabled(organizer.allTags.isEmpty)
+                if !organizer.allTags.isEmpty {
+                    Button("태그 정리", systemImage: "tag") { showsTagManager = true }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .help("태그 이름을 바꾸거나 지웁니다")
+                }
+            }
+            // Before the first tag exists this bar is a search box and a disabled
+            // checkbox, with the only way in — select a take, scroll to the panel
+            // — nowhere on screen. One line fixes that.
+            if organizer.allTags.isEmpty {
+                Text("녹음을 하나 고르면 아래에서 이름을 붙이고 과목·주제 태그를 달 수 있습니다.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Spacing.xs) {
+                        ForEach(organizer.allTags, id: \.self) { tag in
+                            let isOn = organizer.selectedTags.contains(tag)
+                            Button {
+                                organizer.toggleFilter(tag)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(tag).font(.caption.weight(.medium))
+                                    Text("\(organizer.count(of: tag))").font(.caption2).foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(isOn ? AnyShapeStyle(Color.snuBlue.opacity(0.18)) : AnyShapeStyle(.quaternary), in: Capsule())
+                                .overlay(Capsule().strokeBorder(isOn ? Color.snuBlue : .clear))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        if organizer.isFiltering {
+                            Button("초기화") { organizer.clearFilter() }
+                                .buttonStyle(.link).font(.caption)
+                        }
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+        }
+        .padding(.horizontal, Spacing.l)
+        .padding(.vertical, Spacing.s)
+        .glassPanel(Radius.card)
+        .sheet(isPresented: $showsTagManager) { RecordingTagManager(organizer: organizer) }
+    }
+}
+
+/// Renaming a tag in one place rather than on every recording that carries it.
+private struct RecordingTagManager: View {
+    @ObservedObject var organizer: RecordingOrganizer
+    @Environment(\.dismiss) private var dismiss
+    @State private var editing: String?
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            Text("태그 정리").font(.headline)
+            Text("이름을 바꾸면 이 태그를 쓰는 녹음 전체에 반영됩니다. 녹음 파일 자체는 건드리지 않습니다.")
+                .font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(organizer.allTags, id: \.self) { tag in
+                        HStack(spacing: Spacing.s) {
+                            if editing == tag {
+                                TextField("태그 이름", text: $draft)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onSubmit { commit(tag) }
+                                Button("확인") { commit(tag) }.buttonStyle(.borderedProminent).tint(.snuBlue)
+                                Button("취소") { editing = nil }
+                            } else {
+                                Text(tag).font(.callout)
+                                Text("녹음 \(organizer.count(of: tag))개").font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("이름 바꾸기") { editing = tag; draft = tag }.buttonStyle(.borderless)
+                                Button("지우기", role: .destructive) { organizer.deleteTag(tag) }.buttonStyle(.borderless)
+                            }
+                        }
+                        .padding(.vertical, Spacing.xs)
+                        Divider()
+                    }
+                }
+            }
+            .frame(maxHeight: 260)
+            HStack {
+                Spacer()
+                Button("닫기") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(Spacing.l)
+        .frame(width: 420)
+    }
+
+    private func commit(_ tag: String) {
+        organizer.renameTag(tag, to: draft)
+        editing = nil
+    }
+}
+
+/// The name-and-tags editor for one recording.
+private struct RecordingLabelEditor: View {
+    @ObservedObject var organizer: RecordingOrganizer
+    let recording: RecordingItem
+
+    @State private var name = ""
+    @State private var newTag = ""
+    @FocusState private var nameFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            HStack(spacing: Spacing.s) {
+                Text("이름").font(.caption.weight(.semibold)).foregroundStyle(.secondary).frame(width: 32, alignment: .leading)
+                TextField(recording.title, text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($nameFocused)
+                    .onSubmit { organizer.rename(recording, to: name) }
+                if organizer.hasCustomTitle(recording) {
+                    Button("원래 이름", systemImage: "arrow.uturn.backward") {
+                        name = ""
+                        organizer.rename(recording, to: "")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .help("파일 이름인 \(recording.title)(으)로 되돌립니다")
+                }
+            }
+            HStack(alignment: .top, spacing: Spacing.s) {
+                Text("태그").font(.caption.weight(.semibold)).foregroundStyle(.secondary).frame(width: 32, alignment: .leading)
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    let tags = organizer.tags(for: recording.id)
+                    if !tags.isEmpty {
+                        HStack(spacing: Spacing.xs) {
+                            ForEach(tags, id: \.self) { tag in
+                                HStack(spacing: 3) {
+                                    Text(tag).font(.caption.weight(.medium))
+                                    Button("지우기", systemImage: "xmark") { organizer.removeTag(tag, from: recording.id) }
+                                        .labelStyle(.iconOnly).buttonStyle(.plain)
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(Color.snuBlue.opacity(0.16), in: Capsule())
+                            }
+                        }
+                    }
+                    HStack(spacing: Spacing.s) {
+                        TextField("과목이나 주제 (쉼표로 여러 개)", text: $newTag)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 260)
+                            .onSubmit { commitTags() }
+                        Button("추가") { commitTags() }
+                            .buttonStyle(.bordered)
+                            .disabled(RecordingTag.parse(newTag).isEmpty || tags.count >= RecordingTag.maxPerRecording)
+                        // Reusing a tag already in the library beats retyping it
+                        // and beats creating a near-duplicate by accident.
+                        let unused = organizer.allTags.filter { existing in
+                            !tags.contains { RecordingTag.key($0) == RecordingTag.key(existing) }
+                        }
+                        if !unused.isEmpty {
+                            Menu {
+                                ForEach(unused.prefix(20), id: \.self) { tag in
+                                    Button(tag) { organizer.addTag(tag, to: recording.id) }
+                                }
+                            } label: {
+                                Label("기존 태그", systemImage: "tag")
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear { name = organizer.labels(for: recording.id).title }
+        .onChange(of: recording.id) { _, _ in name = organizer.labels(for: recording.id).title }
+        // The field is torn down when the panel closes or the selection moves,
+        // and neither of those ever moves focus, so committing on focus loss
+        // alone would throw the typed name away.
+        .onChange(of: nameFocused) { _, focused in if !focused { organizer.rename(recording, to: name) } }
+        .onDisappear { organizer.rename(recording, to: name) }
+    }
+
+    private func commitTags() {
+        for tag in RecordingTag.parse(newTag) { organizer.addTag(tag, to: recording.id) }
+        newTag = ""
+    }
+}
+
 private struct RecordingCard: View {
     @ObservedObject var controller: AutomationController
     let recording: RecordingItem
@@ -3191,7 +3803,23 @@ private struct RecordingCard: View {
                             .help("이 녹음의 전사본 \(runCount)개")
                     }
                 }
-                Text(recording.title).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                Text(controller.recordingOrganizer.displayTitle(for: recording))
+                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                let tags = controller.recordingOrganizer.tags(for: recording.id)
+                if !tags.isEmpty {
+                    HStack(spacing: 3) {
+                        ForEach(tags.prefix(3), id: \.self) { tag in
+                            Text(tag)
+                                .font(.caption2.weight(.medium))
+                                .lineLimit(1)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(Color.snuBlue.opacity(0.16), in: Capsule())
+                        }
+                        if tags.count > 3 {
+                            Text("+\(tags.count - 3)").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 HStack(spacing: Spacing.xs) {
                     Image(systemName: "calendar").imageScale(.small)
                     Text(recording.date.formatted(date: .abbreviated, time: .shortened))
@@ -3220,9 +3848,29 @@ private struct RecordingCard: View {
             }
             Button("전사 대기열 추가", systemImage: "text.badge.plus") { controller.transcribe(recording: recording) }
                 .disabled(!recording.isLocallyAvailable)
+            Divider()
+            // Tagging from the grid, so filing a run of takes does not mean
+            // selecting each one and scrolling down to the panel.
+            let tags = controller.recordingOrganizer.tags(for: recording.id)
+            Menu("태그") {
+                ForEach(controller.recordingOrganizer.allTags, id: \.self) { tag in
+                    let isOn = tags.contains { RecordingTag.key($0) == RecordingTag.key(tag) }
+                    Button(isOn ? "✓ \(tag)" : tag) {
+                        if isOn {
+                            controller.recordingOrganizer.removeTag(tag, from: recording.id)
+                        } else {
+                            controller.recordingOrganizer.addTag(tag, to: recording.id)
+                        }
+                    }
+                }
+                if controller.recordingOrganizer.allTags.isEmpty {
+                    Text("아직 만든 태그가 없습니다. 녹음을 고르면 아래에서 붙일 수 있습니다.")
+                }
+            }
+            Button("이 녹음 열기", systemImage: "arrow.right.circle") { controller.selectRecording(recording) }
             if recording.source == .app {
-                Button("이름 변경…", systemImage: "pencil") { RenameRecordingPanel.present(recording: recording, controller: controller) }
                 Divider()
+                Button("파일 이름 변경…", systemImage: "pencil") { RenameRecordingPanel.present(recording: recording, controller: controller) }
                 Button("휴지통으로 이동", systemImage: "trash", role: .destructive) { controller.delete(recording) }
             }
         }

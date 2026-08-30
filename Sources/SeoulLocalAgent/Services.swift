@@ -422,14 +422,35 @@ struct GmailSource {
         let query = "after:\(formatter.string(from: since))"
         var items: [SourceItem] = []
         var warnings: [String] = []
+        // No configured mailbox is indistinguishable from an empty inbox once the
+        // count reaches the report, and that silence is how the digest ran for
+        // days without anybody noticing Gmail was not part of it.
+        guard !AppConfig.gmailAccounts.isEmpty else {
+            return SourceHarvest(items: [], warnings: ["Gmail: 설정된 계정이 없어 메일을 전혀 읽지 않았습니다. 설정 › 연결 상태에서 확인해 주세요."])
+        }
 
+        var failedAccounts = 0
         for (account, index) in AppConfig.gmailAccounts {
             try Task.checkCancellation()
-            let data = try await runner.run("/opt/homebrew/bin/gog", [
-                "--readonly", "--account", account, "--json", "--results-only",
-                "gmail", "search", query, "--max", String(Self.maxThreadsPerAccount),
-            ])
-            let threads = try JSONDecoder().decode([GmailThread].self, from: data)
+            let threads: [GmailThread]
+            do {
+                let data = try await runner.run("/opt/homebrew/bin/gog", [
+                    "--readonly", "--account", account, "--json", "--results-only",
+                    "gmail", "search", query, "--max", String(Self.maxThreadsPerAccount),
+                ])
+                threads = try JSONDecoder().decode([GmailThread].self, from: data)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // One account's expired refresh token used to throw out of this
+                // loop and take every message already collected from the other
+                // account with it. A failure here is now the failure of one
+                // mailbox: it is reported, it holds the checkpoint back so the
+                // window is retried, and the rest of the mail still arrives.
+                failedAccounts += 1
+                warnings.append("Gmail(\(account)): 읽지 못했습니다 — \(ConnectionProbe.firstLine(of: error.localizedDescription))")
+                continue
+            }
             if threads.count >= Self.maxThreadsPerAccount {
                 warnings.append("Gmail(\(account)): 검색 상한 \(Self.maxThreadsPerAccount)건에 도달해 이 기간의 오래된 메일이 누락되었을 수 있습니다. 수집 범위를 줄여 다시 실행해 주세요.")
             }
@@ -450,6 +471,12 @@ struct GmailSource {
                     stableID: "gmail:\(account):thread:\(thread.id)"
                 ))
             }
+        }
+        // Every configured mailbox failing is not a partial result, it is an
+        // outage, and the run has to be able to say so rather than reporting a
+        // clean zero.
+        if failedAccounts > 0, failedAccounts == AppConfig.gmailAccounts.count {
+            throw AgentError.processFailed("설정된 \(failedAccounts)개 계정을 모두 읽지 못했습니다. \(warnings.joined(separator: " / "))")
         }
         return SourceHarvest(items: items, warnings: warnings)
     }
@@ -921,6 +948,23 @@ private struct ClassificationResult: Decodable {
 }
 
 struct LocalClassifier {
+    /// Turns Ollama's own answer into something the reader can act on. A missing
+    /// model is by far the most common cause and has an exact remedy, so it gets
+    /// named; anything else is reported verbatim rather than flattened.
+    static func modelFailure(status: Int?, body: Data) -> String {
+        let reported = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])
+            .flatMap { $0?["error"] as? String }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = status.map { "HTTP \($0)" } ?? "HTTP 오류"
+        guard let reported, !reported.isEmpty else {
+            return "로컬 모델 \(code). Ollama가 응답했지만 이유를 알려주지 않았습니다."
+        }
+        if reported.contains("not found"), reported.contains(AppConfig.model) {
+            return "로컬 모델 \(AppConfig.model)을 Ollama에서 찾지 못했습니다. 터미널에서 `ollama pull \(AppConfig.model)`을 먼저 실행해 주세요."
+        }
+        return "로컬 모델 \(code): \(reported)"
+    }
+
     private static let inferenceSession: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 600
@@ -1008,7 +1052,11 @@ struct LocalClassifier {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload)
             let (data, httpResponse) = try await requestWithRetry(request)
             guard let http = httpResponse as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
-                throw AgentError.processFailed("로컬 모델 HTTP 오류")
+                // Ollama says exactly what is wrong — `{"error":"model '…' not
+                // found"}` on a 404 — and this used to throw that away and hand
+                // the reader the four words "로컬 모델 HTTP 오류" instead, which
+                // is a dead end for anyone who has not pulled the model yet.
+                throw AgentError.processFailed(Self.modelFailure(status: (httpResponse as? HTTPURLResponse)?.statusCode, body: data))
             }
             let response: OllamaResponse
             do {
@@ -1100,6 +1148,13 @@ struct LocalClassifier {
                 lastError = error
                 if attempt == 1 { try await Task.sleep(for: .milliseconds(350)) }
             }
+        }
+        // "Could not connect to the server." names neither the server nor the
+        // thing to start, and it is the first message anyone sees who has not
+        // launched Ollama yet.
+        if let urlError = lastError as? URLError,
+           [.cannotConnectToHost, .networkConnectionLost, .cannotFindHost, .timedOut].contains(urlError.code) {
+            throw AgentError.processFailed("Ollama에 연결하지 못했습니다 (\(AppConfig.ollamaURL.absoluteString)). 터미널에서 `ollama serve`로 실행 중인지 확인해 주세요.")
         }
         throw lastError ?? AgentError.processFailed("로컬 모델 요청 실패")
     }

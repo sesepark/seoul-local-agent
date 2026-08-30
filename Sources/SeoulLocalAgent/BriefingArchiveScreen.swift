@@ -18,6 +18,7 @@ struct BriefingArchiveView: View {
             if model.days.isEmpty {
                 empty
             } else {
+                staleness
                 dayBar
                 filterBar
                 ForEach(BriefingArchiveModel.Bucket.allCases) { bucket in
@@ -194,12 +195,13 @@ struct BriefingArchiveView: View {
 
     @ViewBuilder
     private func section(_ bucket: BriefingArchiveModel.Bucket) -> some View {
-        let entries = model.entries(bucket)
+        let all = model.entries(bucket)
+        let visible = model.shown(bucket)
         // 기타 is the tray of things the pipeline set aside; showing an empty
         // heading for it every day would be three lines of nothing.
-        if !entries.isEmpty || bucket != .other {
+        if !all.isEmpty || bucket != .other {
             GroupBox {
-                if entries.isEmpty {
+                if all.isEmpty {
                     Text(model.isSearching ? "검색과 일치하는 항목이 없습니다." : bucket.emptyText)
                         .font(.callout)
                         .foregroundStyle(.tertiary)
@@ -207,23 +209,67 @@ struct BriefingArchiveView: View {
                         .padding(.vertical, Spacing.s)
                 } else {
                     VStack(spacing: 0) {
-                        ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                        ForEach(Array(visible.entries.enumerated()), id: \.element.id) { index, entry in
                             if index > 0 { Divider() }
                             BriefingEntryRow(entry: entry, model: model, showsDate: model.isSearching)
+                        }
+                        // The cap is what makes this a briefing rather than a
+                        // second inbox, so the rest stays one click away instead
+                        // of being unreachable *or* always present.
+                        if visible.hidden > 0 || model.expandedBuckets.contains(bucket) {
+                            Divider()
+                            Button(visible.hidden > 0 ? "\(visible.hidden)개 더 보기" : "덜 보기") {
+                                model.toggleBucketExpansion(bucket)
+                            }
+                            .buttonStyle(.link)
+                            .font(.callout)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, Spacing.s)
                         }
                     }
                 }
             } label: {
                 HStack(spacing: Spacing.s) {
                     Label(bucket.rawValue, systemImage: bucket.symbol).font(.headline)
-                    Text("\(entries.count)")
+                    Text("\(all.count)")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 1)
                         .background(.quaternary, in: Capsule())
+                    if visible.hidden > 0 {
+                        Text("\(visible.entries.count)개 표시")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
+        }
+    }
+
+    /// The one thing the screen could not say before: that what it is showing is
+    /// old. A seventeen-day-old briefing looked exactly like this morning's.
+    @ViewBuilder
+    private var staleness: some View {
+        if let day = model.selectedDay, model.isStale(day) {
+            HStack(spacing: Spacing.s) {
+                Image(systemName: "clock.badge.exclamationmark").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.stalenessSummary(day))
+                        .font(.callout.weight(.medium))
+                    Text("지금 보고 있는 내용은 그때 수집한 것입니다. 새로 정리하면 그 이후의 메일과 공지가 들어옵니다.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("지금 정리", systemImage: "tray.full.fill") { controller.startBriefing() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.snuBlue)
+                    .disabled(controller.isRunning)
+            }
+            .padding(.horizontal, Spacing.l)
+            .padding(.vertical, Spacing.m)
+            .glassPanel(Radius.card)
         }
     }
 
@@ -243,6 +289,10 @@ struct BriefingArchiveView: View {
                     Label(failure, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                 }
+                // The archive is a window, not a vault. Saying how wide beats
+                // letting the reader find out when a day they wanted is gone.
+                Text("보관 중인 브리핑 \(model.days.count)일치 · 최근 \(PersistentState.retainedBriefingDays)일까지 보관하고 그보다 오래된 날은 지웁니다.")
+                    .foregroundStyle(.tertiary)
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -273,6 +323,15 @@ private struct BriefingEntryRow: View {
         .animation(.appControl, value: isExpanded)
         .animation(.appControl, value: entry.mark.isDone)
         .contextMenu {
+            ForEach(entry.bucket.neighbours) { bucket in
+                Button(bucket.moveVerb, systemImage: bucket == .action ? "arrow.up" : "arrow.down") {
+                    model.move(entry, to: bucket)
+                }
+            }
+            if entry.isReclassified {
+                Button("모델 분류로 되돌리기", systemImage: "arrow.uturn.backward") { model.clearCategoryOverride(entry) }
+            }
+            Divider()
             Button("제목 복사", systemImage: "textformat") { ArchiveClipboard.put(entry.title) }
             Button("본문까지 복사", systemImage: "doc.on.doc") { ArchiveClipboard.put(entry.plainText) }
             Button("원문 링크 복사", systemImage: "link") { ArchiveClipboard.put(entry.link.absoluteString) }
@@ -346,6 +405,11 @@ private struct BriefingEntryRow: View {
             if !model.note(for: entry).isEmpty {
                 Badge(text: "메모", symbol: "text.bubble")
             }
+            // Says out loud that the reader overruled the model here, so the
+            // screen never quietly disagrees with the report it came from.
+            if entry.isReclassified {
+                Badge(text: "직접 옮김", symbol: "hand.point.up.left", tint: .snuBlueLabel)
+            }
         }
     }
 
@@ -405,6 +469,30 @@ private struct BriefingEntryRow: View {
                         .buttonStyle(.bordered)
                         .help("\(AgentCalendar.title) 캘린더에서 이 항목을 지웁니다")
                 }
+
+                Menu {
+                    ForEach(entry.bucket.neighbours) { bucket in
+                        Button(bucket.moveVerb, systemImage: bucket == .action ? "arrow.up" : "arrow.down") {
+                            model.move(entry, to: bucket)
+                        }
+                    }
+                    if entry.isReclassified {
+                        Divider()
+                        Button("모델 분류(\(BriefingArchiveModel.Bucket(entry.item.category).rawValue))로 되돌리기", systemImage: "arrow.uturn.backward") {
+                            model.clearCategoryOverride(entry)
+                        }
+                    }
+                    Divider()
+                    Button("이 항목만 다시 분석", systemImage: "arrow.clockwise") {
+                        Task { await model.reanalyze(entry) }
+                    }
+                    .disabled(model.isReanalyzing || entry.bodyText.isEmpty)
+                } label: {
+                    Label("분류 바꾸기", systemImage: "arrow.up.arrow.down")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("이 항목을 다른 칸으로 옮기거나, 저장된 본문으로 다시 분석합니다")
 
                 Spacer()
             }
