@@ -188,6 +188,40 @@ struct WebNoticeTests {
         #expect(sites[0].interest == .direct)
     }
 
+    /// A shadow run promises to change nothing, but the seen-set was written
+    /// anyway. Because the baseline is a one-off, a dry run spent it: the next
+    /// real run believed it had already seen every post on every board and
+    /// reported nothing at all.
+    @Test("모의 실행은 기준선을 쓰지 않는다")
+    func shadowRunLeavesTheSeenSetAlone() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appending(path: "web-notice-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let feedURL = directory.appending(path: "feed.xml")
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+        <item><title>공지 하나</title><link>https://cls.snu.ac.kr/a/1</link></item>
+        <item><title>공지 둘</title><link>https://cls.snu.ac.kr/a/2</link></item>
+        <item><title>공지 셋</title><link>https://cls.snu.ac.kr/a/3</link></item>
+        </channel></rss>
+        """.write(to: feedURL, atomically: true, encoding: .utf8)
+
+        var board = Self.site()
+        board.feed = feedURL
+        let storeURL = directory.appending(path: "seen.json")
+        var source = WebNoticeSource()
+        source.sites = [board]
+        source.storeURL = storeURL
+
+        _ = await source.collect(persists: false)
+        #expect(!FileManager.default.fileExists(atPath: storeURL.path))
+
+        _ = await source.collect(persists: true)
+        #expect(FileManager.default.fileExists(atPath: storeURL.path))
+        #expect(WebNoticeSeenStore.load(url: storeURL).hasBaseline(for: board))
+    }
+
     @Test("기본 게시판 목록은 중복 없이 열린다")
     func catalogueIsWellFormed() {
         let sites = WebNoticeCatalog.defaults

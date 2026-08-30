@@ -220,7 +220,7 @@ struct BriefingService {
             // Public pages only, so this one needs no checkpoint: a post is new when
             // its URL has not been seen before, which the source tracks itself.
             async let webResult = collectSafely(checkpointKey: "web", sourceName: "웹 공지") {
-                await WebNoticeSource().collect()
+                await WebNoticeSource().collect(persists: persists)
             }
             let calendarEnd = Calendar.current.date(byAdding: .day, value: 14, to: now)!
             async let calendarResult = collectSafely(checkpointKey: "calendar", sourceName: "캘린더") {

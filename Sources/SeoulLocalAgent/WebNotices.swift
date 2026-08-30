@@ -193,7 +193,11 @@ struct WebNoticeSource {
         return results
     }
 
-    func collect() async -> SourceHarvest {
+    /// `persists` is false for a shadow run. Without it a dry run spent the
+    /// one-time baseline: the store was written anyway, so the next real run
+    /// believed it had already seen every post on every board and reported
+    /// nothing. A run that promises to change nothing has to include this file.
+    func collect(persists: Bool = true) async -> SourceHarvest {
         let enabled = sites.filter(\.enabled)
         guard !enabled.isEmpty else { return SourceHarvest(items: []) }
         var store = WebNoticeSeenStore.load(url: storeURL)
@@ -218,7 +222,7 @@ struct WebNoticeSource {
                 store.record(entries, for: site)
             }
         }
-        store.save(url: storeURL)
+        if persists { store.save(url: storeURL) }
 
         var warnings: [String] = []
         if !baselined.isEmpty {
