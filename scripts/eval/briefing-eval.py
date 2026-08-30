@@ -79,7 +79,7 @@ def main():
     p.add_argument("--think", action="store_true", help="구조화 출력과 함께 켜면 JSON이 깨진다")
     p.add_argument("--temp", type=float, default=0.1)
     p.add_argument("--num-ctx", type=int, default=16384)
-    p.add_argument("--num-predict", type=int, default=2600)
+    p.add_argument("--num-predict", type=int, default=4500)
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--label", default="")
     p.add_argument("--out", default="")

@@ -991,8 +991,14 @@ struct LocalClassifier {
                 "format": format, "keep_alive": "5m", "options": [
                     "num_ctx": 16384, "temperature": 0.1, "top_p": 0.8,
                     // Two more fields per item, and they carry the whole report now.
-                    // Measured peak for a six-item batch is about 1,300 tokens.
-                    "top_k": 20, "repeat_penalty": 1.0, "num_predict": 2_600,
+                    // A six-item batch measured about 1,300 tokens before the
+                    // summaries were given a length floor and about 1,600 after;
+                    // real notice mail runs longer than the fixtures. This is a
+                    // ceiling, not a target, and hitting it truncates the JSON —
+                    // the items after the cut vanish from the answer and reach
+                    // the reader as "원문을 확인해 주세요." with nothing else. Cheap
+                    // to raise, expensive to hit.
+                    "top_k": 20, "repeat_penalty": 1.0, "num_predict": 4_500,
                 ],
             ]
             var request = URLRequest(url: AppConfig.ollamaURL.appending(path: "api/generate"))
@@ -1033,6 +1039,17 @@ struct LocalClassifier {
             for (position, classified) in decoded.items.enumerated() {
                 let source = byPosition ? usable[position] : classified.sourceID.flatMap { sourceByID[$0] }
                 guard let source, answered.insert(source.id).inserted else { continue }
+                let title = BriefPresentation.usable(classified.displayTitle, limit: 90)
+                let summary = BriefPresentation.usable(classified.displaySummary, limit: 700)
+                // A truncated batch comes back as valid JSON: the structured
+                // decoder closes the remaining objects by filling their required
+                // fields with empty strings. Those items look answered and carry
+                // nothing, so they must go to the same honest fallback as an item
+                // the model never mentioned.
+                guard !classified.summary.trimmingCharacters(in: .whitespaces).isEmpty || title != nil || summary != nil else {
+                    results.append(Self.unclassified(source, reason: "모델 응답이 잘려 이 항목의 내용이 비어 있었습니다.", summary: "자동 분류를 완료하지 못했습니다. 원문을 확인해 주세요."))
+                    continue
+                }
                 let confidence = classified.confidence ?? (classified.category == .action ? 0.7 : 0.8)
                 results.append(ClassifiedItem(
                     sourceItem: source,
@@ -1042,8 +1059,8 @@ struct LocalClassifier {
                     nextAction: classified.nextAction, deadline: classified.deadline,
                     // The gates keep an over-long or leaked string from reaching the
                     // page; `BriefPresentation` then falls back to the plain summary.
-                    displayTitle: BriefPresentation.usable(classified.displayTitle, limit: 90),
-                    displaySummary: BriefPresentation.usable(classified.displaySummary, limit: 700),
+                    displayTitle: title,
+                    displaySummary: summary,
                     confidence: min(1, max(0, confidence))
                 ))
             }
