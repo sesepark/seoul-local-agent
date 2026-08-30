@@ -57,8 +57,26 @@ struct ClassifiedItem: Codable, Hashable, Identifiable {
     /// Hash of the evidence this classification was based on. A carried-over item
     /// whose source still hashes the same does not need to be analysed again.
     var contentFingerprint: String? = nil
+    /// The opening of the message, kept so the archive can show what actually
+    /// arrived. The state file drops `sourceItem.body` on every save — it is a
+    /// checkpoint, not a mail archive — and until this existed that left the
+    /// reader with the model's summary and no way to check it short of opening
+    /// Gmail. Bounded on purpose: enough to read a notice, not a copy of the
+    /// inbox, and pruned with the briefing it belongs to after thirty days.
+    var bodyExcerpt: String? = nil
     var id: String { sourceItem.id }
     var trackingID: String { sourceItem.stableID ?? sourceItem.id }
+
+    static let bodyExcerptLimit = 800
+
+    /// Nil rather than empty when there is nothing worth showing, so the screen
+    /// leaves the 원문 row out instead of printing an empty label.
+    static func excerpt(of body: String) -> String? {
+        let text = InboxTextSanitizer.clean(body)
+        guard InboxEvidenceGate.isUsable(text) else { return nil }
+        guard text.count > bodyExcerptLimit else { return text }
+        return String(text.prefix(bodyExcerptLimit)).trimmingCharacters(in: .whitespaces) + "…"
+    }
 }
 
 struct DailyBriefing: Codable {
@@ -121,7 +139,11 @@ extension DailyBriefing {
                 reason: item.reason, importance: item.importance, nextAction: item.nextAction,
                 deadline: item.deadline, displayTitle: item.displayTitle, displaySummary: item.displaySummary,
                 displayNextAction: item.displayNextAction, confidence: item.confidence,
-                pinnedByUserRule: item.pinnedByUserRule, contentFingerprint: item.contentFingerprint
+                pinnedByUserRule: item.pinnedByUserRule, contentFingerprint: item.contentFingerprint,
+                // Deliberately kept while the full body goes: this is the bounded
+                // excerpt the archive displays, and losing it here would empty
+                // the 원문 row the moment a briefing was saved and read back.
+                bodyExcerpt: item.bodyExcerpt
             )
         }
         return copy

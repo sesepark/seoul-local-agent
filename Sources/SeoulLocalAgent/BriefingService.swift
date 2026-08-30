@@ -289,15 +289,16 @@ struct BriefingService {
                     sourceClassified = sourceClassified.map { item in
                         guard preferenceResult.importantIDs.contains(item.id) else { return item }
                         var important = item
-                        important = ClassifiedItem(sourceItem: important.sourceItem, facts: important.facts, category: .action, summary: important.summary, reason: "사용자의 중요 규칙과 일치: \(important.reason)", importance: 5, nextAction: important.nextAction, deadline: important.deadline, displayTitle: important.displayTitle, displaySummary: important.displaySummary, displayNextAction: important.displayNextAction, confidence: 1, pinnedByUserRule: true)
+                        important = ClassifiedItem(sourceItem: important.sourceItem, facts: important.facts, category: .action, summary: important.summary, reason: "사용자의 중요 규칙과 일치: \(important.reason)", importance: 5, nextAction: important.nextAction, deadline: important.deadline, displayTitle: important.displayTitle, displaySummary: important.displaySummary, displayNextAction: important.displayNextAction, confidence: 1, pinnedByUserRule: true, contentFingerprint: item.contentFingerprint, bodyExcerpt: item.bodyExcerpt)
                         return important
                     }
                     sourceClassified = sourceClassified.map { item in
                         var stamped = item
                         stamped.contentFingerprint = SourceFingerprint.of(item.sourceItem)
+                        stamped.bodyExcerpt = ClassifiedItem.excerpt(of: item.sourceItem.body)
                         return stamped
                     }
-                    classified += BriefingQualityGate.normalized(sourceClassified)
+                    classified += BriefingQualityGate.normalized(sourceClassified, preferences: preferences)
                 } catch {
                     // One source must not erase useful results from the others.
                     analysisFailures.append("\(source) 분류: \(error.localizedDescription)")

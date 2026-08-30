@@ -29,6 +29,12 @@ struct BriefingArchiveView: View {
                 DismissibleError(message: error) { model.error = nil }
             }
         }
+        // Every piece of prose here is something the reader may want to paste
+        // into a message or a form: a deadline, a room number, a sender. It is
+        // applied to the screen rather than to single labels so that nothing is
+        // arbitrarily unselectable — SwiftUI leaves control labels out on its
+        // own, so buttons and menus keep behaving as buttons.
+        .textSelection(.enabled)
         .animation(.appContent, value: model.selectedDateKey)
         .animation(.appContent, value: model.search)
         .onAppear { model.reconcilePlacements() }
@@ -44,6 +50,13 @@ struct BriefingArchiveView: View {
     private var toolbar: some ToolbarContent {
         ToolbarItem {
             Menu {
+                Button("이 날 브리핑 복사", systemImage: "doc.on.doc") {
+                    ArchiveClipboard.put(model.plainText())
+                    model.status = "브리핑을 클립보드에 복사했습니다."
+                }
+                .disabled(model.selectedDay == nil)
+                .keyboardShortcut("c", modifiers: [.command, .shift])
+                Divider()
                 Button("Notion으로 내보내기", systemImage: "arrow.up.forward.square") {
                     Task { await model.exportToNotion() }
                 }
@@ -61,7 +74,7 @@ struct BriefingArchiveView: View {
             } label: {
                 Label("내보내기", systemImage: model.isExporting ? "arrow.up.circle" : "square.and.arrow.up")
             }
-            .help("이 날의 브리핑을 Notion으로 보내거나, 캘린더 앱을 엽니다")
+            .help("이 날의 브리핑을 복사하거나 Notion으로 보냅니다 (⇧⌘C)")
         }
         ToolbarItem {
             Button("새로고침", systemImage: "arrow.clockwise") {
@@ -246,6 +259,7 @@ private struct BriefingEntryRow: View {
     let showsDate: Bool
 
     @State private var note = ""
+    @State private var showsWholeBody = false
     @FocusState private var noteFocused: Bool
 
     private var isExpanded: Bool { model.isExpanded(entry) }
@@ -258,6 +272,13 @@ private struct BriefingEntryRow: View {
         .padding(.vertical, Spacing.s)
         .animation(.appControl, value: isExpanded)
         .animation(.appControl, value: entry.mark.isDone)
+        .contextMenu {
+            Button("제목 복사", systemImage: "textformat") { ArchiveClipboard.put(entry.title) }
+            Button("본문까지 복사", systemImage: "doc.on.doc") { ArchiveClipboard.put(entry.plainText) }
+            Button("원문 링크 복사", systemImage: "link") { ArchiveClipboard.put(entry.link.absoluteString) }
+            Divider()
+            Button("원문 열기", systemImage: "arrow.up.forward.app") { NSWorkspace.shared.open(entry.link) }
+        }
     }
 
     private var header: some View {
@@ -294,8 +315,16 @@ private struct BriefingEntryRow: View {
             .buttonStyle(.plain)
             .help(isExpanded ? "접기" : "자세히 보기")
         }
-        .contentShape(.rect)
-        .onTapGesture { model.toggleExpanded(entry) }
+        // Behind the text rather than over it. Selectable text takes the click
+        // where there is text, so covering the row with a tap gesture would mean
+        // a drag across the title expanded the row instead of selecting the
+        // title; a click on the row's empty space still expands it, and the
+        // chevron is always there for the rest.
+        .background {
+            Color.clear
+                .contentShape(.rect)
+                .onTapGesture { model.toggleExpanded(entry) }
+        }
     }
 
     private var badges: some View {
@@ -341,6 +370,7 @@ private struct BriefingEntryRow: View {
             if let placement = entry.placement {
                 field("캘린더", placement.date.formatted(date: .abbreviated, time: placement.isReminder ? .omitted : .shortened))
             }
+            if !entry.bodyText.isEmpty { original }
 
             HStack(spacing: Spacing.s) {
                 Text("메모").font(.caption.weight(.semibold)).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
@@ -391,6 +421,21 @@ private struct BriefingEntryRow: View {
         .onDisappear { model.setNote(note, for: entry) }
     }
 
+    /// The message as it arrived. Shown short by default: most of these are
+    /// notices whose first two lines say everything, and a full mail body under
+    /// every row would bury the next item.
+    private var original: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            field("원문", showsWholeBody ? entry.bodyText : entry.bodyPreview)
+            if entry.hasLongBody {
+                Button(showsWholeBody ? "접기" : "본문 더 보기") { showsWholeBody.toggle() }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .padding(.leading, 48)
+            }
+        }
+    }
+
     private var scheduleHelp: String {
         guard let parsed = entry.suggestedDate(), parsed.isConfident else {
             return "마감이 분명하지 않아 날짜를 확인하는 창이 열립니다"
@@ -412,7 +457,17 @@ private struct BriefingEntryRow: View {
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+/// One place that writes to the pasteboard, so every copy in this screen
+/// produces the same thing.
+enum ArchiveClipboard {
+    static func put(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 }
 

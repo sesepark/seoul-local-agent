@@ -631,13 +631,16 @@ struct SeoulLocalAgentTests {
         #expect(written.hasPrefix(BriefPresentation.title(for: withDeadline)))
     }
 
+    /// The example here is a 특강 rather than the 장학금 it used to be: a
+    /// scholarship the reader can apply for is now promoted by their own rules
+    /// instead of demoted by this heuristic. See `ReaderPriorityTests`.
     @Test("A user's always-important rule outranks the heuristic demotion")
     func userPinnedItemsSurviveTheQualityGate() {
-        let source = item(id: "gmail:scholarship", body: "장학금 사전등록 모집 안내입니다. 관심 있는 학생은 신청할 수 있습니다.")
-        let heuristic = ClassifiedItem(sourceItem: source, facts: "장학금 모집", category: .action, summary: "s", reason: "r", importance: 5, nextAction: "", deadline: "", confidence: 0.9)
+        let source = item(id: "gmail:lecture", body: "산업수학 특강 사전등록 안내입니다. 관심 있는 학생은 신청할 수 있습니다.")
+        let heuristic = ClassifiedItem(sourceItem: source, facts: "특강 모집", category: .action, summary: "s", reason: "r", importance: 5, nextAction: "", deadline: "", confidence: 0.9)
         #expect(BriefingQualityGate.normalized([heuristic]).first?.category == .reference)
 
-        let pinned = ClassifiedItem(sourceItem: source, facts: "장학금 모집", category: .action, summary: "s", reason: "r", importance: 5, nextAction: "", deadline: "", confidence: 1, pinnedByUserRule: true)
+        let pinned = ClassifiedItem(sourceItem: source, facts: "특강 모집", category: .action, summary: "s", reason: "r", importance: 5, nextAction: "", deadline: "", confidence: 1, pinnedByUserRule: true)
         #expect(BriefingQualityGate.normalized([pinned]).first?.category == .action)
     }
 

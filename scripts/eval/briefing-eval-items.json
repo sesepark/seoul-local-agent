@@ -254,6 +254,88 @@
         ],
         "note": "본인 관련 기관의 지원 가능 프로그램"
       }
+    },
+    {
+      "source_id": "gmail:eval:017",
+      "source": "Gmail",
+      "account": "eval@example.com",
+      "author": "Contoso 계정팀",
+      "timestamp": "2026-08-28T08:10:00+09:00",
+      "subject": "Contoso 서비스 이용 약관 업데이트 안내",
+      "body": "Contoso 서비스 이용 약관이 2026년 10월 1일부터 변경됩니다. 변경 사항은 데이터 보관 기간과 분쟁 해결 절차이며, 요약본과 전문을 웹사이트에서 확인할 수 있습니다. 계속 서비스를 이용하시면 변경된 약관에 동의한 것으로 간주됩니다.",
+      "link": "https://mail.google.com/mail/u/0/#all/eval017",
+      "gold": {
+        "category": "excluded",
+        "note": "전체 발송 약관 개정 안내. 사용자가 해야 할 일이 없음"
+      }
+    },
+    {
+      "source_id": "gmail:eval:018",
+      "source": "Gmail",
+      "account": "eval@example.com",
+      "author": "페이서비스",
+      "timestamp": "2026-08-28T08:20:00+09:00",
+      "subject": "[페이서비스] 이용약관 개정 안내",
+      "body": "전자금융거래 이용약관이 2026년 9월 20일자로 개정됩니다. 주요 개정 내용은 선불충전금 보호 방식과 고객센터 운영시간 변경입니다. 개정 내용에 동의하지 않는 고객은 시행일 전까지 서비스 해지를 요청할 수 있습니다.",
+      "link": "https://mail.google.com/mail/u/0/#all/eval018",
+      "gold": {
+        "category": "excluded",
+        "allowed": [
+          "excluded",
+          "reference"
+        ],
+        "note": "약관 개정. 해지 안내는 일반 고지문이고 본인에게 요구된 행동이 아님"
+      }
+    },
+    {
+      "source_id": "gmail:eval:019",
+      "source": "Gmail",
+      "account": "eval@example.com",
+      "author": "배포 봇",
+      "timestamp": "2026-08-28T02:40:00+09:00",
+      "subject": "gamehub 프로젝트 main 브랜치 배포 실패",
+      "body": "gamehub 저장소 main 브랜치의 배포 파이프라인이 빌드 단계에서 실패했습니다. 실패 원인은 테스트 두 건의 타임아웃이며, 이전 버전이 계속 서비스되고 있습니다. 로그는 대시보드에서 확인할 수 있습니다.",
+      "link": "https://mail.google.com/mail/u/0/#all/eval019",
+      "gold": {
+        "category": "reference",
+        "allowed": [
+          "reference",
+          "excluded"
+        ],
+        "note": "본인 개인 프로젝트의 자동 배포 실패. 서비스 중단 없음"
+      }
+    },
+    {
+      "source_id": "gmail:eval:020",
+      "source": "Gmail",
+      "account": "eval@example.com",
+      "author": "한빛인재재단",
+      "timestamp": "2026-08-28T10:05:00+09:00",
+      "subject": "2026학년도 2학기 한빛인재장학생 신청 안내",
+      "body": "2026학년도 2학기 한빛인재장학생을 모집합니다. 신청 자격은 국내 4년제 대학 재학생이며, 학기당 등록금 전액과 월 50만원의 생활비를 지원합니다. 신청은 재단 홈페이지에서 9월 12일 18시까지 신청서와 성적증명서를 제출하면 됩니다.",
+      "link": "https://mail.google.com/mail/u/0/#all/eval020",
+      "gold": {
+        "category": "action",
+        "deadline_required": true,
+        "note": "본인이 직접 신청할 수 있는 장학 안내 + 방법과 마감 명시"
+      }
+    },
+    {
+      "source_id": "gmail:eval:021",
+      "source": "Gmail",
+      "account": "eval@example.com",
+      "author": "피지컬 AI 포럼 사무국",
+      "timestamp": "2026-08-28T11:30:00+09:00",
+      "subject": "피지컬 AI 포럼 2026 참가 등록 안내",
+      "body": "피지컬 AI 포럼 2026을 10월 8일 코엑스에서 개최합니다. 로보틱스 파운데이션 모델과 온디바이스 추론을 주제로 발표가 진행되며, 학생 참가 등록은 9월 25일까지 홈페이지에서 받습니다. 등록비는 학생 무료입니다.",
+      "link": "https://mail.google.com/mail/u/0/#all/eval021",
+      "gold": {
+        "category": "action",
+        "allowed": [
+          "action"
+        ],
+        "note": "설정에 적힌 관심 분야 + 참가 등록이 열려 있음. 같은 형태의 무관한 포럼(002)보다 한 단계 위"
+      }
     }
   ]
 }

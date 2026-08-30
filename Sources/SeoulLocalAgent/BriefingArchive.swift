@@ -163,6 +163,41 @@ final class BriefingArchiveModel: ObservableObject {
                 ?? item.nextAction.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         }
 
+        /// The message as it arrived, as far as the archive keeps it: a cleaned
+        /// excerpt of the first 800 characters, stored with the classification.
+        ///
+        /// The screen used to show only the model's own summary, which meant an
+        /// email whose summary missed the point could not be checked without
+        /// leaving for Gmail — the exact trip this archive exists to avoid.
+        var bodyText: String {
+            (item.bodyExcerpt ?? item.sourceItem.body).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        static let bodyPreviewLength = 220
+
+        var hasLongBody: Bool { bodyText.count > Self.bodyPreviewLength }
+
+        var bodyPreview: String {
+            guard hasLongBody else { return bodyText }
+            return String(bodyText.prefix(Self.bodyPreviewLength)).trimmingCharacters(in: .whitespaces) + "…"
+        }
+
+        /// The whole item as plain text, for 복사.
+        ///
+        /// SwiftUI can only carry a selection inside one `Text`, so no amount of
+        /// dragging across a row will ever produce this; a copy command has to.
+        var plainText: String {
+            var lines = [title, "\(source) · \(author.isEmpty ? "발신자 미상" : author) · \(receivedText)"]
+            if let deadlineText { lines.append("마감 \(deadlineText)") }
+            lines.append("")
+            lines.append(summary)
+            if let nextAction { lines.append("요청: \(nextAction)") }
+            if !bodyText.isEmpty { lines += ["", bodyText] }
+            if !mark.note.isEmpty { lines += ["", "메모: \(mark.note)"] }
+            lines += ["", link.absoluteString]
+            return lines.joined(separator: "\n")
+        }
+
         /// What the app already put on the calendar for this item, if anything.
         var placement: CalendarPlacement? {
             if let identifier = mark.calendarEventID {
@@ -204,6 +239,14 @@ final class BriefingArchiveModel: ObservableObject {
 
     private let stateStore: StateStore
     private let archiveStore: BriefingArchiveStore
+    /// Read once, and applied to stored briefings as they are shown rather than
+    /// when they were written. That is what lets a change to the reader's own
+    /// rules re-file yesterday's items without asking the model to read the
+    /// inbox again — and it is already how `BriefingQualityGate` behaved.
+    private var preferences: BriefingPreferences
+    /// Non-nil only in tests, which must not depend on the settings file that
+    /// happens to be on the machine running them.
+    private let injectedPreferences: BriefingPreferences?
     private let writer = CalendarWriter()
     private var marks: [String: BriefingMark] = [:]
     /// Bumped whenever the days or the marks change. Both caches below key on it.
@@ -214,9 +257,15 @@ final class BriefingArchiveModel: ObservableObject {
     /// Both stores are injectable so a test can point them at a temporary
     /// directory. Without that, running the suite would read — and the write
     /// tests would overwrite — the real briefings in Application Support.
-    init(stateStore: StateStore = StateStore(), archiveStore: BriefingArchiveStore = BriefingArchiveStore()) {
+    init(
+        stateStore: StateStore = StateStore(),
+        archiveStore: BriefingArchiveStore = BriefingArchiveStore(),
+        preferences: BriefingPreferences? = nil
+    ) {
         self.stateStore = stateStore
         self.archiveStore = archiveStore
+        self.injectedPreferences = preferences
+        self.preferences = preferences ?? BriefingPreferencesStore().load()
         reload()
     }
 
@@ -224,6 +273,9 @@ final class BriefingArchiveModel: ObservableObject {
 
     func reload() {
         revision &+= 1
+        // Re-read on every refresh so editing 분류 기준 in 설정 re-files what is
+        // already on screen, without another run of the model.
+        if injectedPreferences == nil { preferences = BriefingPreferencesStore().load() }
         let state = stateStore.load()
         days = state.dailyBriefings.values.sorted { sortKey($0) > sortKey($1) }
         marks = archiveStore.load().marks
@@ -293,7 +345,7 @@ final class BriefingArchiveModel: ObservableObject {
         var seen = Set<String>()
         var entries: [Entry] = []
         for day in scope {
-            for item in BriefingQualityGate.normalized(day.items) where seen.insert(item.trackingID).inserted {
+            for item in BriefingQualityGate.normalized(day.items, preferences: preferences) where seen.insert(item.trackingID).inserted {
                 entries.append(Entry(item: item, dateKey: day.dateKey, mark: marks[item.trackingID] ?? BriefingMark()))
             }
         }
@@ -323,6 +375,27 @@ final class BriefingArchiveModel: ObservableObject {
     }
 
     var openActionCount: Int { entries(.action).filter { !$0.mark.isDone }.count }
+
+    /// Everything on screen as plain text, in the order it is shown.
+    ///
+    /// The reader's way of taking a whole morning's briefing somewhere else —
+    /// a message to a lab mate, a note in their own notebook — without the app
+    /// having to know about that destination. Notion export writes the same
+    /// content through a service; this writes it to the clipboard.
+    func plainText() -> String {
+        var lines = [Self.dayTitle(selectedDateKey) + " 브리핑"]
+        if isSearching { lines.append("검색: \(search)") }
+        for bucket in Bucket.allCases {
+            let items = entries(bucket)
+            guard !items.isEmpty else { continue }
+            lines += ["", "## \(bucket.rawValue) (\(items.count))"]
+            for entry in items {
+                lines.append("")
+                lines.append("\(entry.mark.isDone ? "[x]" : "[ ]") \(entry.plainText)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
 
     /// What the 개요 screen shows: everything still open whose deadline is today
     /// or already past. Capped, because 개요 is a glance and a backlog of thirty

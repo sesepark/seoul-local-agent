@@ -196,19 +196,151 @@ enum BriefPresentation {
     }
 }
 
+/// The reader's own standing judgements, applied after the model has spoken.
+///
+/// The model is told all of this in the prompt and mostly follows it, but it is
+/// a 3B-active local model reading sixty messages a morning, and the same few
+/// kinds of item came back misfiled every run: a terms-of-service amendment
+/// filed next to a real request, a scholarship the reader could actually apply
+/// for buried among things to merely read, a hobby project's deploy failure
+/// sitting at the top of 오늘 꼭 할 일.
+///
+/// These are the cases where the right answer does not need reading
+/// comprehension, only recognition, so a deterministic rule beats another round
+/// of prompt wording. Each one moves an item by exactly one step and adjusts
+/// importance by one, never more: the point is to correct a systematic tilt, not
+/// to overrule a judgement the model made from evidence this cannot see.
+enum ReaderPriorityRules {
+    enum Direction: Equatable { case up, down }
+
+    struct Adjustment: Equatable {
+        let direction: Direction
+        let reason: String
+        /// Set only where the promotion implies something concrete to do, since
+        /// an item in 오늘 꼭 할 일 whose next action reads "원문 확인" is not a task.
+        var nextAction: String?
+    }
+
+    // Boilerplate every service sends when its lawyers change a document. It is
+    // worth a line in the record and nothing more, unless the reader has to do
+    // something to keep or refuse the change.
+    private static let policyWords = ["이용약관", "이용 약관", "약관 개정", "약관 변경", "약관이 변경", "개인정보 처리방침", "개인정보처리방침", "terms of service", "terms of use", "privacy policy", "policy update"]
+    // Only phrasings that require something. "동의하지 않으면 해지할 수 있습니다" is
+    // the standard escape clause in every one of these notices, so reading 해지
+    // or 탈퇴 as a duty would exempt nearly all of them from the rule.
+    private static let policyDuties = ["회신", "재동의", "동의 절차", "서명", "제출해", "본인 확인이 필요", "정지될 수", "제한될 수", "action required", "must accept"]
+
+    // A context word and a failure word rather than whole phrases: these mails
+    // arrive as "Run failed: Deploy production" as often as in Korean, and a
+    // fixed phrase list missed every English one.
+    private static let buildWords = ["배포", "빌드", "파이프라인", "워크플로우", "deploy", "build", "pipeline", "workflow"]
+    private static let failureWords = ["실패", "failed", "failure"]
+    // Somebody asking the reader to fix it is a request, not a robot's report.
+    private static let requestWords = ["부탁", "해주세요", "해 주세요", "요청드립니다", "확인 바랍니다", "please fix", "can you"]
+    private static let outageWords = ["서비스 중단", "서비스가 중단", "장애", "데이터 손실", "downtime", "outage", "결제 실패", "payment failed", "이용이 정지"]
+
+    private static let scholarshipWords = ["장학금", "장학생", "장학"]
+    private static let applyWords = ["신청", "접수", "지원 자격", "모집"]
+    private static let resultWords = ["선정 결과", "선발 결과", "지급 완료", "선정자 발표"]
+
+    private static let participationWords = ["신청", "등록", "접수", "참가", "사전등록", "registration", "register", "rsvp"]
+
+    static func adjustment(for item: ClassifiedItem, preferences: BriefingPreferences = .defaults) -> Adjustment? {
+        // An explicit user pattern already said what this item is. Nothing here
+        // is allowed to argue with that.
+        guard item.pinnedByUserRule != true else { return nil }
+        // The display text is included because it is often the only Korean
+        // rendering of an English notification, and the rules read both.
+        let text = """
+        \(item.sourceItem.subject) \(item.sourceItem.body) \(item.facts ?? "") \(item.summary) \
+        \(item.displayTitle ?? "") \(item.displaySummary ?? "")
+        """.lowercased()
+
+        if contains(policyWords, text), !contains(policyDuties, text) {
+            return Adjustment(direction: .down, reason: "약관·방침 개정 안내이고 직접 해야 할 일이 없어 한 단계 내렸습니다")
+        }
+        if contains(buildWords, text), contains(failureWords, text),
+           !contains(outageWords, text), !contains(requestWords, text) {
+            return Adjustment(direction: .down, reason: "개인 프로젝트의 배포·빌드 실패 알림이고 서비스 중단이 적혀 있지 않아 한 단계 내렸습니다")
+        }
+        if contains(scholarshipWords, text), contains(applyWords, text), !contains(resultWords, text) {
+            return Adjustment(
+                direction: .up,
+                reason: "직접 신청할 수 있는 장학 안내라 한 단계 올렸습니다",
+                nextAction: "신청 자격과 마감을 확인하고 신청 여부를 정하세요."
+            )
+        }
+        if BriefingPreferenceRules.matches(preferences.interestPatterns, in: text), contains(participationWords, text) {
+            return Adjustment(
+                direction: .up,
+                reason: "관심 분야 행사이고 참가 신청이 열려 있어 한 단계 올렸습니다",
+                nextAction: "참가 신청 마감을 확인하고 등록 여부를 정하세요."
+            )
+        }
+        return nil
+    }
+
+    static func applying(_ adjustment: Adjustment?, to item: ClassifiedItem) -> ClassifiedItem {
+        guard let adjustment, let category = moved(item.category, adjustment.direction) else { return item }
+        let up = adjustment.direction == .up
+        let importance = category == .excluded ? 1 : min(5, max(1, item.importance + (up ? 1 : -1)))
+        let action = up ? (concrete(item.displayNextAction ?? item.nextAction) ?? adjustment.nextAction ?? item.nextAction) : ""
+        return ClassifiedItem(
+            sourceItem: item.sourceItem, facts: item.facts, category: category, summary: item.summary,
+            reason: "\(adjustment.reason): \(item.reason)", importance: importance,
+            nextAction: action, deadline: item.deadline,
+            displayTitle: item.displayTitle, displaySummary: item.displaySummary,
+            displayNextAction: up ? action : nil, confidence: item.confidence,
+            pinnedByUserRule: item.pinnedByUserRule, contentFingerprint: item.contentFingerprint,
+            bodyExcerpt: item.bodyExcerpt
+        )
+    }
+
+    /// One step, and only within the three buckets: `excluded` cannot sink
+    /// further and `action` cannot rise.
+    private static func moved(_ category: BriefCategory, _ direction: Direction) -> BriefCategory? {
+        switch (category, direction) {
+        case (.excluded, .up): .reference
+        case (.reference, .up): .action
+        case (.action, .down): .reference
+        case (.reference, .down): .excluded
+        default: nil
+        }
+    }
+
+    private static let vagueActions = ["원문 확인", "확인", "확인 필요", "확인만 필요", "내용 확인", "참고"]
+
+    private static func concrete(_ value: String) -> String? {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !vagueActions.contains(text) else { return nil }
+        return text
+    }
+
+    private static func contains(_ words: [String], _ text: String) -> Bool {
+        words.contains { text.contains($0) }
+    }
+}
+
 enum BriefingQualityGate {
-    static func normalized(_ items: [ClassifiedItem]) -> [ClassifiedItem] {
+    static func normalized(_ items: [ClassifiedItem], preferences: BriefingPreferences = .defaults) -> [ClassifiedItem] {
         items.map { item in
             var result = item
             if !InboxEvidenceGate.isUsable(item.sourceItem.body) {
                 result.confidence = 0
                 return result
             }
-            if result.category == .action, result.pinnedByUserRule != true {
+            let adjustment = ReaderPriorityRules.adjustment(for: result, preferences: preferences)
+            // Demoting an item the reader's own rules are about to promote would
+            // strip its next action on the way past and hand back something
+            // labelled 할 일 that says "원문 확인".
+            var demotedByGate = false
+            if result.category == .action, result.pinnedByUserRule != true, adjustment?.direction != .up {
                 let evidence = "\(result.sourceItem.subject) \(result.sourceItem.body) \(result.facts ?? "")".lowercased()
                 let optionalOpportunity = ["모집", "포럼", "특강", "학술대회", "장학금", "사전등록", "registration", "forum"].contains { evidence.contains($0) }
                     && !["요청", "회신", "제출", "승인", "필수", "required", "must"].contains { evidence.contains($0) }
                 if optionalOpportunity || (result.confidence ?? 1) < 0.55 {
+                    demotedByGate = true
+                    let carried = (result.contentFingerprint, result.bodyExcerpt)
                     result = ClassifiedItem(
                         sourceItem: result.sourceItem,
                         facts: result.facts,
@@ -224,9 +356,15 @@ enum BriefingQualityGate {
                         confidence: min(result.confidence ?? 1, 0.5),
                         pinnedByUserRule: result.pinnedByUserRule
                     )
+                    // Rebuilding an item by hand loses whatever field was added
+                    // to it last: without this the demoted item is re-analysed
+                    // every morning, and shows no 원문 in the archive.
+                    (result.contentFingerprint, result.bodyExcerpt) = carried
                 }
             }
-            return result
+            // One step in total. When the gate has already moved an item down,
+            // a rule that agrees with it must not move it down again.
+            return demotedByGate ? result : ReaderPriorityRules.applying(adjustment, to: result)
         }
     }
 }

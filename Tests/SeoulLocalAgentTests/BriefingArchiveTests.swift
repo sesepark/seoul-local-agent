@@ -136,7 +136,7 @@ struct BriefingArchiveTests {
         state.dailyBriefings["26/08/29"] = briefing("26/08/29", [item(id: "gmail:old", title: "어제 일")], updatedAt: now.addingTimeInterval(-86_400))
         try stateStore.save(state)
 
-        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory))
+        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory), preferences: .defaults)
         #expect(model.selectedDateKey == "26/08/30")
         #expect(model.entries(.action).map(\.id) == ["gmail:high", "gmail:low"])
         #expect(model.entries(.reference).map(\.id) == ["web:ref"])
@@ -187,7 +187,7 @@ struct BriefingArchiveTests {
         state.dailyBriefings["26/08/20"] = briefing("26/08/20", [item(id: "gmail:old", title: "장학금 서류")], updatedAt: now.addingTimeInterval(-864_000))
         try stateStore.save(state)
 
-        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory))
+        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory), preferences: .defaults)
         #expect(model.entries(.action).map(\.id) == ["gmail:today"])
         model.search = "장학금"
         #expect(model.isSearching)
@@ -212,13 +212,76 @@ struct BriefingArchiveTests {
         ], updatedAt: now)
         try stateStore.save(state)
 
-        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory))
+        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory), preferences: .defaults)
         #expect(model.dueToday(now: now).map(\.id) == ["gmail:due"])
 
         // Finishing it takes it off the front page.
         let due = try #require(model.dueToday(now: now).first)
         model.toggleDone(due)
         #expect(model.dueToday(now: now).isEmpty)
+    }
+
+    // MARK: - 읽고 가져가기
+
+    /// The state file drops `sourceItem.body` on every save, so an archive that
+    /// read the body straight off the source item showed nothing at all from the
+    /// second run onwards — which is how the reader found it.
+    @Test("The archive shows the excerpt that survives being saved")
+    func bodyComesFromTheStoredExcerpt() throws {
+        let directory = temporaryDirectory()
+        let stateStore = StateStore(directory: directory)
+        var stored = item(id: "gmail:body")
+        stored.bodyExcerpt = ClassifiedItem.excerpt(of: stored.sourceItem.body)
+        var state = PersistentState()
+        state.dailyBriefings["26/08/30"] = briefing("26/08/30", [stored], updatedAt: Date(timeIntervalSince1970: 1_800_000_000))
+        try stateStore.save(state)
+
+        let reloaded = try #require(stateStore.load().dailyBriefings["26/08/30"]?.items.first)
+        #expect(reloaded.sourceItem.body.isEmpty)
+        #expect(reloaded.bodyExcerpt?.contains("학사행정실") == true)
+    }
+
+    @Test("An excerpt is bounded, and absent when there is nothing to show")
+    func excerptsAreBounded() {
+        #expect(ClassifiedItem.excerpt(of: "") == nil)
+        #expect(ClassifiedItem.excerpt(of: "google_api") == nil)
+        let long = String(repeating: "가", count: 2_000)
+        let excerpt = ClassifiedItem.excerpt(of: long) ?? ""
+        #expect(!excerpt.isEmpty)
+        #expect(excerpt.count <= ClassifiedItem.bodyExcerptLimit + 1)
+    }
+
+    /// SwiftUI carries a selection inside one `Text` and no further, so dragging
+    /// across a row can never produce the whole item. Copy has to build it.
+    @MainActor
+    @Test("Copying an item gives back everything the row shows")
+    func copyingAnItemKeepsItsSubstance() throws {
+        let directory = temporaryDirectory()
+        let stateStore = StateStore(directory: directory)
+        var stored = item(id: "gmail:copy", title: "국가장학금 2차 신청", deadline: "2026-09-09T18:00:00+09:00")
+        stored.bodyExcerpt = "신청 기간은 9월 9일 18시까지입니다."
+        var state = PersistentState()
+        state.dailyBriefings["26/08/30"] = briefing("26/08/30", [
+            stored,
+            item(id: "web:ref", category: .reference, title: "공지 확인", source: SourceName.web),
+        ], updatedAt: Date(timeIntervalSince1970: 1_800_000_000))
+        try stateStore.save(state)
+
+        let model = BriefingArchiveModel(stateStore: stateStore, archiveStore: BriefingArchiveStore(directory: directory), preferences: .defaults)
+        let entry = try #require(model.entries(.action).first)
+        let text = entry.plainText
+        #expect(text.hasPrefix("국가장학금 2차 신청"))
+        #expect(text.contains("마감 9월 9일 18시 00분"))
+        #expect(text.contains("신청 기간은 9월 9일 18시까지입니다."))
+        #expect(text.contains("https://example.invalid/gmail:copy"))
+
+        // The whole day keeps the reader's headings and their ticks.
+        model.toggleDone(entry)
+        let day = model.plainText()
+        #expect(day.contains(BriefingArchiveModel.Bucket.action.rawValue))
+        #expect(day.contains(BriefingArchiveModel.Bucket.reference.rawValue))
+        #expect(day.contains("[x] 국가장학금 2차 신청"))
+        #expect(day.contains("[ ] 공지 확인"))
     }
 }
 

@@ -186,6 +186,7 @@ final class AutomationController: ObservableObject {
     @Published var briefingUserInstructions: String
     @Published var briefingIgnoredPatternsText: String
     @Published var briefingImportantPatternsText: String
+    @Published var briefingInterestPatternsText: String
     @Published var briefingPreferencesStatus = ""
     @Published var calendarAuthorizationStatus = CalendarIntegration.authorizationDescription
     @Published var reminderAuthorizationStatus = CalendarIntegration.reminderAuthorizationDescription
@@ -403,6 +404,7 @@ final class AutomationController: ObservableObject {
         briefingUserInstructions = briefingPreferences.userInstructions
         briefingIgnoredPatternsText = briefingPreferences.ignoredPatterns.joined(separator: "\n")
         briefingImportantPatternsText = briefingPreferences.importantPatterns.joined(separator: "\n")
+        briefingInterestPatternsText = briefingPreferences.interestPatterns.joined(separator: "\n")
         // Incremental by default: earlier items that are still open are carried
         // forward rather than collected and analysed again.
         selectedRange = CollectionRange(rawValue: UserDefaults.standard.string(forKey: "briefingRange") ?? "") ?? .sinceLastSuccess
@@ -490,9 +492,13 @@ final class AutomationController: ObservableObject {
             try briefingPreferencesStore.save(BriefingPreferences(
                 userInstructions: briefingUserInstructions,
                 ignoredPatterns: .preferenceLines(briefingIgnoredPatternsText),
-                importantPatterns: .preferenceLines(briefingImportantPatternsText)
+                importantPatterns: .preferenceLines(briefingImportantPatternsText),
+                interestPatterns: .preferenceLines(briefingInterestPatternsText)
             ))
-            briefingPreferencesStatus = "저장했습니다. 다음 실행부터 적용됩니다."
+            // Some of these rules are applied when a briefing is shown, not when
+            // it is written, so the archive can answer to the new ones at once.
+            briefingArchive.reload()
+            briefingPreferencesStatus = "저장했습니다. 보관함에 바로 반영되고, 나머지는 다음 실행부터 적용됩니다."
         } catch { briefingPreferencesStatus = error.localizedDescription }
     }
 
@@ -500,6 +506,7 @@ final class AutomationController: ObservableObject {
         briefingUserInstructions = BriefingPreferences.defaultInstructions
         briefingIgnoredPatternsText = ""
         briefingImportantPatternsText = ""
+        briefingInterestPatternsText = BriefingPreferences.defaultInterests.joined(separator: "\n")
         saveBriefingPreferences()
     }
 
@@ -2596,6 +2603,12 @@ private struct ClassificationSettingsTab: View {
                 TextEditor(text: $controller.briefingImportantPatternsText)
                     .font(.body.monospaced()).frame(minHeight: 80)
                 Text("발신자·도메인·제목·본문에 포함될 문자열을 한 줄에 하나씩 입력합니다. 중요 규칙은 무시 규칙보다 우선합니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("관심 분야") {
+                TextEditor(text: $controller.briefingInterestPatternsText)
+                    .font(.body.monospaced()).frame(minHeight: 80)
+                Text("여기 적힌 분야의 포럼·특강·모집 공지는 한 단계 위로 올라갑니다. 참가 신청이 열려 있으면 할 일, 정보뿐이면 확인 항목이 됩니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("항상 무시") {
