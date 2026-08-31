@@ -25,6 +25,13 @@ struct SOArmServer: Codable, Equatable, Sendable {
     var localPort = 8088
     /// 서버에서 콘솔이 듣고 있는 포트. `config/soarm.env`의 `SOARM_WEB_PORT`와 같아야 한다.
     var remotePort = 8088
+    /// 팔을 움직이는 요청에 붙이는 토큰. 서버 `config/soarm.env`의 `SOARM_MOTION_TOKEN`과
+    /// 같아야 한다.
+    ///
+    /// 관찰과 조작의 권한을 가르는 자리다. 터널 너머로 상태와 카메라를 보는 데는 아무것도
+    /// 필요 없지만, 팔로워를 움직이는 요청에는 이 토큰이 있어야 한다. 폰이 같은 tailnet에서
+    /// 붙게 되면서 생긴 구분이고, 토큰을 갈아 끼우면 조작 권한만 끊긴다.
+    var motionToken = ""
 
     var isConfigured: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty
@@ -42,6 +49,32 @@ struct SOArmServer: Codable, Equatable, Sendable {
 
     static func validPort(_ value: Int) -> Int { min(max(value, 1), 65535) }
 
+    /// 없는 키는 기본값으로 둔다.
+    ///
+    /// Swift가 합성해 주는 디코더는 **기본값이 있어도** 키가 없으면 실패한다. 그래서
+    /// `motionToken`을 하나 늘렸을 때, 그 키가 없는 예전 `soarm-console.json`이 통째로
+    /// 디코딩에 실패하며 서버 주소와 계정까지 함께 사라졌다. 이 앱의 설정 파일은 앱보다
+    /// 오래 살아 있는 것이므로, 필드가 늘거나 줄어도 읽히는 편이 옳다.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        host = try values.decodeIfPresent(String.self, forKey: .host) ?? ""
+        user = try values.decodeIfPresent(String.self, forKey: .user) ?? ""
+        sshPort = try values.decodeIfPresent(Int.self, forKey: .sshPort) ?? 22
+        localPort = try values.decodeIfPresent(Int.self, forKey: .localPort) ?? 8088
+        remotePort = try values.decodeIfPresent(Int.self, forKey: .remotePort) ?? 8088
+        motionToken = try values.decodeIfPresent(String.self, forKey: .motionToken) ?? ""
+    }
+
+    init(host: String = "", user: String = "", sshPort: Int = 22, localPort: Int = 8088,
+         remotePort: Int = 8088, motionToken: String = "") {
+        self.host = host
+        self.user = user
+        self.sshPort = sshPort
+        self.localPort = localPort
+        self.remotePort = remotePort
+        self.motionToken = motionToken
+    }
+
     /// 저장된 파일이 손으로 고쳐졌을 수도 있으므로 읽을 때 한 번 걸러 낸다.
     func sanitised() -> SOArmServer {
         SOArmServer(
@@ -49,7 +82,8 @@ struct SOArmServer: Codable, Equatable, Sendable {
             user: user.trimmingCharacters(in: .whitespaces),
             sshPort: Self.validPort(sshPort),
             localPort: Self.validPort(localPort),
-            remotePort: Self.validPort(remotePort)
+            remotePort: Self.validPort(remotePort),
+            motionToken: motionToken.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 }

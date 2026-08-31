@@ -25,6 +25,7 @@ Apple Silicon Mac에서 **전부 기기 안에서** 도는 개인 자동화 메�
 | **용량 줄이기** | 사진·PDF·영상을 macOS 내장 인코더로 축소, 목표 용량 지정 가능 |
 | **로컬 Codex** | Codex OSS/Ollama 읽기 전용 세션, 종료 시 모델 즉시 언로드 |
 | **SO-ARM 101** | 집 서버에 붙은 로봇 팔을 SSH 터널 너머로 조작합니다. 카메라 프리뷰·텔레옵·데이터 수집을 간추린 화면에서 하고, `전체화면`은 서버의 웹 콘솔을 그대로 띄웁니다 |
+| **원격 텔레옵** | 3D로 그린 팔을 마우스로 끌면 집의 진짜 팔이 따라옵니다. 물리 리더 팔이 없어도 되고, 같은 화면을 아이폰에서 손가락으로도 씁니다. 무언가에 닿으면 서버가 모터가 타기 전에 물러난 뒤 멈추고 왜 멈췄는지 화면에 적습니다 |
 | **수집 데이터** | 서버에 쌓인 시연을 에피소드 단위로 되돌려 봅니다. 영상은 내려받지 않고 서버가 그 구간만 잘라 보냅니다 |
 
 ## 구성
@@ -38,6 +39,9 @@ Sources/SeoulLocalAgent/
   BriefingArchive*.swift      브리핑 보관함: 저장 형식, 화면, 체크·메모·분류 교정·캘린더 연결
   ConnectionHealth.swift      각 소스에 실제로 닿는지 점검(설정 › 연결 상태, --connection-check)
   SOArm*.swift                로봇 콘솔 원격 조작: 서버 설정·API 클라이언트, SSH 터널, 화면
+  SOArmVirtualLeader.swift    가상 리더 계약(관절 한계·안전 정책·거절 코드)과 REST 클라이언트
+  SOArmTeleopModel.swift      30Hz WebSocket, 조작 권한(리스)과 하트비트, 3D 뷰어와의 다리
+  SOArmTeleopScreen.swift     원격 텔레옵 화면: 3D(WKWebView) + 네이티브 슬라이더·부하·정지
   MJPEGStream.swift           서버 카메라의 MJPEG 스트림 한 개를 최신 프레임으로
   RecordingOrganization.swift 녹음 이름과 태그
   CalendarWriting.swift       전용 캘린더·미리 알림 쓰기, 중복 방지
@@ -52,6 +56,9 @@ scripts/
   *_runner.py                 전사·누끼·미디어 상주 러너
   eval/                       분류 품질 측정용 합성 데이터와 스크립트
 docs/사용_안내.md              기능별 전체 설명과 운용 절차
+docs/원격_텔레옵_안전.md       안전 사다리의 문턱값과 근거, 아직 확인하지 못한 것
+docs/원격_텔레옵_프로토콜.md    맥·폰·서버가 주고받는 계약(REST·WebSocket·단위·데드맨)
+docs/원격_텔레옵_작업지시.md    이 기능을 만들며 서버에 한 일과 서버 Codex에게 줄 프롬프트
 ```
 
 ## 설계에서 신경 쓴 부분

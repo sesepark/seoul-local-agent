@@ -887,6 +887,18 @@ struct SOArmSettingsTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("조작 토큰") {
+                // 비밀번호 필드로 두는 이유: 이 값이 있으면 팔을 움직일 수 있고, 화면
+                // 캡처나 어깨너머로 새어 나가는 것이 곧 조작 권한이 새는 것이다.
+                SecureField("서버 config/soarm.env의 SOARM_MOTION_TOKEN", text: $model.server.motionToken)
+                Text("관찰과 조작의 권한을 가르는 값입니다. 상태와 카메라를 보는 데는 필요 없고, 팔로워를 움직이는 요청에만 붙습니다. 아이폰이 같은 tailnet에서 붙게 되면서 생긴 구분이라, 서버에서 이 값을 갈아 끼우면 조작 권한만 끊깁니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("서버에서 확인: `grep SOARM_MOTION_TOKEN ~/Project/so-arm-101/config/soarm.env`")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
             Section("이 앱의 열쇠") {
                 Text("앱은 `~/.ssh`를 읽을 수 없습니다 — macOS가 보호하는 폴더라, 전체 디스크 접근 권한이 없는 앱이 띄운 ssh는 평소 쓰는 열쇠를 찾지 못합니다. 그래서 이 연결에만 쓰는 열쇠를 앱 폴더에 따로 두고 씁니다. 서버에서 이 줄만 지우면 앱의 접근만 끊깁니다.")
                     .font(.caption)

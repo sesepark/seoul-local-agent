@@ -191,6 +191,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // resource this app took, and a worker left holding a camera makes the
         // next recording refuse to start.
         SOArmConsoleModel.current?.releaseHeldCamerasNow()
+        // 조작 권한도 이 앱이 가져간 자원이다. 놓지 않고 끝나면 만료될 때까지 몇 초 동안
+        // 아무도 팔을 만질 수 없다. 팔 자체는 건드리지 않는다 — 창을 닫았다는 이유로
+        // 움직이던 팔을 세우거나 토크를 푸는 것은 이 앱이 내릴 결정이 아니다.
+        SOArmTeleopModel.current?.releaseHeldAuthorityNow()
         // The SSH tunnel to the robot console. It also dies on stdin EOF, but
         // that path is for a force-quit; a clean quit should not leave the app's
         // last act to the kernel.
@@ -247,6 +251,10 @@ final class AutomationController: ObservableObject {
     /// the arms and cameras stay owned by that server, and this side only opens
     /// an SSH tunnel and asks it to start and stop.
     let soarm = SOArmConsoleModel()
+    /// 그 콘솔의 가상 리더 — 3D로 그린 팔을 만져 진짜 팔을 움직이는 경로. 콘솔 모델을
+    /// 그대로 쓰는 이유는 터널과 서버 설정이 하나뿐이기 때문이다. 두 화면이 각자 터널을
+    /// 세우면 같은 포트를 두고 다투게 된다.
+    lazy var soarmTeleop = SOArmTeleopModel(console: soarm)
     /// Today's schedule for the 개요 screen. Read on demand rather than kept in
     /// sync: EventKit is the source of truth and the screen is not always up.
     @Published var todayEvents: [CalendarGlance] = []
@@ -2146,6 +2154,7 @@ private struct MainWorkspaceView: View {
                 case .briefing: BriefingStatusWorkspaceView(controller: controller)
                 case .archive: BriefingArchiveView(controller: controller)
                 case .soarm: SOArmView(controller: controller)
+                case .soarmTeleop: SOArmTeleopView(controller: controller)
                 case .soarmData: SOArmDatasetsView(controller: controller)
                 }
             }
@@ -2205,6 +2214,8 @@ private struct OverviewView: View {
                 ) { openSettings() }
 
                 SOArmOverviewTile(model: controller.soarm) { controller.section = .soarm }
+
+                SOArmTeleopOverviewTile(model: controller.soarmTeleop) { controller.section = .soarmTeleop }
             }
 
             runProblems
