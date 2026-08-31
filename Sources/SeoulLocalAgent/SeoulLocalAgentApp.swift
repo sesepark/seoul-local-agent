@@ -50,6 +50,15 @@ struct SeoulLocalAgentApp: App {
                 exit(failed ? EXIT_FAILURE : EXIT_SUCCESS)
             }
         }
+        // The same idea as `--connection-check`, for the robot: open the tunnel,
+        // read the console's status, pull one frame from each camera and report
+        // whether anything was left running. Useful when the arms will not start
+        // and the question is whether this Mac can reach the server at all.
+        if CommandLine.arguments.contains("--soarm-check") {
+            Task { @MainActor in
+                exit(await SOArmConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
+            }
+        }
         // `--briefing-shadow` runs the whole pipeline and prints the report
         // without touching stored state; `--briefing-write` also saves it and
         // exports it to Notion, which is now an explicit extra step rather than
@@ -178,6 +187,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // Same for the 소리 다듬기 · 화질 올리기 runner, which also keeps a torch
         // model warm between files.
         MediaDaemon.shared.shutdownNow()
+        // Hand the server's cameras back before the tunnel goes: they are a
+        // resource this app took, and a worker left holding a camera makes the
+        // next recording refuse to start.
+        SOArmConsoleModel.current?.releaseHeldCamerasNow()
+        // The SSH tunnel to the robot console. It also dies on stdin EOF, but
+        // that path is for a force-quit; a clean quit should not leave the app's
+        // last act to the kernel.
+        SOArmTunnel.shared.shutdownNow()
         // Tree, not just the direct child: the 정밀 문서 인식 helper starts a
         // local service of its own that would otherwise be left behind.
         ActiveProcessRegistry.shared.terminateAllTrees()
@@ -226,6 +243,10 @@ final class AutomationController: ObservableObject {
     let briefingArchive = BriefingArchiveModel()
     /// Names and tags for the recording library, which had neither.
     let recordingOrganizer = RecordingOrganizer()
+    /// The SO-ARM 101 console on the home server. Nothing here touches hardware:
+    /// the arms and cameras stay owned by that server, and this side only opens
+    /// an SSH tunnel and asks it to start and stop.
+    let soarm = SOArmConsoleModel()
     /// Today's schedule for the 개요 screen. Read on demand rather than kept in
     /// sync: EventKit is the source of truth and the screen is not always up.
     @Published var todayEvents: [CalendarGlance] = []
@@ -238,7 +259,16 @@ final class AutomationController: ObservableObject {
     /// Which pane ⌘, lands on. Lives here because the buttons that need to steer
     /// it — 연결 상태 점검 on 개요, 설정에서 변경 on 자동 브리핑 — are outside the
     /// settings window's own view tree.
-    @Published var settingsTab: SettingsTab = .briefing
+    ///
+    /// `--settings <이름>`으로 어느 탭을 열지 고를 수 있다. `--section`과 같은 이유로, 창을
+    /// 눌러 보지 않고도 특정 화면을 확인할 수 있어야 하기 때문이다.
+    @Published var settingsTab: SettingsTab = {
+        guard let index = CommandLine.arguments.firstIndex(of: "--settings"),
+              index + 1 < CommandLine.arguments.count,
+              let requested = SettingsTab(rawValue: CommandLine.arguments[index + 1])
+        else { return .briefing }
+        return requested
+    }()
     @Published var isRunning = false
     @Published var isTranscribing = false
     @Published var asrModel: ASRModelChoice {
@@ -2115,6 +2145,8 @@ private struct MainWorkspaceView: View {
                 case .convert: FileConversionView(controller: controller)
                 case .briefing: BriefingStatusWorkspaceView(controller: controller)
                 case .archive: BriefingArchiveView(controller: controller)
+                case .soarm: SOArmView(controller: controller)
+                case .soarmData: SOArmDatasetsView(controller: controller)
                 }
             }
             // Screens now carry their own name into the title bar, so switching
@@ -2128,6 +2160,10 @@ private struct MainWorkspaceView: View {
         // 녹음·전사 alone, so picking that one tab raised the whole window's
         // minimum while every other tab had none at all.
         .frame(minWidth: 940, minHeight: 620)
+        // The server's own console, when it is asked for. It covers the whole
+        // window rather than opening a second one — this app has exactly one
+        // workspace window and adding a scene for the robot would break that.
+        .overlay { SOArmConsoleOverlay(model: controller.soarm) }
     }
 }
 
@@ -2167,6 +2203,8 @@ private struct OverviewView: View {
                     symbol: controller.dictation.isRecording ? "mic.fill" : "mic",
                     isBusy: controller.dictation.isRecording || controller.dictation.isTranscribing
                 ) { openSettings() }
+
+                SOArmOverviewTile(model: controller.soarm) { controller.section = .soarm }
             }
 
             runProblems
@@ -2411,7 +2449,7 @@ private struct OverviewView: View {
     private var tools: some View {
         GroupBox {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 215), spacing: Spacing.m)], spacing: Spacing.m) {
-                ForEach(AppSection.allCases.filter { $0 != .overview && $0 != .briefing && $0 != .archive }) { section in
+                ForEach(AppSection.allCases.filter { $0 != .overview && $0 != .briefing && $0 != .archive && $0 != .soarm }) { section in
                     ToolShortcut(section: section) { controller.section = section }
                 }
             }
@@ -2515,7 +2553,7 @@ private struct ToolShortcut: View {
 /// A tile that is also the way into the screen it summarises. Fixed 180-point
 /// tiles used to sit in a row that could not reflow, and clicking one did
 /// nothing.
-private struct StatusTile: View {
+struct StatusTile: View {
     let title: String
     let value: String
     var detail: String = ""
@@ -2712,7 +2750,7 @@ private struct BriefingStatusRow: View {
 /// Which pane ⌘, opens on, so a button elsewhere can send the reader somewhere
 /// specific rather than to wherever they were last.
 enum SettingsTab: String, Hashable {
-    case briefing, connections, classification, transcription, dictation, tools
+    case briefing, connections, classification, transcription, dictation, tools, robot
 }
 
 /// The ⌘, window. These nine sections used to be one `Form` inside a sidebar
@@ -2745,6 +2783,9 @@ private struct SettingsWindow: View {
             }
             Tab("도구", systemImage: "wand.and.stars", value: SettingsTab.tools) {
                 ToolSettingsTab(controller: controller)
+            }
+            Tab("로봇", systemImage: "arrow.up.and.down.and.arrow.left.and.right", value: SettingsTab.robot) {
+                SOArmSettingsTab(model: controller.soarm)
             }
         }
         .frame(width: 620, height: 520)

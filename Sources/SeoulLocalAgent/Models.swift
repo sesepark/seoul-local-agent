@@ -326,6 +326,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case transcription, audioCleanup, cutout, upscale
     case compression, convert
     case briefing, archive
+    case soarm, soarmData
 
     var id: String { rawValue }
 
@@ -347,6 +348,8 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "형식 변환"
         case .briefing: "자동 브리핑"
         case .archive: "브리핑 보관함"
+        case .soarm: "SO-ARM 101"
+        case .soarmData: "수집 데이터"
         }
     }
 
@@ -364,6 +367,8 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "사진·오디오·영상·문서를 다른 형식으로 바꿉니다. 필요한 것은 전부 이 Mac 안에서 처리합니다."
         case .briefing: "메일·메시지·웹 공지를 모아 이 Mac의 모델로 정리합니다. 수집부터 저장까지의 상태를 여기서 봅니다."
         case .archive: "정리된 결과가 날짜별로 쌓입니다. 끝낸 일을 체크하고, 남은 일은 Mac 캘린더나 미리 알림으로 바로 넘깁니다."
+        case .soarm: "집 서버에 붙은 SO-ARM101 팔을 여기서 조작합니다. 팔과 카메라는 서버가 쥐고 있고, 이 Mac은 SSH 터널 너머로 시작과 중지만 지시합니다."
+        case .soarmData: "서버에 쌓인 시연 데이터를 에피소드 단위로 되돌려 봅니다. 영상은 서버에 그대로 두고 필요한 구간만 받아 재생합니다."
         }
     }
 
@@ -383,6 +388,8 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "다른 형식으로 바꾸기"
         case .briefing: "메일·공지 모아 정리하기"
         case .archive: "정리된 할 일과 캘린더 연동"
+        case .soarm: "로봇 팔 텔레옵과 데이터 수집"
+        case .soarmData: "찍어 둔 시연 다시 보기"
         }
     }
 
@@ -402,6 +409,10 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "arrow.triangle.2.circlepath"
         case .briefing: "tray.full"
         case .archive: "checklist"
+        // The arm itself, not a generic robot face: this screen is about a
+        // manipulator that moves, and the sidebar should say which one.
+        case .soarm: "arrow.up.and.down.and.arrow.left.and.right"
+        case .soarmData: "film.stack"
         }
     }
 
@@ -409,6 +420,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     /// letter instead — the same answer Apple's own apps reach when a sidebar
     /// outgrows ten rows. 자동 브리핑 and its 보관함 are one subject with two
     /// screens, so they share ⌘B and ⇧⌘B rather than taking unrelated letters.
+    /// SO-ARM 101 takes ⇧⌘R because plain ⌘R already starts a briefing run.
     var shortcut: KeyEquivalent {
         switch self {
         case .overview: "1"
@@ -422,11 +434,18 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .compression: "9"
         case .convert: "0"
         case .briefing, .archive: "b"
+        case .soarm, .soarmData: "r"
         }
     }
 
+    /// 로봇 두 화면은 자동 브리핑과 그 보관함처럼 한 주제의 두 화면이라 같은 글자를 나눠
+    /// 쓴다. `⌘R`은 이미 인박스 정리 시작이 쓰고 있어 `⇧`부터 시작한다.
     var shortcutModifiers: EventModifiers {
-        self == .archive ? [.command, .shift] : .command
+        switch self {
+        case .archive, .soarm: [.command, .shift]
+        case .soarmData: [.command, .option]
+        default: .command
+        }
     }
 
     /// Which heading the row sits under. A flat list of eleven would read as a
@@ -438,6 +457,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case media = "미디어"
         case files = "변환"
         case automation = "자동화"
+        case robot = "로봇"
 
         var id: String { rawValue }
 
@@ -448,6 +468,7 @@ enum AppSection: String, CaseIterable, Identifiable {
             case .media: [.transcription, .audioCleanup, .cutout, .upscale]
             case .files: [.compression, .convert]
             case .automation: [.briefing, .archive]
+            case .robot: [.soarm, .soarmData]
             }
         }
     }

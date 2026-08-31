@@ -32,6 +32,16 @@ done
   <key>NSCalendarsFullAccessUsageDescription</key><string>인박스 정리에 앞으로의 일정을 포함하고, 브리핑 보관함에서 고른 항목만 '서울대 로컬 에이전트' 전용 캘린더에 넣기 위해 캘린더에 접근합니다.</string>
   <key>NSRemindersFullAccessUsageDescription</key><string>브리핑 보관함에서 고른 항목을 '서울대 로컬 에이전트' 전용 목록에 미리 알림으로 넣기 위해 접근합니다.</string>
   <key>NSHighResolutionCapable</key><true/>
+  <!-- The SO-ARM console is reached over an SSH tunnel to 127.0.0.1 and speaks
+       plain HTTP; ATS would otherwise block both the status polling and the
+       embedded web console. This permits loopback and local networking only. -->
+  <!-- The robot console runs on a machine on the home LAN and is reached by an
+       SSH tunnel, so macOS asks for local-network access the first time. Without
+       this string the prompt cannot say what the app wants it for. -->
+  <key>NSLocalNetworkUsageDescription</key><string>집 서버의 SO-ARM101 콘솔에 SSH 터널로 연결하기 위해 같은 네트워크의 그 서버에만 접속합니다. 다른 기기를 찾거나 수집하지 않습니다.</string>
+  <key>NSAppTransportSecurity</key><dict>
+    <key>NSAllowsLocalNetworking</key><true/>
+  </dict>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>

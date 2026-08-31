@@ -61,6 +61,10 @@ final class ActiveProcessRegistry: @unchecked Sendable {
         "scripts/matting_runner.py",
         "scripts/media_runner.py",
         "mineru.cli.fast_api",
+        // The SSH tunnel to the SO-ARM console carries this marker as a shell
+        // comment in its remote command, which is visible in the local `ps`
+        // output and means nothing on the server.
+        SOArmTunnel.marker,
     ]
 
     /// Terminates a process and everything it started, deepest first.
