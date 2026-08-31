@@ -300,10 +300,16 @@ struct SOArmVirtualLeaderClient: Sendable {
         _ = try await send("api/vleader/torque/release", method: "POST", body: ["confirmation": confirmation], token: true, timeout: 30)
     }
 
-    func takeLease(holder: String, session: String) async throws -> SOArmLease {
+    /// 조작 권한을 받는다. **여기에도 확인 문구가 붙는다.**
+    ///
+    /// 토크를 거는 자리에만 두었더니, 이미 켜져 있을 때 그 게이트를 지나쳤다. 먼저 켜 둔
+    /// 사람이 있는 팔에 아무나 문구 없이 붙을 수 있었고, 시험이 그것을 잡았다. 팔이
+    /// 움직일 수 있게 되는 순간은 토크가 걸리는 순간이 아니라 권한을 받는 순간이다.
+    func takeLease(holder: String, session: String, confirmation: String) async throws -> SOArmLease {
         let data = try await send(
             "api/vleader/lease", method: "POST",
-            body: ["holder": holder, "session_id": session], token: true, timeout: 15
+            body: ["confirmation": confirmation, "holder": holder, "session_id": session],
+            token: true, timeout: 15
         )
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let lease = SOArmLease(json) else {

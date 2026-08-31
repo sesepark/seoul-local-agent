@@ -412,7 +412,9 @@ final class SOArmTeleopModel: ObservableObject {
             if !model.telemetry.torqueEnabled {
                 try await client.arm(confirmation: confirmation)
             }
-            let lease = try await client.takeLease(holder: "맥북", session: model.sessionID)
+            let lease = try await client.takeLease(
+                holder: "맥북", session: model.sessionID, confirmation: confirmation
+            )
             model.lease = lease
             model.syncTargetToArm()
             model.pushEnabledToViewer()
