@@ -236,6 +236,12 @@ final class SOArmTeleopModel: ObservableObject {
                     : "다른 화면이 조작 권한을 가져갔습니다. 팔은 그쪽 명령을 따릅니다."
             }
         }
+        // 서버가 팔을 세웠으면 잡고 있던 의도도 놓는다. 그러지 않으면 멈춘 자리에서
+        // 목표만 멀리 떨어진 채 남고, 다시 시작하는 순간 같은 곳으로 다시 밀어 붙는다 —
+        // 팔이 책상에 닿아 멈춘 뒤로는 무엇을 눌러도 400ms 만에 또 멈췄다.
+        if isCommanding, !value.telemetry.state.acceptsMotion {
+            endCommanding()
+        }
         if !isCommanding {
             syncTargetToArm()
         }
@@ -483,9 +489,13 @@ final class SOArmTeleopModel: ObservableObject {
     }
 
     /// 데드맨. 손을 떼면 목표가 팔의 지금 자리로 붙고 팔은 그 자리에 선다.
+    ///
+    /// 3D에도 같은 말을 해야 한다. 페이지는 자기 유령 자세를 30Hz로 올려 보내므로,
+    /// 여기서 목표만 팔에 붙여 두면 다음 프레임이 곧바로 옛 유령으로 덮어쓴다.
     func endCommanding() {
         isCommanding = false
         syncTargetToArm()
+        pushEndTargetToViewer()
         pushEnabledToViewer()
     }
 
@@ -527,8 +537,8 @@ final class SOArmTeleopModel: ObservableObject {
             model.lease = lease
             model.leaseTakenAt = Date()
             model.startLeaseKeepalive()
-            model.syncTargetToArm()
-            model.pushEnabledToViewer()
+            // 첫 명령은 반드시 팔이 지금 서 있는 자리여야 한다. 3D의 유령도 같이 붙인다.
+            model.endCommanding()
         }
     }
 
@@ -551,7 +561,10 @@ final class SOArmTeleopModel: ObservableObject {
     func resume() {
         perform { client, model in
             try await client.resume()
-            model.syncTargetToArm()
+            // 목표를 팔의 지금 자리로 되돌린 뒤에 다시 시작한다. 3D의 유령까지 함께
+            // 되돌려야 한다 — 페이지가 옛 자세를 계속 올려 보내면 되돌린 것이 한 프레임
+            // 만에 없던 일이 된다.
+            model.endCommanding()
         }
     }
 

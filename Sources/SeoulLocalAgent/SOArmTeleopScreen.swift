@@ -497,9 +497,10 @@ private struct SOArmJointRow: View {
                 버티고 있을 때도 0~3칸(0~20mA)에 머물러 거의 움직이지 않습니다.
                 온도: 모터 온도입니다. \(Int(policy.temperatureWarnC))°C부터 주황, \
                 \(Int(policy.temperatureTripC))°C에서 서버가 세웁니다.
-                팔을 실제로 세우는 것은 부하·전류 문턱(\(Int(policy.loadTrip))·\(Int(policy.currentTrip)))이 \
-                아니라 "목표를 \(policy.commandTimeoutMs + 100)ms 넘게 따라가지 못함"입니다 — \
-                이 눈금들로는 막힌 팔과 그냥 무거운 팔이 잘 구분되지 않았습니다.
+                팔을 세우는 것은 부하·전류 문턱(\(Int(policy.loadTrip))·\(Int(policy.currentTrip)))이 \
+                아닙니다 — 이 팔에서는 그 값에 닿지 않습니다. 실제로 세우는 것은 둘입니다: \
+                목표를 \(policy.commandTimeoutMs + 100)ms 넘게 따라가지 못할 때, 그리고 \
+                밀고 있는데 제자리인 채 부하가 높을 때.
                 """)
         }
     }
