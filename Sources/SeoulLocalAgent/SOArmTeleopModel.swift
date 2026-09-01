@@ -10,6 +10,47 @@ import Combine
 /// 이 타입은 팔에 대해 낙관적으로 말하지 않는다. 목표를 보냈다고 화면의 관절을 먼저
 /// 옮기지 않고, 서버가 실제로 읽은 값이 내려올 때 옮긴다. 조작면이 팔보다 앞서 있으면
 /// 사람은 팔이 이미 도착했다고 믿은 채 다음 동작을 시작한다.
+/// 소켓이 받아 둔 가장 새 텔레메트리 한 장을 들고 있는 자리.
+///
+/// 받는 쪽(소켓)과 쓰는 쪽(30Hz 명령 고리)의 박자가 다르므로 그 사이에 **한 칸짜리** 통을
+/// 둔다. 통이 한 칸인 것이 요점이다 — 밀린 프레임을 쌓아 두면 그만큼 낡은 자세를 근거로
+/// 명령하게 되고, 서버는 그것을 거절한다.
+final class SOArmTelemetryInbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frame: [String: Any]?
+
+    func put(_ json: [String: Any]) {
+        lock.lock()
+        frame = json
+        lock.unlock()
+    }
+
+    func take() -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        let latest = frame
+        frame = nil
+        return latest
+    }
+
+    /// 텔레메트리가 아닌 것들. 드물고 **순서가 중요하므로** 줄을 세워 둔다.
+    private var others: [[String: Any]] = []
+
+    func putOther(_ json: [String: Any]) {
+        lock.lock()
+        others.append(json)
+        lock.unlock()
+    }
+
+    func takeOthers() -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        let queued = others
+        others = []
+        return queued
+    }
+}
+
 @MainActor
 final class SOArmTeleopModel: ObservableObject {
     enum Connection: Equatable {
@@ -53,7 +94,10 @@ final class SOArmTeleopModel: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
     private var leaseTask: Task<Void, Never>?
+    /// 소켓이 받아 둔 가장 새 텔레메트리 한 장. 받는 쪽과 그리는 쪽의 박자가 다르다.
+    private nonisolated let inbox = SOArmTelemetryInbox()
     private var homingTask: Task<Void, Never>?
+    private var viewerFrame = 0
     /// 리스를 받은 시각. 갓 받은 리스를 낡은 프레임이 지우지 못하게 하는 데 쓴다.
     private var leaseTakenAt = Date.distantPast
     private var reconnectAttempt = 0
@@ -286,20 +330,43 @@ final class SOArmTeleopModel: ObservableObject {
         if case .streaming = connection { connection = .idle }
     }
 
-    private func readStream(_ task: URLSessionWebSocketTask) async {
+    /// 소켓에서 받는 일만 한다. **메인 액터에서 하지 않는다.**
+    ///
+    /// 전에는 이 고리 전체가 메인 액터에서 돌았고, 한 프레임마다 JSON 해석 + SwiftUI 갱신 +
+    /// WKWebView로 `evaluateJavaScript`까지 했다. 30Hz에서 그 일이 33ms를 넘으면 받는 쪽이
+    /// 밀리기 시작하고, 밀린 만큼 우리가 명령의 근거로 대는 관측이 낡는다. 서버는 15프레임
+    /// (0.5초)보다 낡은 근거를 거절하고, 거절된 명령은 워치독의 "명령이 없다"로 이어진다.
+    /// 실물에서 그 화면을 봤다: **18 프레임 전의 관측을 근거로 하고 있습니다.**
+    ///
+    /// 그래서 받는 쪽은 받아서 **가장 새 것 한 장만** 남기고, 그리는 것은 명령 고리가
+    /// 자기 박자에 맞춰 가져간다. 밀린 프레임은 그리지 않고 버린다 — 이미 지나간 자세를
+    /// 뒤늦게 그리는 것은 아무에게도 도움이 되지 않는다.
+    private nonisolated func readStream(_ task: URLSessionWebSocketTask) async {
         while !Task.isCancelled {
             do {
                 let message = try await task.receive()
                 guard case .string(let text) = message,
                       let data = text.data(using: .utf8),
                       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
-                handle(json)
+                if (json["type"] as? String) == "telemetry" {
+                    inbox.put(json)
+                } else {
+                    // 텔레메트리가 아닌 것(hello·ack·reject·lease)은 드물고 순서가 중요하다.
+                    // 통을 거치지 않고 곧바로 넘긴다.
+                    inbox.putOther(json)
+                    await MainActor.run { self.drainOthers() }
+                }
             } catch {
                 guard !Task.isCancelled else { return }
                 await scheduleReconnect(SOArmClient.reason(for: error))
                 return
             }
         }
+    }
+
+    /// 텔레메트리가 아닌 프레임들을 온 순서대로 처리한다.
+    private func drainOthers() {
+        for json in inbox.takeOthers() { handle(json) }
     }
 
     private func handle(_ json: [String: Any]) {
@@ -317,7 +384,11 @@ final class SOArmTeleopModel: ObservableObject {
             var updated = status
             updated.telemetry = SOArmTelemetry(json)
             apply(updated)
-            pushTelemetryToViewer()
+            // 3D에 밀어 넣는 것은 프로세스를 건너가는 호출이라 한 장에 드는 값이 크다.
+            // 눈으로는 15Hz와 30Hz가 구별되지 않고, 아낀 시간은 받는 쪽이 밀리지 않는 데
+            // 쓰인다.
+            viewerFrame &+= 1
+            if viewerFrame % 2 == 0 { pushTelemetryToViewer() }
         case "ack":
             rejection = nil
         case "reject":
@@ -376,6 +447,10 @@ final class SOArmTeleopModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: period)
                 guard let self, !Task.isCancelled else { return }
+                // 밀려 있던 프레임 중 **가장 새 것 하나만** 반영한다. 명령의 근거가 되는
+                // 관측이 낡지 않게 하는 것이 이 순서의 전부다.
+                self.drainOthers()
+                if let frame = self.inbox.take() { self.handle(frame) }
                 self.sendCommand()
                 beats += 1
                 // 카메라가 끊기면 다시 붙는다. 조작하면서 보는 화면이라 한 번 끊긴 채로

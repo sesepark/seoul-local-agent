@@ -655,11 +655,16 @@ private struct SOArmTeleopCameraTile: View {
 
 // MARK: - 확인 문구
 
-/// 손으로 옮겨 적어야 열리는 게이트.
+/// 팔이 움직이기 직전에 사람을 한 번 멈춰 세우는 자리.
 ///
-/// 문구를 미리 채워 주지 않는다. 채워 두면 남는 것은 버튼 하나이고, 그 버튼은 잘못
-/// 눌리는 것을 막지 못한다. 여기서 지키려는 것은 *팔이 움직이기 직전에 사람이 한 번
-/// 멈춰 서는 것*이며, 옮겨 적는 시간이 그 멈춤이다.
+/// 멈춤은 **한 번의 분명한 행동**으로 받는다: 무엇을 확인했는지 적힌 체크 하나. 문구를
+/// 손으로 옮겨 적게 하던 때가 있었는데, 조작 권한은 한 세션에 여러 번 받는 것이라
+/// 그때마다 열세 글자를 치는 것은 게이트가 아니라 통행세가 됐다. 통행세는 사람을
+/// 신중하게 만들지 않는다.
+///
+/// 위험이 큰 쪽(토크 해제)도 마찬가지다. 거기서 달라지는 것은 확인의 무게가 아니라
+/// **화면이 말해 주는 것** — 빨간색이고, 팔이 떨어진다고 적혀 있고, 체크 문구가
+/// "받치고 있는 사람이 있다"이다.
 enum SOArmTeleopGate: String, Identifiable {
     case arm
     case releaseTorque
@@ -691,17 +696,6 @@ enum SOArmTeleopGate: String, Identifiable {
 
     var isDangerous: Bool { self == .releaseTorque }
 
-    /// 문구를 손으로 옮겨 적게 할 것인가.
-    ///
-    /// 조작 권한은 한 세션에 여러 번 받는다 — 잠깐 반납했다가 다시 잡고, 멈췄다가 다시
-    /// 시작한다. 그때마다 열세 글자를 치게 하면 게이트가 아니라 통행세가 되고, 통행세는
-    /// 사람을 신중하게 만들지 않는다. 대신 **한 번의 분명한 행동**을 요구한다: 현장을
-    /// 확인했다는 체크 하나와 버튼(또는 Return).
-    ///
-    /// 토크 해제는 그대로 남긴다. 그쪽은 자주 하는 일이 아니고, 잘못 눌리면 팔이 떨어진다.
-    /// 손으로 옮겨 적는 몇 초가 값을 하는 자리는 여기다.
-    var requiresTypedPhrase: Bool { self == .releaseTorque }
-
     /// 체크박스에 적히는 말. 무엇을 확인했다고 말하는 것인지가 분명해야 한다.
     var acknowledgement: String {
         switch self {
@@ -718,14 +712,11 @@ private struct SOArmPhraseGate: View {
     let confirm: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var typed = ""
     @State private var acknowledged = false
 
-    /// 서버는 어느 쪽이든 정확한 문구를 요구한다. 달라지는 것은 **사람이 무엇을 하느냐**뿐이다
-    /// — 옮겨 적거나, 확인에 체크하거나.
-    private var matches: Bool {
-        gate.requiresTypedPhrase ? typed == gate.phrase : acknowledged
-    }
+    /// 서버는 어느 쪽이든 정확한 문구를 요구한다. 달라지는 것은 **사람이 무엇을 하느냐**뿐이고,
+    /// 그것은 어느 게이트에서나 체크 하나다.
+    private var matches: Bool { acknowledged }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
@@ -764,32 +755,21 @@ private struct SOArmPhraseGate: View {
                 .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: Radius.card, style: .continuous))
             }
 
-            if gate.requiresTypedPhrase {
-                VStack(alignment: .leading, spacing: Spacing.xs) {
-                    Text("아래 문구를 손으로 옮겨 적으세요")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(gate.phrase)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.disabled)
-                    TextField("", text: $typed)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-                        .autocorrectionDisabled()
-                }
-            } else {
-                Toggle(gate.acknowledgement, isOn: $acknowledged)
-                    .toggleStyle(.checkbox)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            // 위험의 크기는 확인의 **무게**가 아니라 이 화면이 무엇을 말해 주느냐로 표현한다.
+            // 빨간색, "팔이 떨어집니다"라는 분명한 문장, 그리고 무엇을 확인했다고 말하는
+            // 것인지 적힌 체크 하나. 문구를 옮겨 적게 하던 자리였는데, 자주 하는 일에서
+            // 타이핑은 신중함이 아니라 마찰만 만든다.
+            Toggle(gate.acknowledgement, isOn: $acknowledged)
+                .toggleStyle(.checkbox)
+                .fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
                 Button("취소") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button(gate.title) {
-                    // 서버가 요구하는 문구는 그대로 간다. 화면에서 달라진 것은 사람이
-                    // 그것을 옮겨 적느냐, 확인에 체크하느냐뿐이다.
-                    confirm(gate.requiresTypedPhrase ? typed : gate.phrase)
+                    // 서버가 요구하는 문구는 그대로 간다. 바뀌는 것은 **사람이 무엇을
+                    // 하느냐**이지 프로토콜이 아니다.
+                    confirm(gate.phrase)
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
