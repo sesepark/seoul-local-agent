@@ -872,9 +872,16 @@ struct SOArmSettingsTab: View {
     @State private var key = SOArmTunnelKey()
     @State private var publicKey = ""
     @State private var keyError = ""
+    @StateObject private var tuning: SOArmTuningModel
+
+    init(model: SOArmConsoleModel) {
+        self.model = model
+        _tuning = StateObject(wrappedValue: SOArmTuningModel(server: model.server))
+    }
 
     var body: some View {
         Form {
+            SOArmTuningSection(model: tuning)
             Section("서버") {
                 TextField("집에서 쓸 주소", text: $model.server.host, prompt: Text("192.168.0.20"))
                 TextField("집 밖에서 쓸 주소", text: $model.server.alternateHost, prompt: Text("100.x.y.z (Tailscale)"))

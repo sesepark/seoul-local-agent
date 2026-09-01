@@ -249,6 +249,14 @@ struct SOArmVirtualLeaderStatus: Sendable, Equatable {
     }
 }
 
+/// 화면에서 바꿀 수 있는 값 하나의 난간. 범위는 서버가 정하고 앱은 그대로 따른다 —
+/// 두 곳에 적어 두면 서버가 범위를 좁혔을 때 앱만 옛 난간을 그린다.
+struct SOArmTunableRange: Sendable, Equatable {
+    var minimum: Double
+    var maximum: Double
+    var isInteger: Bool
+}
+
 /// 서버가 preflight로 돌려주는 영어 한 줄을, 무엇을 해야 하는지로 옮긴다.
 /// `SOArmPreflightText`와 같은 규칙이다 — 아는 것만 옮기고 모르는 문장은 원문을 남긴다.
 enum SOArmVirtualLeaderText {
@@ -327,6 +335,44 @@ struct SOArmVirtualLeaderClient: Sendable {
 
     func releaseLease(_ id: String) async throws {
         _ = try await send("api/vleader/lease/\(id)", method: "DELETE", token: true, timeout: 10)
+    }
+
+    /// 서버가 지금 쓰고 있는 안전·조작 값과, 그중 화면에서 바꿀 수 있는 것들의 범위.
+    func policy() async throws -> (values: [String: Double], ranges: [String: SOArmTunableRange]) {
+        let data = try await send("api/vleader/policy", method: "GET", token: false, timeout: 10)
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw SOArmError.badResponse("정책을 읽지 못했습니다")
+        }
+        var values: [String: Double] = [:]
+        for (name, raw) in (json["policy"] as? [String: Any]) ?? [:] {
+            if let number = raw as? NSNumber { values[name] = number.doubleValue }
+        }
+        var ranges: [String: SOArmTunableRange] = [:]
+        for (name, raw) in (json["tunable"] as? [String: Any]) ?? [:] {
+            guard let entry = raw as? [String: Any],
+                  let low = (entry["min"] as? NSNumber)?.doubleValue,
+                  let high = (entry["max"] as? NSNumber)?.doubleValue else { continue }
+            ranges[name] = SOArmTunableRange(
+                minimum: low, maximum: high, isInteger: (entry["integer"] as? Bool) ?? false
+            )
+        }
+        return (values, ranges)
+    }
+
+    /// 바꾼 값을 보낸다. 서버가 그 자리에서 적용하고 `config/soarm.env`에도 남긴다.
+    func setPolicy(_ values: [String: Double]) async throws -> [String: Double] {
+        let data = try await send(
+            "api/vleader/policy", method: "POST", body: ["values": values], token: true, timeout: 15
+        )
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let policy = json["policy"] as? [String: Any] else {
+            throw SOArmError.badResponse("정책 응답을 읽지 못했습니다")
+        }
+        var updated: [String: Double] = [:]
+        for (name, raw) in policy {
+            if let number = raw as? NSNumber { updated[name] = number.doubleValue }
+        }
+        return updated
     }
 
     /// 리스를 살려 둔다.
