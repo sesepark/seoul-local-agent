@@ -39,6 +39,7 @@ struct SOArmVirtualLeaderTests {
       "state": "HOLD",
       "state_korean": "자세 유지",
       "torque_enabled": true,
+      "torque_known": true,
       "observation": 27512,
       "loop_ms": 4.43,
       "joints": [
@@ -123,6 +124,19 @@ struct SOArmVirtualLeaderTests {
         let status = try SOArmVirtualLeaderStatus.parse(Data(json.utf8))
         #expect(status.telemetry.state == .stopped)
         #expect(status.telemetry.state.acceptsMotion == false)
+    }
+
+    @Test("토크를 모를 때는 모른다고 말한다")
+    func anUnknownTorqueStateIsNotReportedAsOff() throws {
+        // 루프가 돌지 않으면 토크가 걸려 있는지 알 수 없다. 서버에서 실제로 모터 여섯 개가
+        // 전부 켜져 있는데 화면이 "토크 없음"이라고 적어 둔 것을 봤다.
+        let known = try Self.status()
+        #expect(known.telemetry.torqueKnown)
+        #expect(known.telemetry.torqueEnabled)
+
+        let json = Self.statusJSON.replacingOccurrences(of: "\"torque_known\": true", with: "\"torque_known\": false")
+        let unknown = try SOArmVirtualLeaderStatus.parse(Data(json.utf8))
+        #expect(unknown.telemetry.torqueKnown == false)
     }
 
     @Test("조작을 받아 주는 상태와 사람이 확인해야 하는 상태를 구별한다")
@@ -313,10 +327,24 @@ struct SOArmVirtualLeaderTests {
         // `aspectRatio`가 풀 것이 없으므로, 가로를 재서 높이만 계산한다.
         #expect(SOArmTeleopLayout.stageHeight(for: 0) == SOArmTeleopLayout.minimumStageHeight)
         #expect(SOArmTeleopLayout.stageHeight(for: 400) == SOArmTeleopLayout.minimumStageHeight)
-        #expect(SOArmTeleopLayout.stageHeight(for: 1200) == 408)
+        #expect(SOArmTeleopLayout.stageHeight(for: 1200) == 552)
         #expect(SOArmTeleopLayout.stageHeight(for: 1600) > SOArmTeleopLayout.stageHeight(for: 1200))
         // 위로도 한계를 둔다. 이 칸이 창을 다 먹으면 관절 슬라이더가 한 줄도 보이지 않는다.
-        #expect(SOArmTeleopLayout.stageHeight(for: 4000) == 560)
+        #expect(SOArmTeleopLayout.stageHeight(for: 4000) == 760)
+    }
+
+    @Test("카메라도 창을 따라 커진다")
+    func theCamerasGrowWithTheWindowToo() {
+        // 카메라 칸을 고정 폭으로 두었더니 창을 키워도 3D만 자라고 영상은 그대로였다.
+        // 조작하면서 실제로 들여다보는 것은 카메라다.
+        let narrow = SOArmTeleopLayout.cameraColumnWidth(for: 900)
+        let wide = SOArmTeleopLayout.cameraColumnWidth(for: 1600)
+        #expect(wide > narrow)
+        // 아래로는 알아볼 수 있을 만큼, 위로는 3D를 밀어내지 않을 만큼.
+        #expect(SOArmTeleopLayout.cameraColumnWidth(for: 600) == 240)
+        #expect(SOArmTeleopLayout.cameraColumnWidth(for: 4000) == 460)
+        // 폭이 아직 측정되기 전에도 납작해지지 않는다.
+        #expect(SOArmTeleopLayout.cameraColumnWidth(for: 0) == 260)
     }
 
     @Test("게이트는 서로 다른 문구를 요구하고 위험한 쪽을 위험하다고 말한다")

@@ -85,6 +85,15 @@ final class SOArmTeleopModel: ObservableObject {
     var mirror: SOArmLimitMirror { SOArmLimitMirror(spec: status.spec, policy: status.policy) }
     var holdsAuthority: Bool { lease != nil }
 
+    /// 토크에 대해 화면이 할 수 있는 말.
+    ///
+    /// 루프가 돌지 않으면 아무 말도 하지 않는 것이 아니라 **모른다고** 말한다. 팔이
+    /// 힘을 주고 서 있는데 "토크 없음"이라고 적힌 화면을 보고 손을 대면 다친다.
+    var torqueText: String {
+        guard telemetry.torqueKnown else { return "토크 상태 모름 (관찰을 시작하면 확인합니다)" }
+        return telemetry.torqueEnabled ? "토크 걸림" : "토크 없음"
+    }
+
     /// 3D를 만져서 팔이 움직일 수 있는 상태인가.
     var canCommand: Bool { holdsAuthority && state.acceptsMotion }
 
@@ -378,14 +387,26 @@ final class SOArmTeleopModel: ObservableObject {
     func setTarget(_ name: String, _ value: Double) {
         guard let joint = status.spec.first(where: { $0.name == name }) else { return }
         isCommanding = true
-        target[name] = joint.clamp(value)
+        target[name] = clampToSyncWindow(joint, joint.clamp(value))
+    }
+
+    /// 리스를 막 잡았을 때는 첫 목표가 팔의 현재 자세 근처여야 한다.
+    ///
+    /// 서버가 그렇게 요구하는데(`POSE_NOT_SYNCED`), 클라이언트가 그것을 모르면 슬라이더를
+    /// 멀리 던진 순간 명령이 조용히 거절되고 팔은 꿈쩍도 하지 않는다. 실물에서 그 화면을
+    /// 봤다 — 47%로 보냈는데 1.9%에 선 채로 거절만 쌓였다. 거절당할 값을 보내는 대신
+    /// 갈 수 있는 데까지 보내고, 자세가 맞으면 나머지는 다음 명령이 이어 간다.
+    private func clampToSyncWindow(_ joint: SOArmJointSpec, _ value: Double) -> Double {
+        guard lease?.needsSync == true, let present = telemetry.present[joint.name] else { return value }
+        let tolerance = (joint.isPercent ? status.policy.syncTolerancePercent : status.policy.syncToleranceDegrees) * 0.8
+        return min(present + tolerance, max(present - tolerance, value))
     }
 
     /// 여러 관절을 한 번에. 3D 뷰어가 올려 보내는 목표가 여기로 들어온다.
     func setTargets(_ values: [String: Double], commanding: Bool) {
         for (name, value) in values {
             guard let joint = status.spec.first(where: { $0.name == name }) else { continue }
-            target[name] = joint.clamp(value)
+            target[name] = clampToSyncWindow(joint, joint.clamp(value))
         }
         isCommanding = commanding
         if !commanding { syncTargetToArm() }

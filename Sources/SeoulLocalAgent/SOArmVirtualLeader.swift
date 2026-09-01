@@ -182,6 +182,12 @@ struct SOArmTelemetry: Sendable, Equatable {
     var relay = false
     var state = SOArmSafetyState.stopped
     var torqueEnabled = false
+    /// 토크 상태를 **알고 있는가**.
+    ///
+    /// 제어 루프가 돌지 않으면 알 수 없다. 그때 `false`를 그대로 보여 주면 화면은 힘을
+    /// 주고 서 있는 팔을 두고 "토크 없음"이라고 말한다. 서버에서 실제로 그 화면을 봤다 —
+    /// 모터 여섯 개가 전부 켜져 있는데도. 모르는 것은 모른다고 해야 한다.
+    var torqueKnown = false
     var observation = 0
     var loopMilliseconds = 0.0
     var joints: [SOArmJointReading] = []
@@ -203,6 +209,7 @@ struct SOArmTelemetry: Sendable, Equatable {
         relay = json.soarmBool("relay")
         state = SOArmSafetyState(rawValue: json.soarmString("state") ?? "") ?? .stopped
         torqueEnabled = json.soarmBool("torque_enabled")
+        torqueKnown = json.soarmBool("torque_known")
         observation = json.soarmInt("observation") ?? 0
         loopMilliseconds = json.soarmDouble("loop_ms") ?? 0
         joints = (json["joints"] as? [[String: Any]] ?? []).compactMap(SOArmJointReading.init)

@@ -211,11 +211,14 @@ private struct SOArmTeleopWorkspace: View {
     // MARK: 3D와 카메라 (스크롤 위에 고정)
 
     /// 조작하면서 늘 보고 있어야 하는 것들. 넓은 쪽이 3D, 좁은 쪽이 카메라 두 장이다.
+    ///
+    /// 창을 넓히면 **둘 다** 커진다. 처음에는 카메라 칸을 240pt로 못 박아 두었는데, 창을
+    /// 키워도 3D만 자라고 영상은 그대로였다 — 조작하면서 실제로 들여다보는 것은 카메라다.
     private var stageRow: some View {
         HStack(alignment: .top, spacing: Spacing.l) {
             stage
             cameras
-                .frame(width: 240)
+                .frame(width: SOArmTeleopLayout.cameraColumnWidth(for: stageWidth))
         }
         .padding(Spacing.l)
         .frame(height: SOArmTeleopLayout.stageHeight(for: stageWidth))
@@ -328,7 +331,7 @@ private struct SOArmTeleopWorkspace: View {
                             .help("팔로워 serial을 잡고 관절값을 읽기 시작합니다. 토크는 걸지 않으므로 아무것도 움직이지 않습니다")
                     }
                     Spacer()
-                    if model.telemetry.torqueEnabled {
+                    if model.telemetry.torqueEnabled && model.telemetry.torqueKnown {
                         Button("토크 해제…", systemImage: "bolt.slash") { gate = .releaseTorque }
                             .tint(.red)
                             .disabled(model.isBusy)
@@ -344,7 +347,7 @@ private struct SOArmTeleopWorkspace: View {
     private var statusLine: some View {
         let items: [String] = [
             "상태 \(model.state.korean)",
-            model.telemetry.torqueEnabled ? "토크 걸림" : "토크 없음",
+            model.torqueText,
             model.telemetry.running ? String(format: "루프 %.1fms", model.telemetry.loopMilliseconds) : "루프 정지",
         ]
         return Text(items.joined(separator: " · "))
@@ -369,13 +372,25 @@ private struct SOArmTeleopWorkspace: View {
 /// 3D 칸의 크기 계산. 화면에서 떼어 둔 것은 창 폭에 따라 어떤 높이가 나오는지 그림 없이
 /// 확인할 수 있어야 하기 때문이다 — 카메라 카드와 같은 이유다.
 enum SOArmTeleopLayout {
-    static let minimumStageHeight: CGFloat = 320
+    static let minimumStageHeight: CGFloat = 380
 
-    /// 창을 따라 커지되 너무 높아지지는 않는다. 이 칸이 화면을 다 먹으면 관절 슬라이더가
-    /// 한 줄도 보이지 않는 채로 시작한다.
+    /// 창을 따라 커진다. 위쪽 한계는 두되 넉넉하게 — 이 화면에서 제일 오래 보는 것이
+    /// 3D와 카메라이고, 그 아래의 관절 슬라이더는 스크롤하면 된다. 다만 이 칸이 창을
+    /// 통째로 먹으면 슬라이더가 한 줄도 보이지 않은 채로 시작하므로 그 선은 지킨다.
     static func stageHeight(for width: CGFloat) -> CGFloat {
         guard width > 0 else { return minimumStageHeight }
-        return min(560, max((width * 0.34).rounded(), minimumStageHeight))
+        return min(760, max((width * 0.46).rounded(), minimumStageHeight))
+    }
+
+    /// 카메라 두 장이 세로로 쌓이는 칸의 폭.
+    ///
+    /// 고정 폭이 아니라 줄 전체의 몫으로 계산한다. 창을 넓히면 3D와 함께 영상도 커져야
+    /// 한다 — 실제로 손이 무엇을 하고 있는지는 3D가 아니라 카메라가 말해 준다. 아래쪽
+    /// 한계는 카드가 알아볼 수 없을 만큼 작아지지 않게, 위쪽 한계는 카메라가 3D를
+    /// 밀어내지 않게 둔다.
+    static func cameraColumnWidth(for rowWidth: CGFloat) -> CGFloat {
+        guard rowWidth > 0 else { return 260 }
+        return min(460, max((rowWidth * 0.30).rounded(), 240))
     }
 }
 
@@ -493,9 +508,9 @@ private struct SOArmTeleopCameraTile: View {
                     )
                 }
             }
-            .frame(maxWidth: .infinity)
             // 카메라가 내는 4:3 그대로. 비율을 맞춰 두지 않으면 영상 양옆에 빈 띠가 생긴다.
             .aspectRatio(4.0 / 3.0, contentMode: .fit)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .contentCard()
         }
@@ -539,6 +554,25 @@ enum SOArmTeleopGate: String, Identifiable {
     }
 
     var isDangerous: Bool { self == .releaseTorque }
+
+    /// 문구를 손으로 옮겨 적게 할 것인가.
+    ///
+    /// 조작 권한은 한 세션에 여러 번 받는다 — 잠깐 반납했다가 다시 잡고, 멈췄다가 다시
+    /// 시작한다. 그때마다 열세 글자를 치게 하면 게이트가 아니라 통행세가 되고, 통행세는
+    /// 사람을 신중하게 만들지 않는다. 대신 **한 번의 분명한 행동**을 요구한다: 현장을
+    /// 확인했다는 체크 하나와 버튼(또는 Return).
+    ///
+    /// 토크 해제는 그대로 남긴다. 그쪽은 자주 하는 일이 아니고, 잘못 눌리면 팔이 떨어진다.
+    /// 손으로 옮겨 적는 몇 초가 값을 하는 자리는 여기다.
+    var requiresTypedPhrase: Bool { self == .releaseTorque }
+
+    /// 체크박스에 적히는 말. 무엇을 확인했다고 말하는 것인지가 분명해야 한다.
+    var acknowledgement: String {
+        switch self {
+        case .arm: "현장에 사람·장애물·케이블이 없고, 전원 차단 위치를 알고 있습니다"
+        case .releaseTorque: "팔을 받치고 있는 사람이 있습니다"
+        }
+    }
 }
 
 private struct SOArmPhraseGate: View {
@@ -547,8 +581,13 @@ private struct SOArmPhraseGate: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var typed = ""
+    @State private var acknowledged = false
 
-    private var matches: Bool { typed == gate.phrase }
+    /// 서버는 어느 쪽이든 정확한 문구를 요구한다. 달라지는 것은 **사람이 무엇을 하느냐**뿐이다
+    /// — 옮겨 적거나, 확인에 체크하거나.
+    private var matches: Bool {
+        gate.requiresTypedPhrase ? typed == gate.phrase : acknowledged
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
@@ -570,24 +609,32 @@ private struct SOArmPhraseGate: View {
             .foregroundStyle(gate.isDangerous ? .red : .orange)
             .fixedSize(horizontal: false, vertical: true)
 
-            VStack(alignment: .leading, spacing: Spacing.xs) {
-                Text("아래 문구를 손으로 옮겨 적으세요")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(gate.phrase)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.disabled)
-                TextField("", text: $typed)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.body, design: .monospaced))
-                    .autocorrectionDisabled()
+            if gate.requiresTypedPhrase {
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    Text("아래 문구를 손으로 옮겨 적으세요")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(gate.phrase)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.disabled)
+                    TextField("", text: $typed)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .autocorrectionDisabled()
+                }
+            } else {
+                Toggle(gate.acknowledgement, isOn: $acknowledged)
+                    .toggleStyle(.checkbox)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Spacer()
                 Button("취소") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button(gate.title) {
-                    confirm(typed)
+                    // 서버가 요구하는 문구는 그대로 간다. 화면에서 달라진 것은 사람이
+                    // 그것을 옮겨 적느냐, 확인에 체크하느냐뿐이다.
+                    confirm(gate.requiresTypedPhrase ? typed : gate.phrase)
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
