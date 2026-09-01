@@ -399,6 +399,35 @@ struct SOArmVirtualLeaderTests {
         #expect(SOArmServerText.korean("A brand new refusal") == "A brand new refusal")
     }
 
+    @MainActor
+    @Test("안전 자세는 사람이 정해 주고, 정하기 전에는 되돌릴 곳이 없다")
+    func theHomePoseIsTaughtNotGuessed() throws {
+        // 앱이 기본 자세를 고르지 않는다. 이 팔이 어디에 놓여 있는지 앱은 모르고, 모르는
+        // 채로 고른 자세로 팔을 보내는 것은 되돌리기가 아니라 또 하나의 사고다.
+        let key = "soarmTeleopHomePose"
+        let saved = UserDefaults.standard.dictionary(forKey: key)
+        defer {
+            if let saved { UserDefaults.standard.set(saved, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        UserDefaults.standard.removeObject(forKey: key)
+
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "soarm-home-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let model = SOArmTeleopModel(console: SOArmConsoleModel(store: SOArmServerStore(directory: directory)))
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        #expect(model.homePose == nil)
+        #expect(model.distanceFromHome == nil)
+
+        // 팔을 한 번도 읽지 못한 화면에서는 기억할 자세도 없다.
+        model.rememberHomePose()
+        #expect(model.homePose == nil)
+
+        model.forgetHomePose()
+        #expect(model.homePose == nil)
+    }
+
     @Test("멈춰 있을 때는 이유가 실려 있고, 그 이유는 게이트가 보여 줄 수 있다")
     func aStoppedArmCarriesAReadableReason() throws {
         // 권한을 받는 게이트가 이 이유를 함께 보여 준다. 전에는 이유를 지우는 버튼과 권한을

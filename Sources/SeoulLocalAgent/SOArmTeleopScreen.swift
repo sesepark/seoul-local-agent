@@ -343,6 +343,7 @@ private struct SOArmTeleopWorkspace: View {
                             .help("팔이 떨어질 수 있습니다. 받쳐 줄 사람이 있을 때만 하세요")
                     }
                 }
+                homeControls
                 statusLine
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -419,6 +420,58 @@ enum SOArmTeleopLayout {
     /// 위쪽 한계. 이 폭에서 줄 높이가 768pt가 되는데, 그보다 커지면 카메라가 창을 통째로
     /// 먹어 아래쪽 관절 슬라이더가 한 줄도 보이지 않는 채로 시작한다.
     static let maximumCameraColumnWidth: CGFloat = 460
+}
+
+private extension SOArmTeleopWorkspace {
+
+    /// 안전 자세 — 밖에서 팔을 되돌리는 자리.
+    ///
+    /// 자세를 정해 두기 전에는 되돌릴 곳이 없으므로, 그때는 무엇을 해야 하는지만 말한다.
+    /// 기본 자세를 앱이 고르지 않는 이유는 이 팔이 어디에 놓여 있는지 앱이 모르기 때문이다.
+    @ViewBuilder
+    var homeControls: some View {
+        Divider()
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            HStack(spacing: Spacing.s) {
+                if model.isHoming {
+                    Button("되돌리기 중지", systemImage: "stop.fill") { model.stopHoming() }
+                        .tint(.orange)
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("안전 자세로 되돌리기", systemImage: "house") { model.goHome() }
+                        .disabled(!model.canCommand || model.homePose == nil)
+                        .help(model.homePose == nil
+                              ? "먼저 안전 자세를 기억시켜야 합니다"
+                              : "기억해 둔 자세로 천천히 돌아갑니다. 사람이 끄는 것과 같은 길이라 막히면 서버가 세웁니다")
+                }
+                Spacer()
+                Button(model.homePose == nil ? "지금 자세를 안전 자세로 기억" : "안전 자세 다시 정하기",
+                       systemImage: "mappin.and.ellipse") {
+                    model.rememberHomePose()
+                }
+                .disabled(model.telemetry.present.isEmpty)
+                .help("팔 앞에 있을 때, 돌아오고 싶은 자세로 두고 누르세요")
+                if model.homePose != nil {
+                    Button("지우기", systemImage: "xmark") { model.forgetHomePose() }
+                        .labelStyle(.iconOnly)
+                        .help("기억해 둔 안전 자세를 지웁니다")
+                }
+            }
+            Text(homeExplanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    var homeExplanation: String {
+        guard model.homePose != nil else {
+            return "밖에서 팔이 무언가에 박히면 관절을 하나씩 손으로 빼내야 합니다. 팔 앞에 있을 때 돌아오고 싶은 자세로 두고 `지금 자세를 안전 자세로 기억`을 누르면, 그다음부터는 밖에서도 한 번에 그 자세로 돌아옵니다. 앱이 기본 자세를 대신 고르지 않는 이유는 이 팔이 어디에 놓여 있는지 앱이 모르기 때문입니다."
+        }
+        let base = "기억해 둔 자세로 천천히 돌아갑니다. 사람이 3D를 끄는 것과 같은 길이라 막히면 서버가 먼저 세우고, `정지`나 슬라이더로 언제든 끊을 수 있습니다."
+        guard let distance = model.distanceFromHome else { return base }
+        return base + String(format: " 지금 자세와 최대 %.1f 차이입니다.", distance)
+    }
 }
 
 // MARK: - 관절 한 줄

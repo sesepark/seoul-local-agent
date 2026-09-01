@@ -32,6 +32,9 @@ final class SOArmTeleopModel: ObservableObject {
     /// 서버가 방금 거절한 것. 몇 초 뒤 스스로 사라진다.
     @Published private(set) var rejection: String?
     @Published private(set) var isBusy = false
+    /// 안전 자세로 되돌리는 중인가. 그 동안에는 사람이 끄는 것과 똑같은 길로 목표가
+    /// 흐르고, `정지`도 슬라이더도 언제든 그것을 끊는다.
+    @Published private(set) var isHoming = false
 
     /// 3D 뷰어(WKWebView)가 붙어 있는가. 붙기 전에 밀어 넣은 텔레메트리는 버려진다.
     @Published private(set) var isViewerReady = false
@@ -50,6 +53,7 @@ final class SOArmTeleopModel: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
     private var leaseTask: Task<Void, Never>?
+    private var homingTask: Task<Void, Never>?
     /// 리스를 받은 시각. 갓 받은 리스를 낡은 프레임이 지우지 못하게 하는 데 쓴다.
     private var leaseTakenAt = Date.distantPast
     private var reconnectAttempt = 0
@@ -240,6 +244,7 @@ final class SOArmTeleopModel: ObservableObject {
         // 목표만 멀리 떨어진 채 남고, 다시 시작하는 순간 같은 곳으로 다시 밀어 붙는다 —
         // 팔이 책상에 닿아 멈춘 뒤로는 무엇을 눌러도 400ms 만에 또 멈췄다.
         if isCommanding, !value.telemetry.state.acceptsMotion {
+            stopHoming()
             endCommanding()
         }
         if !isCommanding {
@@ -462,6 +467,8 @@ final class SOArmTeleopModel: ObservableObject {
     /// 관절 하나를 옮긴다. 슬라이더와 3D 드래그가 같은 자리로 들어온다.
     func setTarget(_ name: String, _ value: Double) {
         guard let joint = status.spec.first(where: { $0.name == name }) else { return }
+        // 사람이 만지면 사람이 이긴다. 되돌아가는 중이었다면 거기서 멈춘다.
+        stopHoming()
         isCommanding = true
         target[name] = clampToSyncWindow(joint, joint.clamp(value))
     }
@@ -480,12 +487,112 @@ final class SOArmTeleopModel: ObservableObject {
 
     /// 여러 관절을 한 번에. 3D 뷰어가 올려 보내는 목표가 여기로 들어온다.
     func setTargets(_ values: [String: Double], commanding: Bool) {
+        // 되돌아가는 동안에는 3D가 올려 보내는 목표를 듣지 않는다.
+        //
+        // 페이지는 사람이 잡고 있지 않으면 유령을 팔의 실제 자세에 붙여 30Hz로 올려 보낸다.
+        // 그것을 그대로 받으면 되돌리기가 한 걸음 나아갈 때마다 도로 실제 자세로 당겨져,
+        // 실물에서 초당 0.7%씩밖에 가지 못했다. 지금 목표를 정하는 것은 되돌리기다.
+        guard !isHoming else { return }
         for (name, value) in values {
             guard let joint = status.spec.first(where: { $0.name == name }) else { continue }
             target[name] = clampToSyncWindow(joint, joint.clamp(value))
         }
         isCommanding = commanding
         if !commanding { syncTargetToArm() }
+    }
+
+    // MARK: 안전 자세
+
+    /// 사람이 옆에 없을 때 팔을 되돌리는 길.
+    ///
+    /// 밖에서 조작하다 팔이 책상에 박히면, 남는 일은 관절을 하나씩 손으로 끌어 빼내는
+    /// 것뿐이었다. 그것은 정확히 사람이 옆에 없을 때 하고 싶지 않은 일이다.
+    ///
+    /// **새 길을 만들지 않았다.** 여기서 하는 일은 사람이 3D를 끄는 것과 글자 그대로
+    /// 같다 — 목표를 조금씩 옮기고, 서버의 안전 사다리가 그것을 그대로 심사한다. 막히면
+    /// 서버가 세우고, `정지`는 언제나 듣고, 슬라이더를 만지면 사람이 이어받는다. 자동으로
+    /// 하는 것은 "어디로"뿐이다.
+    func goHome() {
+        guard canCommand, let home = homePose, !home.isEmpty else { return }
+        homingTask?.cancel()
+        isHoming = true
+        isCommanding = true
+        homingTask = Task { [weak self] in
+            defer { Task { @MainActor [weak self] in self?.finishHoming() } }
+            // 한 걸음은 서버가 허락하는 한 틱치보다 작게. 크게 잡아도 서버가 자르지만,
+            // 자르는 쪽에 맡기면 화면의 목표와 실제로 나가는 값이 달라진다.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(33))
+                guard let self, !Task.isCancelled, self.canCommand else { return }
+                var arrived = true
+                for joint in self.status.spec {
+                    guard let goal = home[joint.name] else { continue }
+                    let now = self.target[joint.name] ?? self.telemetry.present[joint.name] ?? 0
+                    // 사람이 끄는 것보다 느리게. 되돌리기는 급할 일이 아니고, 천천히
+                    // 가야 무언가에 닿았을 때 사다리가 걸릴 시간이 있다.
+                    let step = self.status.policy.step(for: joint) * 0.25
+                    if abs(goal - now) <= step {
+                        self.target[joint.name] = goal
+                    } else {
+                        self.target[joint.name] = now + (goal > now ? step : -step)
+                        arrived = false
+                    }
+                }
+                if arrived { return }
+            }
+        }
+    }
+
+    func stopHoming() {
+        homingTask?.cancel()
+        homingTask = nil
+        if isHoming { finishHoming() }
+    }
+
+    private func finishHoming() {
+        homingTask = nil
+        isHoming = false
+        endCommanding()
+    }
+
+    /// 되돌아갈 자세. 사람이 팔 앞에서 한 번 정해 준다.
+    ///
+    /// 기본값을 두지 않는다. 이 팔이 어디에 놓여 있는지 — 책상 위인지, 무엇이 옆에 있는지
+    /// — 는 앱이 알 수 없고, 모르는 채로 고른 자세로 팔을 보내는 것은 되돌리기가 아니라
+    /// 또 하나의 사고다. 사람이 팔 앞에 있을 때 안전한 자세로 두고 `지금 자세를 기억`을
+    /// 누르면, 그때부터 밖에서도 한 번에 그 자세로 돌아올 수 있다.
+    var homePose: [String: Double]? {
+        get {
+            guard let raw = UserDefaults.standard.dictionary(forKey: Self.homePoseKey) as? [String: Double],
+                  !raw.isEmpty else { return nil }
+            return raw
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: Self.homePoseKey)
+            objectWillChange.send()
+        }
+    }
+
+    private static let homePoseKey = "soarmTeleopHomePose"
+
+    /// 지금 자세를 안전 자세로 기억한다.
+    func rememberHomePose() {
+        let present = telemetry.present
+        guard !present.isEmpty else { return }
+        homePose = present.mapValues { ($0 * 100).rounded() / 100 }
+    }
+
+    func forgetHomePose() {
+        UserDefaults.standard.removeObject(forKey: Self.homePoseKey)
+        objectWillChange.send()
+    }
+
+    /// 안전 자세에서 얼마나 떨어져 있는가. 되돌릴 것이 있는지 화면이 말할 수 있어야 한다.
+    var distanceFromHome: Double? {
+        guard let home = homePose else { return nil }
+        let present = telemetry.present
+        let gaps = home.compactMap { name, goal in present[name].map { abs(goal - $0) } }
+        return gaps.max()
     }
 
     /// 데드맨. 손을 떼면 목표가 팔의 지금 자리로 붙고 팔은 그 자리에 선다.
@@ -544,6 +651,7 @@ final class SOArmTeleopModel: ObservableObject {
 
     func releaseAuthority() async {
         guard let held = lease else { return }
+        stopHoming()
         lease = nil
         stopLeaseKeepalive()
         pushEnabledToViewer()
@@ -553,6 +661,7 @@ final class SOArmTeleopModel: ObservableObject {
 
     /// 지금 자세에서 세운다. 리스가 없어도, 토큰이 없어도 된다.
     func holdNow() {
+        stopHoming()
         endCommanding()
         perform { client, _ in try await client.hold() }
     }
