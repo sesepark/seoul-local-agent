@@ -99,6 +99,14 @@ struct SeoulLocalAgentApp: App {
         }
         .defaultSize(width: 1120, height: 780)
         .windowResizability(.contentMinSize)
+        // 앱을 열면 창이 뜬다 — 지난번에 닫아 두었더라도.
+        //
+        // `Window` 장면은 열려 있었는지 닫혀 있었는지를 기억한다. 닫은 채로 끝낸 다음
+        // 실행에서는 창이 하나도 없이 떴고, 그때 남는 것은 메뉴 막대 아이콘뿐이다.
+        // 앱은 멀쩡히 돌고 있는데(터널까지 열려 있었다) 화면에는 아무것도 없으니,
+        // 사용자가 할 수 있는 일은 메뉴 막대를 찾아 `앱 열기`를 누르는 것뿐이었다.
+        // 창이 하나뿐인 앱에서 그 기억은 도움이 되지 않는다.
+        .restorationBehavior(.disabled)
         .commands { AppCommands(controller: controller) }
 
         MenuBarExtra {

@@ -24,13 +24,16 @@ struct SOArmVirtualLeaderTests {
          "min": 0.0, "max": 100.0, "urdf_joint": "gripper",
          "urdf_sign": 1.0, "radians_per_unit": 0.0174533}
       ],
-      "policy": {"hz": 30, "step_deg": 2.0, "step_percent": 3.0,
-                 "command_timeout_ms": 300, "command_valid_ms": 500,
+      "policy": {"hz": 30, "max_deg_per_s": 90.0, "max_percent_per_s": 110.0,
+                 "lead_deg": 12.0, "lead_percent": 12.0,
+                 "step_deg": 12.0, "step_percent": 12.0,
+                 "command_timeout_ms": 300, "command_hold_ms": 1500,
+                 "command_valid_ms": 500,
                  "lease_ttl_ms": 5000, "heartbeat_ms": 1000,
-                 "sync_tolerance_deg": 6.0, "sync_tolerance_percent": 10.0,
-                 "load_trip": 400, "load_trip_ms": 300, "current_trip": 108,
-                 "current_trip_ms": 300, "following_error_deg": 12.0,
-                 "following_error_ms": 400, "temperature_warn_c": 55,
+                 "sync_tolerance_deg": 10.0, "sync_tolerance_percent": 15.0,
+                 "load_trip": 550, "load_trip_ms": 400, "current_trip": 0,
+                 "current_trip_ms": 300, "following_error_deg": 8.0,
+                 "following_error_ms": 600, "temperature_warn_c": 58,
                  "temperature_trip_c": 65, "retreat_deg": 4.0},
       "arm_confirmation_length": 13,
       "viewer_url": "/viewer/",
@@ -42,16 +45,18 @@ struct SOArmVirtualLeaderTests {
       "torque_known": true,
       "observation": 27512,
       "loop_ms": 4.43,
+      "speed_ticks": {"shoulder_pan": 1024, "elbow_flex": 1024, "gripper": 1588},
+      "command_stalled": false,
       "joints": [
         {"name": "shoulder_pan", "present": -44.922, "goal": -44.922, "load": 77.2,
-         "current": 21.9, "temperature": 32.0, "rate_limited": false},
-        {"name": "elbow_flex", "present": 8.0, "goal": 51.8, "load": 520.0,
-         "current": 140.0, "temperature": 58.0, "rate_limited": true},
-        {"name": "gripper", "present": 41.0, "goal": 41.0, "load": 12.0,
-         "current": 4.0, "temperature": 46.0, "rate_limited": false}
+         "current": 21.9, "temperature": 32.0, "rate_limited": false, "at_limit": false},
+        {"name": "elbow_flex", "present": 8.0, "goal": 51.8, "load": 560.0,
+         "current": 140.0, "temperature": 58.0, "rate_limited": true, "at_limit": false},
+        {"name": "gripper", "present": 0.4, "goal": 0.4, "load": 12.0,
+         "current": 4.0, "temperature": 46.0, "rate_limited": false, "at_limit": true}
       ],
       "fault": {"code": "OVERLOAD", "joint": "elbow_flex",
-                "message": "팔꿈치의 부하가 300ms 넘게 520(문턱 400)입니다", "at": 1788195000.0},
+                "message": "팔꿈치의 부하가 400ms 넘게 560(문턱 550)입니다", "at": 1788195000.0},
       "warnings": [{"joint": "elbow_flex", "code": "OVER_TEMPERATURE", "message": "팔꿈치 58°C"}],
       "lease": {"lease_id": "426136b635229aff", "holder": "맥북", "session_id": "mac-1",
                 "scope": "follower_motion", "needs_sync": true, "expires_in_ms": 4800},
@@ -162,12 +167,14 @@ struct SOArmVirtualLeaderTests {
         // 리스를 막 잡았는데 현재 자세에서 멀다 → POSE_NOT_SYNCED.
         #expect(mirror.verdict(for: "elbow_flex", target: 40, present: 0, needsSync: true) == .notSynced)
         // 같은 값이라도 자세가 이미 맞았으면 거절이 아니라 "잘라서 따라간다"이다.
+        // 잘리는 것은 **속도가 아니라 힘**이다 — 목표가 `lead_deg`(12°)보다 멀리 앞서면
+        // 그만큼만 앞세워 쓰고, 팔은 서보의 속도 상한으로 거기까지 간다.
         #expect(mirror.verdict(for: "elbow_flex", target: 40, present: 0, needsSync: false) == .rateLimited)
         #expect(mirror.verdict(for: "elbow_flex", target: 1, present: 0, needsSync: false) == .fine)
-        // 집게는 단위가 달라 허용 폭도 다르다. 자세 동기화는 퍼센트 10까지 봐 주지만
-        // 틱당 변화량은 퍼센트 3이라, 그 사이의 값은 거절이 아니라 잘라서 따라가는 쪽이다.
+        // 집게는 단위가 달라 허용 폭도 다르다. 자세 동기화는 퍼센트 15까지 봐 주고
+        // 앞서는 거리는 퍼센트 12라, 그 사이의 값은 거절이 아니라 잘라서 따라가는 쪽이다.
         #expect(mirror.verdict(for: "gripper", target: 43, present: 41, needsSync: true) == .fine)
-        #expect(mirror.verdict(for: "gripper", target: 50, present: 41, needsSync: true) == .rateLimited)
+        #expect(mirror.verdict(for: "gripper", target: 55, present: 41, needsSync: true) == .rateLimited)
         #expect(mirror.verdict(for: "gripper", target: 60, present: 41, needsSync: true) == .notSynced)
     }
 
@@ -177,10 +184,10 @@ struct SOArmVirtualLeaderTests {
         let mirror = SOArmLimitMirror(spec: status.spec, policy: status.policy)
         let elbow = try #require(status.telemetry.joints.first { $0.name == "elbow_flex" })
         let pan = try #require(status.telemetry.joints.first { $0.name == "shoulder_pan" })
-        // 520은 문턱 400을 넘었으므로 가득 찬다. 넘겨도 1을 넘지 않는다.
+        // 560은 문턱 550을 넘었으므로 가득 찬다. 넘겨도 1을 넘지 않는다.
         #expect(mirror.loadFraction(elbow) == 1.0)
-        #expect(abs(mirror.loadFraction(pan) - 77.2 / 400) < 0.001)
-        #expect(mirror.isHot(elbow))          // 58°C ≥ 경고 55°C
+        #expect(abs(mirror.loadFraction(pan) - 77.2 / 550) < 0.001)
+        #expect(mirror.isHot(elbow))          // 58°C ≥ 경고 58°C
         #expect(mirror.isHot(pan) == false)   // 32°C
     }
 
@@ -447,6 +454,104 @@ struct SOArmVirtualLeaderTests {
         let moving = Self.statusJSON.replacingOccurrences(of: "\"state\": \"HOLD\"", with: "\"state\": \"READY\"")
         let ready = try SOArmVirtualLeaderStatus.parse(Data(moving.utf8))
         #expect(ready.telemetry.state.needsAcknowledgement == false)
+    }
+
+    // MARK: 속도와 힘이 갈라진 뒤
+
+    @Test("속도는 서보가 지키고, 앞서는 거리는 힘만 정한다")
+    func speedAndForceAreSeparateNow() throws {
+        let policy = try Self.status().policy
+        // 예전에는 이 둘이 한 값이었다. `step_deg`가 최대 속도(step × hz)이면서 동시에
+        // 서보가 보는 위치 오차 — 곧 힘 — 이었고, 그래서 안전하게 낮추면 어깨가 팔을
+        // 들지 못했다. 이제 서로 다른 값이다.
+        #expect(policy.maxDegreesPerSecond == 90)
+        #expect(policy.leadDegrees == 12)
+        // 그리고 그 값이 실제로 서보 안에 들어갔는지 되읽은 값으로 확인할 수 있다.
+        // 눈금 하나가 360/4096도이므로 1024칸은 90°/s다.
+        let ticks = try #require(try Self.status().telemetry.speedTicks["elbow_flex"])
+        #expect(abs(Double(ticks) * 360.0 / 4096.0 - policy.maxDegreesPerSecond) < 1)
+    }
+
+    @Test("옛 이름만 아는 서버에 붙어도 화면이 기본값을 실제인 척하지 않는다")
+    func anOlderServerStillFillsTheFeel() throws {
+        // 앱이 서버보다 먼저 올라가는 경우가 있다. 그때 `lead_deg`는 없고 `step_deg`만
+        // 오는데, 그 값을 버리고 기본값을 그리면 화면이 서버와 다른 말을 하게 된다.
+        let old = """
+        {"policy": {"hz": 30, "step_deg": 5.5, "step_percent": 4.0}, "joints": []}
+        """
+        let status = try SOArmVirtualLeaderStatus.parse(Data(old.utf8))
+        #expect(status.policy.leadDegrees == 5.5)
+        #expect(status.policy.leadPercent == 4.0)
+    }
+
+    @Test("전류 문턱이 꺼져 있으면 그것으로 색칠하지 않는다")
+    func aDisabledCurrentTripIsNotATrip() throws {
+        // 이 하드웨어에서 `Present_Current`는 부하가 300을 넘는 순간에도 0~3칸에 머문다.
+        // 그래서 서버가 그 칸을 꺼 두는데(문턱 0), 화면이 `0 >= 0`으로 견주면 모든 관절이
+        // 언제나 빨갛게 된다 — 늘 빨간 화면은 아무것도 말해 주지 않는다.
+        let status = try Self.status()
+        #expect(status.policy.currentTrip == 0)
+    }
+
+    @Test("끝에 닿아 선 관절과 막혀서 선 관절은 다른 일이다")
+    func reachingTheEndOfTravelIsNotAFault() throws {
+        let telemetry = try Self.status().telemetry
+        let gripper = try #require(telemetry.joints.first { $0.name == "gripper" })
+        let elbow = try #require(telemetry.joints.first { $0.name == "elbow_flex" })
+        // 집게는 자기 끝에 닿았다. 고장이 아니라 기하학이고, 서버는 그저 미는 것을
+        // 그만둔다 — 사람에게 확인을 요구하지 않는다.
+        #expect(gripper.atLimit)
+        #expect(!elbow.atLimit)
+        // 멈춘 이유는 여전히 팔꿈치의 과부하다.
+        #expect(telemetry.fault?.joint == "elbow_flex")
+    }
+
+    @Test("명령이 잠깐 끊긴 것과 자세 유지는 화면에서도 다르다")
+    func aShortGapIsNotAHold() throws {
+        #expect(try Self.status().telemetry.commandStalled == false)
+        let stalled = Self.statusJSON.replacingOccurrences(
+            of: "\"command_stalled\": false", with: "\"command_stalled\": true"
+        )
+        let paused = try SOArmVirtualLeaderStatus.parse(Data(stalled.utf8))
+        #expect(paused.telemetry.commandStalled)
+        // 그리고 그것은 확인을 요구하는 상태가 아니다 — 명령이 다시 오면 이어진다.
+        let moving = stalled.replacingOccurrences(of: "\"state\": \"HOLD\"", with: "\"state\": \"ACTIVE\"")
+        let active = try SOArmVirtualLeaderStatus.parse(Data(moving.utf8))
+        #expect(active.telemetry.state.needsAcknowledgement == false)
+        #expect(active.telemetry.commandStalled)
+    }
+
+    @Test("조작감은 이름으로 고른다")
+    func theFeelIsChosenByName() throws {
+        let json = """
+        {"policy": {"max_deg_per_s": 45.0, "lead_deg": 8.0},
+         "profile": "gentle",
+         "profiles": [
+           {"name": "gentle", "title": "조심", "detail": "천천히 움직이고 조금만 막혀도 섭니다.",
+            "values": {"max_deg_per_s": 45.0}},
+           {"name": "normal", "title": "보통", "detail": "평소 조작에 맞춘 값입니다.",
+            "values": {"max_deg_per_s": 90.0}}
+         ],
+         "tunable": {"lead_deg": {"min": 3.0, "max": 25.0, "integer": false}}}
+        """
+        let answer = SOArmPolicyAnswer(
+            try #require(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        )
+        #expect(answer.profile == "gentle")
+        #expect(answer.profiles.map(\.title) == ["조심", "보통"])
+        #expect(answer.ranges["lead_deg"]?.maximum == 25)
+        // 값을 하나 손으로 옮기면 어느 조작감도 아니게 된다. 그때 화면이 세 칸 중 하나를
+        // 켜 두면 실제와 다른 말을 한다.
+        let tuned = SOArmPolicyAnswer(["policy": ["lead_deg": 9.5], "profile": NSNull()])
+        #expect(tuned.profile == nil)
+    }
+
+    @Test("조작 방식은 둘이고, 어느 쪽이든 나가는 것은 관절 절대 목표 하나다")
+    func bothControlModesEndInTheSameCommand() {
+        #expect(SOArmControlMode.allCases.map(\.title) == ["관절", "끝점"])
+        #expect(SOArmControlMode(rawValue: "endpoint") == .endpoint)
+        // 모르는 값이 저장되어 있어도 화면이 비지 않는다.
+        #expect(SOArmControlMode(rawValue: "wrist") == nil)
     }
 }
 #endif

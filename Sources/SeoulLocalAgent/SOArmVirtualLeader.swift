@@ -56,17 +56,32 @@ struct SOArmJointSpec: Sendable, Equatable, Identifiable {
 /// 워치독이 걸리는지를 사람에게 말해 주는 데 쓴다.
 struct SOArmSafetyPolicy: Sendable, Equatable {
     var hz = 30
-    var stepDegrees = 2.0
-    var stepPercent = 3.0
+    /// 팔이 낼 수 있는 최대 속도. **서보 자신이** 지킨다 — 서버가 STS3215의
+    /// `Goal_Velocity` 레지스터에 써 넣으면 서보 안의 궤적 생성기가 목표까지 그 속도로
+    /// 미끄러진다. 그래서 명령을 얼마나 자주 보내는지와 무관하고, 느린 연결에서도
+    /// 팔이 느려지지 않는다.
+    var maxDegreesPerSecond = 90.0
+    var maxPercentPerSecond = 110.0
+    /// 목표가 실제 위치보다 앞설 수 있는 거리 = **막혔을 때 내는 힘**.
+    ///
+    /// 예전에는 이 값 하나가 속도와 힘을 함께 정했다. STS3215는 위치 P 제어라 힘이
+    /// 위치 오차에 비례하기 때문이고, 그래서 안전하게 낮추면 어깨가 팔을 들지 못했다.
+    /// 속도를 서보에게 맡기고 나서 둘이 갈라졌다 — 이제 이 값은 힘만 정한다.
+    var leadDegrees = 12.0
+    var leadPercent = 12.0
+    /// 명령이 이만큼 끊기면 팔이 지금 자리에 선다. **아직 HOLD는 아니다.**
     var commandTimeoutMs = 300
+    /// 그 침묵이 이만큼 이어지면 그때 HOLD다. 사람이 확인해야 풀린다.
+    var commandHoldMs = 1500
     var leaseTTLMs = 5000
     var heartbeatMs = 1000
-    var syncToleranceDegrees = 6.0
-    var syncTolerancePercent = 10.0
-    var loadTrip = 400.0
-    var currentTrip = 108.0
-    var followingErrorDegrees = 12.0
-    var temperatureWarnC = 55.0
+    var syncToleranceDegrees = 10.0
+    var syncTolerancePercent = 15.0
+    var loadTrip = 550.0
+    var currentTrip = 0.0
+    var followingErrorDegrees = 8.0
+    var followingErrorMs = 600
+    var temperatureWarnC = 58.0
     var temperatureTripC = 65.0
     var retreatDegrees = 4.0
 
@@ -74,9 +89,14 @@ struct SOArmSafetyPolicy: Sendable, Equatable {
 
     init(_ json: [String: Any]) {
         hz = json.soarmInt("hz") ?? hz
-        stepDegrees = json.soarmDouble("step_deg") ?? stepDegrees
-        stepPercent = json.soarmDouble("step_percent") ?? stepPercent
+        // 옛 이름(`step_deg`)도 읽는다. 앱이 서버보다 먼저 올라가는 경우가 있고, 그때
+        // 화면이 기본값을 실제인 것처럼 그리는 것보다는 옛 이름이라도 맞는 편이 낫다.
+        leadDegrees = json.soarmDouble("lead_deg") ?? json.soarmDouble("step_deg") ?? leadDegrees
+        leadPercent = json.soarmDouble("lead_percent") ?? json.soarmDouble("step_percent") ?? leadPercent
+        maxDegreesPerSecond = json.soarmDouble("max_deg_per_s") ?? maxDegreesPerSecond
+        maxPercentPerSecond = json.soarmDouble("max_percent_per_s") ?? maxPercentPerSecond
         commandTimeoutMs = json.soarmInt("command_timeout_ms") ?? commandTimeoutMs
+        commandHoldMs = json.soarmInt("command_hold_ms") ?? commandHoldMs
         leaseTTLMs = json.soarmInt("lease_ttl_ms") ?? leaseTTLMs
         heartbeatMs = json.soarmInt("heartbeat_ms") ?? heartbeatMs
         syncToleranceDegrees = json.soarmDouble("sync_tolerance_deg") ?? syncToleranceDegrees
@@ -84,12 +104,34 @@ struct SOArmSafetyPolicy: Sendable, Equatable {
         loadTrip = json.soarmDouble("load_trip") ?? loadTrip
         currentTrip = json.soarmDouble("current_trip") ?? currentTrip
         followingErrorDegrees = json.soarmDouble("following_error_deg") ?? followingErrorDegrees
+        followingErrorMs = json.soarmInt("following_error_ms") ?? followingErrorMs
         temperatureWarnC = json.soarmDouble("temperature_warn_c") ?? temperatureWarnC
         temperatureTripC = json.soarmDouble("temperature_trip_c") ?? temperatureTripC
         retreatDegrees = json.soarmDouble("retreat_deg") ?? retreatDegrees
     }
 
-    func step(for spec: SOArmJointSpec) -> Double { spec.isPercent ? stepPercent : stepDegrees }
+    /// 이 관절이 한 번에 앞설 수 있는 거리.
+    func lead(for spec: SOArmJointSpec) -> Double { spec.isPercent ? leadPercent : leadDegrees }
+    /// 이 관절의 최대 속도(단위/초).
+    func speed(for spec: SOArmJointSpec) -> Double {
+        spec.isPercent ? maxPercentPerSecond : maxDegreesPerSecond
+    }
+}
+
+/// 사람이 고르는 조작감 하나. 숫자는 서버가 들고 있고 앱은 이름과 설명만 그린다.
+struct SOArmFeelProfile: Sendable, Equatable, Identifiable {
+    var name: String
+    var title: String
+    var detail: String
+
+    var id: String { name }
+
+    init?(_ json: [String: Any]) {
+        guard let name = json.soarmString("name") else { return nil }
+        self.name = name
+        self.title = json.soarmString("title") ?? name
+        self.detail = json.soarmString("detail") ?? ""
+    }
 }
 
 // MARK: - 상태
@@ -161,6 +203,12 @@ struct SOArmJointReading: Sendable, Equatable, Identifiable {
     var current: Double
     var temperature: Double
     var rateLimited: Bool
+    /// 자기 가동 범위의 끝에 닿아 선 관절.
+    ///
+    /// 고장이 아니라 기하학이다. 집게를 끝까지 닫으면 팔은 거기서 서고 그것이 정상이다.
+    /// 서버는 그때 미는 것을 그만두므로(모터가 계속 뜨거워지지 않게) 화면도 "막혔다"가
+    /// 아니라 "더 갈 곳이 없다"고 말해야 한다.
+    var atLimit: Bool
 
     var id: String { name }
 
@@ -173,6 +221,7 @@ struct SOArmJointReading: Sendable, Equatable, Identifiable {
         self.current = json.soarmDouble("current") ?? 0
         self.temperature = json.soarmDouble("temperature") ?? 0
         self.rateLimited = json.soarmBool("rate_limited")
+        self.atLimit = json.soarmBool("at_limit")
     }
 }
 
@@ -196,6 +245,12 @@ struct SOArmTelemetry: Sendable, Equatable {
     var error: String?
     var commandAgeMs: Int?
     var warnings: [String] = []
+    /// 명령이 잠깐 끊겨 팔이 선 상태. **HOLD와 다르다** — 확인을 요구하지 않고, 명령이
+    /// 다시 오면 그대로 이어진다. 둘을 같게 말하면 사람은 멀쩡한 상태에서 버튼을 찾는다.
+    var commandStalled = false
+    /// 서보가 실제로 들고 있는 속도 상한(눈금/초). 우리가 부탁한 값이 아니라 되읽은
+    /// 값이다 — "속도 상한이 걸렸다"고 말하려면 그 근거가 팔에서 와야 한다.
+    var speedTicks: [String: Int] = [:]
 
     /// 관절 이름 → 실제 값.
     var present: [String: Double] {
@@ -218,6 +273,10 @@ struct SOArmTelemetry: Sendable, Equatable {
         error = json.soarmString("error")
         commandAgeMs = json.soarmInt("command_age_ms")
         warnings = (json["warnings"] as? [[String: Any]] ?? []).compactMap { $0.soarmString("message") }
+        commandStalled = json.soarmBool("command_stalled")
+        speedTicks = (json["speed_ticks"] as? [String: Any] ?? [:]).compactMapValues {
+            ($0 as? NSNumber)?.intValue
+        }
     }
 }
 
@@ -255,6 +314,36 @@ struct SOArmTunableRange: Sendable, Equatable {
     var minimum: Double
     var maximum: Double
     var isInteger: Bool
+}
+
+/// `/api/vleader/policy` 한 번의 답.
+///
+/// 값과 난간만이 아니라 **지금 어느 조작감인가**를 함께 담는다. 값을 하나라도 손으로
+/// 옮겨 두면 어느 조작감도 아니게 되고, 그때 화면이 세 칸 중 하나를 켜 두면 실제와
+/// 다른 말을 하게 된다.
+struct SOArmPolicyAnswer: Sendable, Equatable {
+    var values: [String: Double] = [:]
+    var ranges: [String: SOArmTunableRange] = [:]
+    var profiles: [SOArmFeelProfile] = []
+    var profile: String?
+
+    init() {}
+
+    init(_ json: [String: Any]) {
+        for (name, raw) in (json["policy"] as? [String: Any]) ?? [:] {
+            if let number = raw as? NSNumber { values[name] = number.doubleValue }
+        }
+        for (name, raw) in (json["tunable"] as? [String: Any]) ?? [:] {
+            guard let entry = raw as? [String: Any],
+                  let low = (entry["min"] as? NSNumber)?.doubleValue,
+                  let high = (entry["max"] as? NSNumber)?.doubleValue else { continue }
+            ranges[name] = SOArmTunableRange(
+                minimum: low, maximum: high, isInteger: (entry["integer"] as? Bool) ?? false
+            )
+        }
+        profiles = (json["profiles"] as? [[String: Any]] ?? []).compactMap(SOArmFeelProfile.init)
+        profile = json.soarmString("profile")
+    }
 }
 
 /// 서버가 preflight로 돌려주는 영어 한 줄을, 무엇을 해야 하는지로 옮긴다.
@@ -337,8 +426,27 @@ struct SOArmVirtualLeaderClient: Sendable {
         _ = try await send("api/vleader/lease/\(id)", method: "DELETE", token: true, timeout: 10)
     }
 
-    /// 서버가 지금 쓰고 있는 안전·조작 값과, 그중 화면에서 바꿀 수 있는 것들의 범위.
-    func policy() async throws -> (values: [String: Double], ranges: [String: SOArmTunableRange]) {
+    /// 서버가 지금 쓰고 있는 안전·조작 값, 고를 수 있는 조작감, 그리고 난간.
+    func policy() async throws -> SOArmPolicyAnswer {
+        let data = try await send("api/vleader/policy", method: "GET", token: false, timeout: 10)
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw SOArmError.badResponse("정책을 읽지 못했습니다")
+        }
+        return SOArmPolicyAnswer(json)
+    }
+
+    /// 조작감 하나를 고른다. 속도·힘·민감도가 함께 옮겨 간다.
+    func setFeel(_ profile: String) async throws -> SOArmPolicyAnswer {
+        let data = try await send(
+            "api/vleader/policy", method: "POST", body: ["profile": profile], token: true, timeout: 15
+        )
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw SOArmError.badResponse("정책 응답을 읽지 못했습니다")
+        }
+        return SOArmPolicyAnswer(json)
+    }
+
+    private func legacyPolicy() async throws -> (values: [String: Double], ranges: [String: SOArmTunableRange]) {
         let data = try await send("api/vleader/policy", method: "GET", token: false, timeout: 10)
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw SOArmError.badResponse("정책을 읽지 못했습니다")
@@ -359,7 +467,7 @@ struct SOArmVirtualLeaderClient: Sendable {
         return (values, ranges)
     }
 
-    /// 바꾼 값을 보낸다. 서버가 그 자리에서 적용하고 `config/soarm.env`에도 남긴다.
+    /// 값 하나하나를 바꾼다. 화면의 `고급`이 쓰는 길이다.
     func setPolicy(_ values: [String: Double]) async throws -> [String: Double] {
         let data = try await send(
             "api/vleader/policy", method: "POST", body: ["values": values], token: true, timeout: 15
@@ -471,7 +579,7 @@ struct SOArmLimitMirror: Sendable {
             let tolerance = joint.isPercent ? policy.syncTolerancePercent : policy.syncToleranceDegrees
             if abs(target - present) > tolerance { return .notSynced }
         }
-        if abs(target - present) > policy.step(for: joint) { return .rateLimited }
+        if abs(target - present) > policy.lead(for: joint) { return .rateLimited }
         return .fine
     }
 

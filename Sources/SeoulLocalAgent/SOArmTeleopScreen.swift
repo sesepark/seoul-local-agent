@@ -21,6 +21,8 @@ private struct SOArmTeleopWorkspace: View {
     @Environment(\.openSettings) private var openSettings
     @State private var gate: SOArmTeleopGate?
     @State private var stageWidth: CGFloat = 0
+    /// 앞뒤 손잡이의 자리. 놓으면 0으로 돌아온다.
+    @State private var depth: Double = 0
 
     /// 이 화면만 `WorkspaceScreen`의 스크롤 안에 전부 담지 않는다.
     ///
@@ -234,12 +236,72 @@ private struct SOArmTeleopWorkspace: View {
     /// 지금 그리고 있는 자세가 실제 팔의 자세인 것처럼 말하게 된다.
     private var stageCaption: String {
         if !model.telemetry.running { return "관찰을 시작하기 전이라 3D는 실제 자세를 모릅니다" }
-        if model.canCommand { return "끌어서 움직이세요 · 손을 떼면 그 자리에 섭니다" }
+        if model.canCommand {
+            return model.controlMode == .endpoint
+                ? "집게 끝을 끌어 옮기세요 · 손을 떼면 그 자리에 섭니다"
+                : "팔의 마디를 집어 끌어 움직이세요 · 손을 떼면 그 자리에 섭니다"
+        }
         return "보기 전용입니다 · 조작하려면 권한을 받으세요"
+    }
+
+    /// 조작 방식과, `끝점`일 때만 필요한 시점 단추들.
+    ///
+    /// 시점 단추를 관절 모드에서도 보여 주지 않는 이유가 있다. 그때는 화면을 손가락으로
+    /// 돌리는 것이 곧 시점 조작이라 단추가 할 일이 없고, 있으면 사람은 두 방법 가운데
+    /// 어느 것이 맞는지 매번 고르게 된다.
+    private var modeBar: some View {
+        HStack(spacing: Spacing.m) {
+            Picker("조작 방식", selection: Binding(
+                get: { model.controlMode },
+                set: { model.setControlMode($0) }
+            )) {
+                ForEach(SOArmControlMode.allCases, id: \.self) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 160)
+
+            if model.controlMode == .endpoint {
+                HStack(spacing: Spacing.xs) {
+                    Button { model.turnView(-1) } label: { Image(systemName: "arrow.counterclockwise") }
+                        .help("시점을 왼쪽으로 90° 돌립니다")
+                    Button { model.turnView(0) } label: { Text("앞").font(.caption) }
+                        .help("정면으로 되돌립니다")
+                    Button { model.turnView(1) } label: { Image(systemName: "arrow.clockwise") }
+                        .help("시점을 오른쪽으로 90° 돌립니다")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!model.isViewerReady)
+
+                // 앞뒤. 화면 평면만으로는 깊이를 정할 수 없다. 놓으면 가운데로 돌아오는
+                // 손잡이라 손가락과 같은 성질을 갖는다 — 놓으면 팔이 선다.
+                HStack(spacing: Spacing.xs) {
+                    Text("앞뒤").font(.caption2).foregroundStyle(.tertiary)
+                    Slider(value: Binding(
+                        get: { depth },
+                        set: { depth = $0; model.setDepth($0) }
+                    ), in: -1...1) { editing in
+                        if !editing {
+                            depth = 0
+                            model.setDepth(0)
+                            model.endCommanding()
+                        }
+                    }
+                    .frame(width: 130)
+                    .tint(.snuBlue)
+                    .disabled(!model.canCommand)
+                }
+            }
+            Spacer()
+        }
     }
 
     private var stage: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
+            modeBar
             HStack(spacing: Spacing.s) {
                 Text("3D").font(.caption2).foregroundStyle(.tertiary)
                 if let viewerError = model.viewerError {
@@ -351,14 +413,24 @@ private struct SOArmTeleopWorkspace: View {
     }
 
     private var statusLine: some View {
-        let items: [String] = [
-            "상태 \(model.state.korean)",
-            model.torqueText,
-            model.telemetry.running ? String(format: "루프 %.1fms", model.telemetry.loopMilliseconds) : "루프 정지",
-        ]
+        var items: [String] = ["상태 \(model.state.korean)"]
+        // 명령이 잠깐 끊겨 선 것은 자세 유지(HOLD)와 다르다. 확인을 요구하지 않고 명령이
+        // 다시 오면 그대로 이어지는데, 둘을 같게 적으면 사람은 멀쩡한 상태에서 누를
+        // 버튼을 찾게 된다.
+        if model.telemetry.commandStalled { items.append("명령 끊김 · 대기 중") }
+        items.append(model.torqueText)
+        if model.telemetry.running {
+            items.append(String(format: "루프 %.1fms", model.telemetry.loopMilliseconds))
+            // 속도 상한이 **정말로** 서보에 들어갔는가. 부탁한 값이 아니라 되읽은 값이다.
+            if let ticks = model.telemetry.speedTicks["elbow_flex"] {
+                items.append(String(format: "속도 상한 %.0f°/s", Double(ticks) * 360.0 / 4096.0))
+            }
+        } else {
+            items.append("루프 정지")
+        }
         return Text(items.joined(separator: " · "))
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(model.telemetry.commandStalled ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
     }
 
     private var safetyNote: some View {
@@ -509,6 +581,14 @@ private struct SOArmJointRow: View {
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(divergence == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
                     .frame(width: 116, alignment: .trailing)
+                // 가동 범위의 끝에 닿아 선 관절. 고장이 아니므로 배너를 띄우지 않는다 —
+                // 집게를 끝까지 닫을 때마다 배너가 뜨면 그것은 알림이 아니라 소음이다.
+                // 대신 이 자리에 한 글자로 적고, 서버는 그 관절을 그만 민다.
+                Text(atLimit ? "끝" : "")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 18, alignment: .leading)
+                    .help("이 관절은 갈 수 있는 데까지 갔습니다. 서버가 더 밀지 않으므로 모터도 힘을 쓰지 않습니다.")
             }
             HStack(spacing: Spacing.s) {
                 loadBar
@@ -544,16 +624,20 @@ private struct SOArmJointRow: View {
             .frame(width: 190, alignment: .trailing)
             .help("""
                 부하: 모터가 목표를 향해 내고 있는 힘입니다. 서보 자신의 눈금(0~1000)이고 \
-                단위가 없습니다. 실측으로 자유롭게 움직일 때 24~100, 무언가에 막히면 \
-                48~130까지 올라갑니다.
-                전류: 모터가 쓰는 전류입니다. 서보 눈금 한 칸이 약 6.5mA인데, 이 팔에서는 \
-                버티고 있을 때도 0~3칸(0~20mA)에 머물러 거의 움직이지 않습니다.
+                단위가 없습니다. 실측(2026-09-02)으로 움직이는 중에는 250~420까지 오르고, \
+                자세를 유지할 때는 30 안팎에 머무릅니다. 서보 자신은 800에서 토크를 \
+                20%로 떨어뜨리고, 서버는 그 전에 \(Int(policy.loadTrip))에서 세웁니다.
+                전류: 이 팔에서는 쓰지 않습니다. 여섯 관절 모두 부하가 300을 넘는 순간에도 \
+                판독값이 0~3칸에 머물러, 힘을 말해 주지 않았습니다. 그래서 전류로 세우는 \
+                칸은 꺼 두었습니다 — 걸릴 수 없는 검사를 남겨 두면 화면이 보호가 한 겹 \
+                더 있다고 말하게 됩니다.
                 온도: 모터 온도입니다. \(Int(policy.temperatureWarnC))°C부터 주황, \
                 \(Int(policy.temperatureTripC))°C에서 서버가 세웁니다.
-                팔을 세우는 것은 부하·전류 문턱(\(Int(policy.loadTrip))·\(Int(policy.currentTrip)))이 \
-                아닙니다 — 이 팔에서는 그 값에 닿지 않습니다. 실제로 세우는 것은 둘입니다: \
-                목표를 \(policy.commandTimeoutMs + 100)ms 넘게 따라가지 못할 때, 그리고 \
-                밀고 있는데 제자리인 채 부하가 높을 때.
+                팔을 실제로 세우는 것은 셋입니다: 목표를 \(policy.followingErrorMs)ms 넘게 \
+                \(Int(policy.followingErrorDegrees))° 이상 따라가지 못할 때, 밀고 있는데 \
+                제자리인 채 부하가 높을 때, 그리고 부하가 \(Int(policy.loadTrip))을 넘길 때.
+                관절이 자기 가동 범위 끝에 닿아 선 것은 여기에 들지 않습니다 — 그때는 \
+                고장이 아니라 기하학이라, 서버가 미는 것을 그만두고 `끝`이라고만 적습니다.
                 """)
         }
     }
@@ -562,13 +646,16 @@ private struct SOArmJointRow: View {
     private var readoutTint: AnyShapeStyle {
         guard let reading else { return AnyShapeStyle(.secondary) }
         let policy = model.status.policy
+        // 전류 문턱이 0이면 그 검사는 꺼져 있다는 뜻이다. 그대로 견주면 `0 >= 0`이라
+        // 모든 관절이 언제나 빨갛게 된다 — 늘 빨간 화면은 아무것도 말해 주지 않는다.
+        let watchesCurrent = policy.currentTrip > 0
         if reading.temperature >= policy.temperatureTripC
             || abs(reading.load) >= policy.loadTrip
-            || abs(reading.current) >= policy.currentTrip {
+            || (watchesCurrent && abs(reading.current) >= policy.currentTrip) {
             return AnyShapeStyle(Color.red)
         }
         if model.mirror.isHot(reading) || loadFraction > 0.6
-            || abs(reading.current) >= policy.currentTrip * 0.6 {
+            || (watchesCurrent && abs(reading.current) >= policy.currentTrip * 0.6) {
             return AnyShapeStyle(Color.orange)
         }
         return AnyShapeStyle(.secondary)
@@ -579,6 +666,7 @@ private struct SOArmJointRow: View {
     }
 
     private var rateLimited: Bool { reading?.rateLimited ?? false }
+    private var atLimit: Bool { reading?.atLimit ?? false }
 
     /// 목표와 실제가 벌어져 있으면 둘 다 적는다. 막혀서 선 팔에서는 그 차이가 곧 설명이다.
     private var divergence: Double? {

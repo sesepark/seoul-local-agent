@@ -51,6 +51,27 @@ final class SOArmTelemetryInbox: @unchecked Sendable {
     }
 }
 
+/// 조작 방식 둘.
+///
+/// 둘 다 결과는 같은 것 하나다 — 관절 여섯 개의 절대 목표. 다른 것은 사람이 무엇을
+/// 가리키느냐뿐이다: 관절 하나의 각도인가, 집게 끝이 있어야 할 자리인가.
+enum SOArmControlMode: String, CaseIterable, Sendable {
+    /// 관절을 하나씩. 3D에서 링크를 집어 끌거나 슬라이더로. 화면은 손가락으로 돌린다.
+    case joint
+    /// 집게 끝을 잡아 끈다. 어깨 회전·어깨 들기·팔꿈치를 역기구학이 함께 푼다.
+    /// 이때 화면은 고정된다 — 끌면 시점이 따라 도는 화면에서는 끝점을 어디로 보내는지
+    /// 알 수 없기 때문이고, 시점은 90°씩만 돌린다.
+    case endpoint
+
+    var title: String { self == .joint ? "관절" : "끝점" }
+
+    var help: String {
+        self == .joint
+            ? "관절을 하나씩 정합니다. 3D에서 팔의 마디를 집어 끌거나 아래 슬라이더로 움직이고, 화면은 손가락으로 돌릴 수 있습니다."
+            : "집게 끝을 잡아 원하는 자리로 끕니다. 어깨와 팔꿈치가 함께 풀립니다. 끄는 동안 화면이 돌지 않도록 시점은 고정되고, ⟲ ⟳로 90°씩 돌립니다."
+    }
+}
+
 @MainActor
 final class SOArmTeleopModel: ObservableObject {
     enum Connection: Equatable {
@@ -76,6 +97,12 @@ final class SOArmTeleopModel: ObservableObject {
     /// 안전 자세로 되돌리는 중인가. 그 동안에는 사람이 끄는 것과 똑같은 길로 목표가
     /// 흐르고, `정지`도 슬라이더도 언제든 그것을 끊는다.
     @Published private(set) var isHoming = false
+
+    /// 조작 방식. 관절을 하나씩 정하거나, 집게 끝을 잡아 끌거나.
+    @Published private(set) var controlMode: SOArmControlMode = {
+        SOArmControlMode(rawValue: UserDefaults.standard.string(forKey: SOArmTeleopModel.controlModeKey) ?? "")
+            ?? .joint
+    }()
 
     /// 3D 뷰어(WKWebView)가 붙어 있는가. 붙기 전에 밀어 넣은 텔레메트리는 버려진다.
     @Published private(set) var isViewerReady = false
@@ -605,7 +632,14 @@ final class SOArmTeleopModel: ObservableObject {
                     let now = self.target[joint.name] ?? self.telemetry.present[joint.name] ?? 0
                     // 사람이 끄는 것보다 느리게. 되돌리기는 급할 일이 아니고, 천천히
                     // 가야 무언가에 닿았을 때 사다리가 걸릴 시간이 있다.
-                    let step = self.status.policy.step(for: joint) * 0.25
+                    //
+                    // 속도에서 계산한다. 예전에는 틱당 상한(`step_deg`)의 몫이었는데, 그
+                    // 값이 속도를 정하던 시절의 이야기다. 지금 속도를 정하는 것은 서보의
+                    // `Goal_Velocity`이고, 그것을 그대로 쓰면 되돌리기가 사람이 끄는 것과
+                    // 같은 속도로 간다 — 사람이 보고 있지 않은 동작에는 맞지 않는다.
+                    // 그래서 최대 속도의 3분의 1쯤으로 목표를 옮긴다.
+                    let perTick = self.status.policy.speed(for: joint) / Double(max(1, self.status.policy.hz))
+                    let step = perTick * 0.35
                     if abs(goal - now) <= step {
                         self.target[joint.name] = goal
                     } else {
@@ -649,6 +683,7 @@ final class SOArmTeleopModel: ObservableObject {
     }
 
     private static let homePoseKey = "soarmTeleopHomePose"
+    fileprivate static let controlModeKey = "soarmTeleopControlMode"
 
     /// 지금 자세를 안전 자세로 기억한다.
     func rememberHomePose() {
@@ -845,6 +880,7 @@ final class SOArmTeleopModel: ObservableObject {
         pushSpecToViewer()
         pushTelemetryToViewer()
         pushEnabledToViewer()
+        pushModeToViewer()
     }
 
     func viewerWentAway() {
@@ -888,6 +924,46 @@ final class SOArmTeleopModel: ObservableObject {
     func pushEndTargetToViewer() {
         guard isViewerReady else { return }
         evaluate?("window.soarmViewer && window.soarmViewer.endTarget()")
+    }
+
+    // MARK: 조작 방식
+
+    /// 관절을 하나씩 정할 것인가, 집게 끝을 끌 것인가.
+    ///
+    /// 계산은 3D 페이지가 한다 — 역기구학이 **화면이 쓰는 바로 그 순기구학**을 미분해서
+    /// 풀기 때문이고, 그 순기구학은 URDF에서 온다. 같은 계산을 Swift에 다시 쓰면 링크
+    /// 길이와 축 방향을 두 곳에 적게 되고, URDF를 바꾸는 날 한쪽만 따라온다.
+    ///
+    /// 어느 쪽이든 서버로 나가는 것은 같다: **관절 여섯 개의 절대 목표.** 조작 방식을
+    /// 늘려도 팔이 받는 명령의 종류는 늘지 않고, 안전 사다리도 그 하나만 심사한다.
+    func setControlMode(_ next: SOArmControlMode) {
+        guard next != controlMode else { return }
+        controlMode = next
+        UserDefaults.standard.set(next.rawValue, forKey: Self.controlModeKey)
+        endCommanding()
+        pushModeToViewer()
+    }
+
+    /// 시점을 90° 돌린다. `끝점` 모드에서는 화면이 고정되어 있으므로 여기서만 돌아간다.
+    ///
+    /// 고정하는 이유는 손가락이 하나이기 때문이다. 끌면 시점이 따라 도는 화면에서는
+    /// 같은 동작이 "끝점을 옮긴다"와 "카메라를 돌린다" 둘 다를 뜻하게 되고, 그러면
+    /// 어느 쪽도 정확히 되지 않는다.
+    func turnView(_ direction: Int) {
+        guard isViewerReady else { return }
+        evaluate?("window.soarmViewer && window.soarmViewer.turnView(\(direction))")
+    }
+
+    /// 앞뒤 손잡이. 화면 평면만으로는 깊이를 정할 수 없다.
+    func setDepth(_ value: Double) {
+        guard isViewerReady else { return }
+        if value != 0 { isCommanding = true }
+        evaluate?("window.soarmViewer && window.soarmViewer.setDepth(\(value))")
+    }
+
+    private func pushModeToViewer() {
+        guard isViewerReady else { return }
+        evaluate?("window.soarmViewer && window.soarmViewer.setMode('\(controlMode.rawValue)')")
     }
 
     private func specPayload() -> [String: Any] {
