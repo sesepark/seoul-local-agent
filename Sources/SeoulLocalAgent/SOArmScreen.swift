@@ -84,6 +84,7 @@ private struct SOArmWorkspace: View {
         ToolbarItem {
             Button("모드 중지", systemImage: "stop.circle.fill") { model.stopActiveMode() }
                 .tint(.red)
+                .toolbarKeepsTitle()
                 .disabled(!model.isModeRunning || model.isBusy)
                 .help("도는 모드를 모두 내립니다. 물리 E-stop을 대신하지 않습니다")
         }
@@ -98,12 +99,14 @@ private struct SOArmWorkspace: View {
             if model.status?.teleop.running == true {
                 Button("텔레옵 중지", systemImage: "stop.fill") { model.stopTeleoperation() }
                     .tint(.red)
+                    .toolbarKeepsTitle()
                     .disabled(model.isBusy)
                     .help("리더 → 팔로워 전달을 멈춥니다")
             } else {
                 Button("텔레옵 시작", systemImage: "dot.radiowaves.left.and.right") { pending = .teleoperation }
                     .buttonStyle(.glassProminent)
                     .tint(.snuBlue)
+                    .toolbarKeepsTitle()
                     .disabled(model.status?.teleopReady != true || model.isModeRunning || model.isBusy)
                     .help("현장 확인과 확인 문구를 거쳐 리더 팔의 움직임을 팔로워에 전달합니다")
             }

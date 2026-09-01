@@ -117,6 +117,7 @@ struct PDFEditorView: View {
             Button("저장…", systemImage: "square.and.arrow.down") { model.save() }
                 .buttonStyle(.glassProminent)
                 .tint(.snuBlue)
+                .toolbarKeepsTitle()
                 .disabled(model.isEmpty)
                 .help("편집한 PDF를 새 파일로 저장합니다. 원본은 그대로 둡니다")
         }

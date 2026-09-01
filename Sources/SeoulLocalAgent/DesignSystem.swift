@@ -100,6 +100,22 @@ extension View {
         )
         .animation(.smooth(duration: 0.18), value: isTargeted)
     }
+
+    /// A toolbar button that keeps its word.
+    ///
+    /// macOS draws `Button("이름", systemImage:)` in a window toolbar as the icon
+    /// alone; the name survives only as a tooltip that has to be hunted for with
+    /// the pointer. For the utilities — 새로고침, 열기, 내보내기 — that is the right
+    /// trade: the toolbar stays quiet and pressing one is never a decision.
+    ///
+    /// It is the wrong trade for the two kinds of button this app leans on. The
+    /// screen's main action is the reason the screen exists, and the button that
+    /// stops something is the one that has to be found *fast* — 원격 텔레옵's 정지
+    /// was a red hand and nothing else, which is not what you want to be reading
+    /// icons for while the arm is moving.
+    func toolbarKeepsTitle() -> some View {
+        labelStyle(.titleAndIcon)
+    }
 }
 
 // MARK: - 움직임

@@ -49,6 +49,9 @@ final class SOArmTeleopModel: ObservableObject {
     private var socketSession: URLSession?
     private var streamTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
+    private var leaseTask: Task<Void, Never>?
+    /// 리스를 받은 시각. 갓 받은 리스를 낡은 프레임이 지우지 못하게 하는 데 쓴다.
+    private var leaseTakenAt = Date.distantPast
     private var reconnectAttempt = 0
     private var sequence = 0
     private var isVisible = false
@@ -127,6 +130,12 @@ final class SOArmTeleopModel: ObservableObject {
             lines.append(SOArmVirtualLeaderClient.missingTokenMessage)
         }
         return lines
+    }
+
+    /// 지금 팔이 서 있는 이유. 확인이 필요한 멈춤일 때만 값이 있다.
+    var stopReason: String? {
+        guard state.needsAcknowledgement, let fault = telemetry.fault else { return nil }
+        return fault.message
     }
 
     /// 다른 모드가 하드웨어를 쥐고 있는가. 같은 팔에 두 곳에서 명령이 들어가는 일은 없다.
@@ -208,9 +217,23 @@ final class SOArmTeleopModel: ObservableObject {
         if let mine = lease {
             if let theirs = value.telemetry.lease, theirs.id == mine.id {
                 lease = theirs
+            } else if Date().timeIntervalSince(leaseTakenAt) < Self.leaseGrace {
+                // 방금 받은 리스는 낡은 프레임 한 장으로 버리지 않는다.
+                //
+                // 텔레메트리는 30Hz로 밀려오고, 그중 한 장은 리스를 받기 **직전**에 만들어진
+                // 것일 수 있다. 그 한 장에는 우리 리스가 없고, 그것을 곧이곧대로 읽으면 앱은
+                // 방금 받은 권한을 스스로 내려놓는다. 그러면 갱신도 멈추고, 서버 쪽 리스는
+                // 5초 뒤 조용히 만료된다 — 팔은 토크가 걸린 채로 남고 화면은 권한이 없다고
+                // 말한다. 사용자가 "권한 받기를 누르면 몇 초 있다가 풀린다"고 한 것이 이것이다.
             } else if value.telemetry.lease == nil || value.telemetry.lease?.id != mine.id {
                 lease = nil
+                stopLeaseKeepalive()
                 endCommanding()
+                // 조용히 권한만 사라지면, 3D를 계속 만지면서 팔이 왜 안 따라오는지 모른다.
+                // 실제로 그 화면을 봤다 — 권한을 받고 몇 초 뒤 아무 말 없이 풀려 있었다.
+                errorMessage = value.telemetry.lease == nil
+                    ? "조작 권한이 풀렸습니다. 팔은 그 자리에 서 있습니다 — 다시 받으려면 조작 권한 받기를 누르세요."
+                    : "다른 화면이 조작 권한을 가져갔습니다. 팔은 그쪽 명령을 따릅니다."
             }
         }
         if !isCommanding {
@@ -370,7 +393,54 @@ final class SOArmTeleopModel: ObservableObject {
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let text = String(data: data, encoding: .utf8) else { return }
-        socket.send(.string(text)) { _ in }
+        send(text, on: socket)
+    }
+
+    /// 리스를 지키는 것은 **명령 루프와 따로** 돈다.
+    ///
+    /// 전에는 30Hz 명령 루프가 24프레임마다 하트비트를 겸했다. 그 루프는 소켓이 끊기면
+    /// 함께 죽는데, 받는 쪽(텔레메트리)은 다시 붙어도 보내는 쪽이 살아나지 않는 순간이
+    /// 있었다. 화면은 멀쩡히 값이 바뀌는데 서버로는 아무것도 가지 않았고, 5초 뒤 권한만
+    /// 조용히 만료됐다. 그래서 리스를 쥐고 있는 동안에는 이 태스크가 HTTP로 직접 갱신한다 —
+    /// 소켓의 안부와 무관하게.
+    /// 갓 받은 리스를 지키는 유예. 서버의 TTL(5초)보다 짧고, 프레임 한 장이 밀리는
+    /// 시간보다는 넉넉하다.
+    private static let leaseGrace: TimeInterval = 2
+
+    private func startLeaseKeepalive() {
+        leaseTask?.cancel()
+        let period = Duration.milliseconds(max(500, status.policy.leaseTTLMs / 3))
+        leaseTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: period)
+                guard let self, !Task.isCancelled else { return }
+                guard let held = self.lease else { continue }
+                // 한 번 실패했다고 그만두지 않는다. 터널이 잠깐 끊겼다 붙는 일이 있고,
+                // 그때 갱신을 접으면 팔은 토크가 걸린 채로 권한만 잃는다. 정말로 잃었다면
+                // 그 사실은 위의 `apply`가 말해 준다.
+                try? await self.client.heartbeat(held.id)
+            }
+        }
+    }
+
+    private func stopLeaseKeepalive() {
+        leaseTask?.cancel()
+        leaseTask = nil
+    }
+
+    /// 소켓으로 한 줄 내보낸다.
+    ///
+    /// 실패를 삼키지 않는다. `send`의 오류를 버리는 동안, 받는 쪽만 살아 있고 보내는 쪽은
+    /// 죽은 소켓이 멀쩡한 척 남아 있었다 — 화면에는 텔레메트리가 흐르는데 서버로는 명령도
+    /// 하트비트도 한 줄 나가지 않았다. 실패하면 다시 붙는 편이 낫다.
+    private func send(_ text: String, on socket: URLSessionWebSocketTask) {
+        socket.send(.string(text)) { [weak self] error in
+            guard error != nil else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.socket === socket else { return }
+                await self.scheduleReconnect("스트림으로 명령을 보내지 못했습니다")
+            }
+        }
     }
 
     private func sendHeartbeat() {
@@ -378,7 +448,7 @@ final class SOArmTeleopModel: ObservableObject {
         let payload: [String: any Sendable] = ["type": "heartbeat", "lease_id": lease.id]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let text = String(data: data, encoding: .utf8) else { return }
-        socket.send(.string(text)) { _ in }
+        send(text, on: socket)
     }
 
     // MARK: 조작
@@ -427,16 +497,36 @@ final class SOArmTeleopModel: ObservableObject {
     /// 채워 두면 게이트가 아니라 버튼 하나가 된다.
     func takeAuthority(confirmation: String) {
         perform { client, model in
+            // 한 번의 확인으로 어디서든 다시 시작할 수 있어야 한다. 관찰이 꺼져 있든,
+            // 걸려서 멈춰 있든, 토크를 풀어 두었든 마찬가지다. 전에는 이 셋이 각각 다른
+            // 버튼을 요구했고 순서를 틀리면 서버가 조용히 거절했다 — 토크를 풀고 권한을
+            // 반납한 뒤 다시 받으려 하면 아무 일도 일어나지 않았다.
+            //
+            // 매 단계 뒤에 상태를 다시 읽는다. 방금 바뀐 것을 두고 예전 스냅숏으로
+            // 다음 판단을 하면 하나씩 건너뛰게 된다.
+            // 손에 든 상태부터 새로 읽는다. 화면이 들고 있던 스냅숏이 낡아 있으면 — 스트림이
+            // 잠깐 끊겼다 붙은 뒤가 그렇다 — "토크는 이미 걸려 있다"고 잘못 판단해 토크를
+            // 걸지 않고 리스를 요청하고, 서버는 영어 한 줄로 거절한다. 사용자가 만난 화면이
+            // 그것이었다: 토크를 풀고 반납한 뒤 다시 받으려 하면 아무 일도 일어나지 않았다.
+            await model.refresh()
             if !model.telemetry.running {
                 try await client.start()
+                await model.refresh()
+            }
+            if model.state.needsAcknowledgement {
+                try await client.resume()
+                await model.refresh()
             }
             if !model.telemetry.torqueEnabled {
                 try await client.arm(confirmation: confirmation)
+                await model.refresh()
             }
             let lease = try await client.takeLease(
                 holder: "맥북", session: model.sessionID, confirmation: confirmation
             )
             model.lease = lease
+            model.leaseTakenAt = Date()
+            model.startLeaseKeepalive()
             model.syncTargetToArm()
             model.pushEnabledToViewer()
         }
@@ -445,6 +535,7 @@ final class SOArmTeleopModel: ObservableObject {
     func releaseAuthority() async {
         guard let held = lease else { return }
         lease = nil
+        stopLeaseKeepalive()
         pushEnabledToViewer()
         try? await client.releaseLease(held.id)
         await refresh()

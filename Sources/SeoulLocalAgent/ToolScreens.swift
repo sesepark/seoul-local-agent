@@ -35,6 +35,7 @@ struct AudioCleanupView: View {
                 .buttonStyle(.glassProminent)
                 .tint(.snuBlue)
                 .help("이 앱으로 녹음한 파일에서 바로 고릅니다")
+                .toolbarKeepsTitle()
             }
         }
     }

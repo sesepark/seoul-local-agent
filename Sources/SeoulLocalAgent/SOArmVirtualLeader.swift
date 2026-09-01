@@ -329,6 +329,16 @@ struct SOArmVirtualLeaderClient: Sendable {
         _ = try await send("api/vleader/lease/\(id)", method: "DELETE", token: true, timeout: 10)
     }
 
+    /// 리스를 살려 둔다.
+    ///
+    /// 스트림에도 같은 이름의 프레임이 있고, 잘 돌 때는 그쪽이 한다. 이것은 그쪽이 조용히
+    /// 죽었을 때를 위한 것이다 — 소켓 전송은 실패해도 아무 말을 하지 않으므로, 권한이
+    /// 사라지고 나서야 알게 된다. 실제로 그 일이 있었다: 권한을 받고 5초 뒤, 아무것도
+    /// 하지 않았는데 권한만 풀려 있었다.
+    func heartbeat(_ id: String) async throws {
+        _ = try await send("api/vleader/lease/\(id)/heartbeat", method: "POST", token: true, timeout: 5)
+    }
+
     /// 리스가 없어도, 토큰이 없어도 부를 수 있다. 멈추는 것은 빼앗는 것이 아니다.
     func hold() async throws {
         _ = try await send("api/vleader/hold", method: "POST", token: false, timeout: 15)

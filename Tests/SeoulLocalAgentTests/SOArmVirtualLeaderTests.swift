@@ -380,5 +380,38 @@ struct SOArmVirtualLeaderTests {
         #expect(SOArmVirtualLeaderText.korean("Something new the app has not seen")
             == "Something new the app has not seen")
     }
+
+    @Test("서버가 거절한 이유도 한국어로 나온다")
+    func rejectionsAreNotLeftInEnglish() {
+        // 이 문장이 그대로 빨간 띠에 떠 있는 것을 실물 화면에서 봤다. 앱은 전부 한국어인데
+        // 거절만 영어였고, 그 문장은 무엇을 해야 하는지도 말해 주지 않았다.
+        let stillOn = SOArmServerText.korean(
+            "Torque is still enabled. Release it explicitly (the arm will drop) or hold the arm first.")
+        #expect(stillOn.contains("토크"))
+        #expect(!stillOn.contains("Torque"))
+        #expect(SOArmServerText.korean("Enable torque first: the arm cannot follow a goal while torque is off")
+            .contains("조작 권한"))
+        #expect(SOArmServerText.korean("Clear the fault before arming").contains("확인하고 계속"))
+        // 서버가 이유를 덧붙여 준 경우에는 그 꼬리를 살려 둔다.
+        #expect(SOArmServerText.korean("Could not start the virtual leader: no status packet")
+            .contains("no status packet"))
+        // 모르는 문장은 원문 그대로. preflight 쪽과 같은 규칙이다.
+        #expect(SOArmServerText.korean("A brand new refusal") == "A brand new refusal")
+    }
+
+    @Test("멈춰 있을 때는 이유가 실려 있고, 그 이유는 게이트가 보여 줄 수 있다")
+    func aStoppedArmCarriesAReadableReason() throws {
+        // 권한을 받는 게이트가 이 이유를 함께 보여 준다. 전에는 이유를 지우는 버튼과 권한을
+        // 받는 버튼이 따로였고, 순서를 모르면 "권한 받기"가 아무 말 없이 거절당했다 —
+        // 토크를 풀고 반납한 뒤 다시 받으려 할 때 실제로 그랬다.
+        let stopped = try Self.status()
+        #expect(stopped.telemetry.state.needsAcknowledgement)
+        let reason = try #require(stopped.telemetry.fault?.message)
+        #expect(!reason.isEmpty)
+
+        let moving = Self.statusJSON.replacingOccurrences(of: "\"state\": \"HOLD\"", with: "\"state\": \"READY\"")
+        let ready = try SOArmVirtualLeaderStatus.parse(Data(moving.utf8))
+        #expect(ready.telemetry.state.needsAcknowledgement == false)
+    }
 }
 #endif

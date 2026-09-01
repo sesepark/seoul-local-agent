@@ -15,7 +15,7 @@ final class PDFEditorModel: ObservableObject {
     @Published private(set) var summary = ""
     // Deliberately terse: the empty state below already spells out what to do,
     // and saying it twice on one screen reads as a stutter.
-    @Published private(set) var status = "대기 중"
+    @Published private(set) var status = "PDF를 열면 쪽을 고르고 정리할 수 있습니다."
     @Published var selection: Set<Int> = []
     @Published var error: String?
     @Published private(set) var isBusy = false
@@ -115,7 +115,7 @@ final class PDFEditorModel: ObservableObject {
         selection = []
         undoStack = []
         revision += 1
-        status = "대기 중"
+        status = "PDF를 열면 쪽을 고르고 정리할 수 있습니다."
     }
 
     // MARK: 되돌리기

@@ -324,7 +324,7 @@ final class AutomationController: ObservableObject {
     @Published private(set) var isRecognizingDocument = false
     @Published private(set) var recognizedText = ""
     @Published private(set) var recognizedSourceName = ""
-    @Published private(set) var recognitionStatus = "대기 중"
+    @Published private(set) var recognitionStatus = "이미지나 PDF를 넣으면 글자를 뽑습니다."
     @Published var recognitionError: String?
     @Published private(set) var recognizedNoteText = ""
     /// Drives the save panel's file type and the hint under the result.
@@ -343,7 +343,7 @@ final class AutomationController: ObservableObject {
     }
     @Published private(set) var cutoutItems: [CutoutItem] = []
     @Published private(set) var isRemovingBackground = false
-    @Published private(set) var cutoutStatus = "대기 중"
+    @Published private(set) var cutoutStatus = "사진을 넣으면 배경을 지웁니다."
     @Published var cutoutError: String?
     @Published var compressionMode: CompressionMode {
         didSet { UserDefaults.standard.set(compressionMode.rawValue, forKey: "compressionMode") }
@@ -362,7 +362,7 @@ final class AutomationController: ObservableObject {
     }
     @Published private(set) var compressionItems: [CompressionItem] = []
     @Published private(set) var isCompressing = false
-    @Published private(set) var compressionStatus = "대기 중"
+    @Published private(set) var compressionStatus = "파일을 넣고 방식과 정도를 고르세요."
     @Published private(set) var compressionETA: TimeInterval?
     @Published var compressionError: String?
 
@@ -2642,11 +2642,13 @@ private struct BriefingStatusWorkspaceView: View {
                 if controller.isRunning {
                     Button("중지", systemImage: "stop.fill") { controller.stopBriefing() }
                         .tint(.red)
+                        .toolbarKeepsTitle()
                         .help("모델을 안전하게 해제하고 멈춥니다 (⌘.)")
                 } else {
                     Button("인박스 정리 시작", systemImage: "tray.full.fill") { controller.startBriefing() }
                         .buttonStyle(.glassProminent)
                         .tint(.snuBlue)
+                        .toolbarKeepsTitle()
                         .help("지금 수집하고 분류해 보관함에 저장합니다 (⌘R)")
                 }
             }
@@ -3278,6 +3280,7 @@ private struct TranscriptionView: View {
                 if controller.isTranscribing {
                     Button("전사 중단", systemImage: "stop.fill") { controller.stopTranscription() }
                         .tint(.red)
+                        .toolbarKeepsTitle()
                         .help("실행 중인 음성 인식을 중단합니다")
                 }
             }
@@ -3289,6 +3292,7 @@ private struct TranscriptionView: View {
                 }
                 .buttonStyle(.glassProminent)
                 .tint(controller.audioRecorder.isRecording ? .red : .snuBlue)
+                .toolbarKeepsTitle()
                 .help(controller.audioRecorder.isRecording ? "녹음을 끝내고 보관함에 넣습니다" : "이 Mac의 마이크로 바로 녹음합니다")
             }
         }
@@ -4339,11 +4343,13 @@ private struct DocumentRecognitionView: View {
                 if controller.isRecognizingDocument {
                     Button("중단", systemImage: "stop.fill") { controller.stopDocumentRecognition() }
                         .tint(.red)
+                        .toolbarKeepsTitle()
                         .help("인식을 중단합니다")
                 } else {
                     Button("화면 영역 캡처", systemImage: "camera.viewfinder") { controller.captureScreenAndRecognize() }
                         .buttonStyle(.glassProminent)
                         .tint(.snuBlue)
+                        .toolbarKeepsTitle()
                         .help("화면의 일부를 끌어 선택해 바로 인식합니다")
                 }
             }
@@ -4453,11 +4459,13 @@ private struct CutoutView: View {
                 if controller.isRemovingBackground {
                     Button("중단", systemImage: "stop.fill") { controller.stopBackgroundRemoval() }
                         .tint(.red)
+                        .toolbarKeepsTitle()
                         .help("남은 사진 처리를 중단합니다")
                 } else {
                     Button("사진 선택…", systemImage: "photo.badge.plus") { choosePhotos() }
                         .buttonStyle(.glassProminent)
                         .tint(.snuBlue)
+                        .toolbarKeepsTitle()
                         .help("누끼를 딸 사진을 고릅니다 · 여러 장 가능")
                 }
             }
@@ -4750,6 +4758,7 @@ private struct FileCompressionView: View {
                 if controller.isCompressing {
                     Button("중단", systemImage: "stop.fill") { controller.stopCompression() }
                         .tint(.red)
+                        .toolbarKeepsTitle()
                         .help("남은 파일 처리를 중단합니다")
                 } else {
                     PhotosPicker(selection: $photoSelection, matching: .any(of: [.images, .videos])) {
@@ -4758,6 +4767,7 @@ private struct FileCompressionView: View {
                     .buttonStyle(.glassProminent)
                     .tint(.snuBlue)
                     .help("사진 보관함에서 직접 고릅니다 · 사진 권한 없이 동작합니다")
+                    .toolbarKeepsTitle()
                 }
             }
         }

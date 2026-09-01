@@ -683,6 +683,7 @@ struct SOArmClient: Sendable {
             detail = json.soarmString("detail") ?? ""
         }
         if detail.isEmpty { detail = "HTTP \(status)" }
+        detail = SOArmServerText.korean(detail)
         switch status {
         case 400: return .confirmationMismatch(detail)
         case 404: return .badResponse(detail)
@@ -691,6 +692,67 @@ struct SOArmClient: Sendable {
         default: return .badResponse(detail)
         }
     }
+}
+
+// MARK: - 거절 문장을 한국어로
+
+/// 서버가 `detail`로 돌려주는 영어 한 줄을 화면의 말로 옮긴다.
+///
+/// 이 앱은 전부 한국어인데 거절 문장만 영어로 튀어나왔다. "Torque is still enabled…"이
+/// 화면 한가운데 빨간 띠로 떠 있는 것을 실제로 봤고, 그 문장은 무엇을 해야 하는지도
+/// 말해 주지 않았다. 규칙은 preflight 쪽과 같다 — 아는 문장만 옮기고, 모르는 문장은
+/// 원문을 남긴다. 조용히 삼키면 서버가 새 거절을 추가했을 때 이유가 사라진다.
+enum SOArmServerText {
+    static func korean(_ detail: String) -> String {
+        let table: [(String, String)] = [
+            ("Torque is still enabled",
+             "토크가 아직 걸려 있습니다. 팔을 받쳐 줄 사람이 있을 때 `토크 해제`로 명시적으로 풀거나, 먼저 팔을 세우세요."),
+            ("Torque is disabled",
+             "토크가 꺼져 있어 팔이 목표를 따라갈 수 없습니다. 먼저 조작 권한을 받으세요."),
+            ("Enable torque first",
+             "토크가 꺼져 있습니다. 조작 권한을 받으면 토크가 걸리고 팔이 목표를 따라갑니다."),
+            ("Torque belongs to the recording process",
+             "데이터 수집이 팔을 쥐고 있습니다. 수집을 먼저 끝내세요."),
+            ("Clear the fault before arming",
+             "멈춘 이유를 먼저 확인해 주세요. `확인하고 계속`을 누르면 지금 자세에서 다시 시작합니다."),
+            ("Confirmation phrase does not match", "확인 문구가 맞지 않습니다."),
+            ("Motion token is missing or wrong", wrongTokenLine),
+            ("SOARM_ENABLE_MOTION=1 is not set",
+             "서버에서 동작이 잠겨 있습니다 (config/soarm.env의 SOARM_ENABLE_MOTION=1 후 서비스 재시작)."),
+            ("Virtual leader is already running", "가상 리더가 이미 돌고 있습니다."),
+            ("Virtual leader is not running", "가상 리더가 돌고 있지 않습니다. `관찰 시작`을 먼저 누르세요."),
+            ("Follower is not connected", "팔로워 팔이 연결되어 있지 않습니다."),
+            ("Simulated follower is not connected", "모의 팔로워가 연결되어 있지 않습니다."),
+            ("Follower calibration file is missing",
+             "팔로워 calibration 파일이 없습니다. 서버에서 scripts/calibrate_follower.sh를 한 번 돌려야 합니다."),
+            ("Follower bus did not answer",
+             "팔로워 serial 버스가 응답하지 않았습니다. 전원과 케이블을 확인하고 다시 시도하세요."),
+            ("Follower bus did not read back healthy",
+             "팔로워 serial 버스에서 읽은 값이 정상이 아닙니다. 전원과 케이블을 확인하세요."),
+            ("Could not aim the servos",
+             "서보를 지금 자세로 겨누지 못했습니다. 다시 시도하고, 계속 실패하면 서버 로그를 보세요."),
+            ("Could not start the virtual leader",
+             "가상 리더를 시작하지 못했습니다. 잠시 뒤 다시 시도하세요."),
+            ("The last known arm position is more than two minutes old",
+             "마지막으로 읽은 팔의 자세가 2분보다 오래됐습니다. `관찰 시작`을 다시 누르세요."),
+            ("The virtual leader has not read the arm yet",
+             "아직 팔을 한 번도 읽지 못했습니다. `관찰 시작`을 먼저 누르세요."),
+            ("Missing follower port", "팔로워 팔의 serial 포트를 찾지 못했습니다."),
+        ]
+        for (needle, korean) in table where detail.contains(needle) {
+            // 서버가 이유를 덧붙여 준 경우에는 그 꼬리를 살려 둔다. 무엇이 실패했는지는
+            // 대개 그 뒤에 적혀 있다.
+            if let range = detail.range(of: ": "), detail.distance(from: detail.startIndex, to: range.lowerBound) < 60,
+               needle.contains(":") == false, detail.hasPrefix(needle) {
+                return korean + " (" + String(detail[range.upperBound...]) + ")"
+            }
+            return korean
+        }
+        return detail
+    }
+
+    private static let wrongTokenLine =
+        "서버가 조작 토큰을 받아들이지 않았습니다. 설정 › 로봇의 값과 서버 config/soarm.env의 SOARM_MOTION_TOKEN이 같은지 확인하세요."
 }
 
 // MARK: - preflight 문장을 한국어로

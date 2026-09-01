@@ -61,7 +61,9 @@ private struct SOArmTeleopWorkspace: View {
         .animation(.appControl, value: model.holdsAuthority)
         .toolbar { toolbar }
         .sheet(item: $gate) { gate in
-            SOArmPhraseGate(gate: gate) { phrase in
+            // 멈춰 있는 이유를 게이트 안에서 보여 준다. 확인은 "현장을 봤다"와 "왜 멈췄는지
+            // 읽었다"를 함께 뜻하고, 그래야 권한을 받는 그 한 번으로 다시 움직일 수 있다.
+            SOArmPhraseGate(gate: gate, reason: gate == .arm ? model.stopReason : nil) { phrase in
                 switch gate {
                 case .arm: model.takeAuthority(confirmation: phrase)
                 case .releaseTorque: model.releaseTorque(confirmation: phrase)
@@ -92,6 +94,7 @@ private struct SOArmTeleopWorkspace: View {
             // 아니고, 멈춰야 할 때 무언가를 먼저 입력해야 한다면 그것은 정지 버튼이 아니다.
             Button("정지", systemImage: "hand.raised.fill") { model.holdNow() }
                 .tint(.red)
+                .toolbarKeepsTitle()
                 .disabled(!model.telemetry.running || model.isBusy)
                 .help("팔을 지금 자세에서 세웁니다. 토크는 그대로 두므로 팔이 떨어지지 않습니다")
         }
@@ -100,12 +103,14 @@ private struct SOArmTeleopWorkspace: View {
                 Button("권한 반납", systemImage: "hand.wave") {
                     Task { await model.releaseAuthority() }
                 }
+                .toolbarKeepsTitle()
                 .disabled(model.isBusy)
                 .help("조작 권한을 놓습니다. 팔은 지금 자세를 유지합니다")
             } else {
                 Button("조작 권한 받기", systemImage: "dot.radiowaves.left.and.right") { gate = .arm }
                     .buttonStyle(.glassProminent)
                     .tint(.snuBlue)
+                    .toolbarKeepsTitle()
                     .disabled(!canTakeAuthority)
                     .help(takeHelp)
             }
@@ -454,13 +459,65 @@ private struct SOArmJointRow: View {
             }
             HStack(spacing: Spacing.s) {
                 loadBar
-                if let reading, model.mirror.isHot(reading) {
-                    Text(String(format: "%.0f°C", reading.temperature))
-                        .font(.caption2)
-                        .foregroundStyle(reading.temperature >= model.status.policy.temperatureTripC ? .red : .orange)
-                }
+                readout
             }
         }
+    }
+
+    /// 모터가 지금 얼마나 힘들어하는지, 숫자로.
+    ///
+    /// 온도는 뜨거울 때만 나타났고 부하는 막대 하나가 전부였다 — 막대는 "많이 찼다"까지만
+    /// 말하고, 얼마나 남았는지는 말하지 않는다. 값과 서버의 정지 문턱을 나란히 적으면 그
+    /// 한 줄이 둘 다 말한다. 전류는 모터가 쓰는 단위 그대로다(문턱과 같은 자에 있으므로
+    /// 서로 견줄 수 있다).
+    @ViewBuilder
+    private var readout: some View {
+        if let reading {
+            let policy = model.status.policy
+            // 문턱을 분모로 적지 않는다. 실측에서 부하는 막혀도 130을 넘지 않고 전류는
+            // 한 자리에 머무르는데, 서버의 문턱은 400과 108이다 — 그 분수는 "아직 한참
+            // 남았다"는 틀린 안심을 준다. 실제로 팔을 세우는 것은 이 숫자들이 아니라
+            // "목표를 400ms 넘게 따라가지 못함"이다. 숫자는 상태를 보여 주는 계기이고,
+            // 어디서 서는지는 툴팁이 말한다.
+            Text(
+                "부하 \(Int(abs(reading.load)))"
+                + " · 전류 \(Int(abs(reading.current)))"
+                + String(format: " · %.0f°C", reading.temperature)
+            )
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(readoutTint)
+            .lineLimit(1)
+            .fixedSize()
+            .frame(width: 190, alignment: .trailing)
+            .help("""
+                부하: 모터가 목표를 향해 내고 있는 힘입니다. 서보 자신의 눈금(0~1000)이고 \
+                단위가 없습니다. 실측으로 자유롭게 움직일 때 24~100, 무언가에 막히면 \
+                48~130까지 올라갑니다.
+                전류: 모터가 쓰는 전류입니다. 서보 눈금 한 칸이 약 6.5mA인데, 이 팔에서는 \
+                버티고 있을 때도 0~3칸(0~20mA)에 머물러 거의 움직이지 않습니다.
+                온도: 모터 온도입니다. \(Int(policy.temperatureWarnC))°C부터 주황, \
+                \(Int(policy.temperatureTripC))°C에서 서버가 세웁니다.
+                팔을 실제로 세우는 것은 부하·전류 문턱(\(Int(policy.loadTrip))·\(Int(policy.currentTrip)))이 \
+                아니라 "목표를 \(policy.commandTimeoutMs + 100)ms 넘게 따라가지 못함"입니다 — \
+                이 눈금들로는 막힌 팔과 그냥 무거운 팔이 잘 구분되지 않았습니다.
+                """)
+        }
+    }
+
+    /// 정상은 조용하게. 문턱에 다가가면 그때 색이 붙는다.
+    private var readoutTint: AnyShapeStyle {
+        guard let reading else { return AnyShapeStyle(.secondary) }
+        let policy = model.status.policy
+        if reading.temperature >= policy.temperatureTripC
+            || abs(reading.load) >= policy.loadTrip
+            || abs(reading.current) >= policy.currentTrip {
+            return AnyShapeStyle(Color.red)
+        }
+        if model.mirror.isHot(reading) || loadFraction > 0.6
+            || abs(reading.current) >= policy.currentTrip * 0.6 {
+            return AnyShapeStyle(Color.orange)
+        }
+        return AnyShapeStyle(.secondary)
     }
 
     private var reading: SOArmJointReading? {
@@ -602,6 +659,8 @@ enum SOArmTeleopGate: String, Identifiable {
 
 private struct SOArmPhraseGate: View {
     let gate: SOArmTeleopGate
+    /// 지금 팔이 멈춰 서 있는 이유. 없으면 아무것도 그리지 않는다.
+    var reason: String?
     let confirm: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -633,6 +692,23 @@ private struct SOArmPhraseGate: View {
             .font(.callout)
             .foregroundStyle(gate.isDangerous ? .red : .orange)
             .fixedSize(horizontal: false, vertical: true)
+
+            if let reason {
+                // 멈춘 이유를 여기서 읽는다. 확인을 누르면 이 멈춤이 함께 풀린다 —
+                // 전에는 이유를 지우는 버튼과 권한을 받는 버튼이 따로였고, 순서를 모르면
+                // "권한 받기"가 아무 말 없이 거절당했다.
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    Text("지금 멈춰 있는 이유").font(.caption).foregroundStyle(.secondary)
+                    Text(reason).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Text("확인하면 이 멈춤을 풀고, 이전 동작을 이어서 하지 않고 지금 자세에서 다시 시작합니다.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(Spacing.m)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: Radius.card, style: .continuous))
+            }
 
             if gate.requiresTypedPhrase {
                 VStack(alignment: .leading, spacing: Spacing.xs) {

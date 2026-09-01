@@ -89,11 +89,13 @@ struct BriefingArchiveView: View {
             if controller.isRunning {
                 Button("중지", systemImage: "stop.fill") { controller.stopBriefing() }
                     .tint(.red)
+                    .toolbarKeepsTitle()
                     .help("모델을 안전하게 해제하고 멈춥니다 (⌘.)")
             } else {
                 Button("인박스 정리 시작", systemImage: "tray.full.fill") { controller.startBriefing() }
                     .buttonStyle(.glassProminent)
                     .tint(.snuBlue)
+                    .toolbarKeepsTitle()
                     .help("지금 수집하고 정리해 이 보관함에 저장합니다 (⌘R)")
             }
         }

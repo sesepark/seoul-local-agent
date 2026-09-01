@@ -514,6 +514,7 @@ struct BatchToolToolbar<Primary: View, Extra: View>: ToolbarContent {
             if model.isRunning {
                 Button("중단", systemImage: "stop.fill") { model.stop() }
                     .tint(.red)
+                    .toolbarKeepsTitle()
                     .help("남은 파일 처리를 중단합니다")
             } else {
                 primary()
@@ -566,6 +567,7 @@ struct PhotosImportButton: View {
         }
         .buttonStyle(.glassProminent)
         .tint(.snuBlue)
+        .toolbarKeepsTitle()
         .help("사진 보관함에서 직접 고릅니다 · 사진 권한 없이 동작합니다")
         .onChange(of: selection) { _, items in
             guard !items.isEmpty else { return }
