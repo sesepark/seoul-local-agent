@@ -340,7 +340,7 @@ private struct SOArmTeleopWorkspace: View {
                         Button("토크 해제…", systemImage: "bolt.slash") { gate = .releaseTorque }
                             .tint(.red)
                             .disabled(model.isBusy)
-                            .help("팔이 떨어질 수 있습니다. 받쳐 줄 사람이 있을 때만 하세요")
+                            .help("팔이 힘을 놓습니다. 대개 그 자리에 서 있지만, 버티고 있던 자세라면 그만큼 내려앉습니다")
                     }
                 }
                 homeControls
@@ -363,7 +363,7 @@ private struct SOArmTeleopWorkspace: View {
 
     private var safetyNote: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {
-            Text("`정지`는 자세를 유지한 채 멈추는 것이고 토크를 끄지 않습니다 — 토크를 끄면 팔이 떨어집니다. 소프트웨어 중지는 물리 전원 차단을 대신하지 않으니, 팔이 움직이는 동안에는 현장에 사람이 있어야 합니다.")
+            Text("`정지`는 자세를 유지한 채 멈추는 것이고 토크를 끄지 않습니다 — 멈춘 뒤에도 팔은 명령을 기다리는 상태로 서 있습니다. 소프트웨어 중지는 물리 전원 차단을 대신하지 않으니, 팔이 움직이는 동안에는 현장에 사람이 있어야 합니다.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -690,7 +690,11 @@ enum SOArmTeleopGate: String, Identifiable {
         case .arm:
             "토크를 걸고 조작 권한을 받습니다. 이 순간부터 팔은 스스로 자세를 버티고, 3D에서 만진 값을 따라옵니다. 3D는 지금 팔의 자세로 맞춰져 있으므로 첫 명령에 팔이 튀지 않습니다."
         case .releaseTorque:
-            "토크를 풀면 팔은 자기 무게를 버티지 못하고 **떨어집니다**. 팔을 손으로 받치고 있는 사람이 있을 때만 하세요."
+            // 실측(2026-09-02): 접힌 자세에서 토크를 걸었다가 풀었더니 6초 동안 0.00°
+            // 움직였다. 1/345 감속비가 사실상 스스로 잠기기 때문이다. 다만 중력이 두는
+            // 자리보다 위로 **버티고 있던** 자세에서는 내려앉는다 — 팔을 뻗어 든 채로
+            // 풀었을 때 어깨가 17° 주저앉는 것을 봤다.
+            "토크를 풀면 팔은 지금 자세에서 힘을 놓습니다. 1/345 감속비 덕분에 대개는 그 자리에 그대로 서 있지만, 중력이 두는 자리보다 위로 버티고 있던 자세라면 그만큼 내려앉습니다. 팔을 뻗어 든 상태라면 받쳐 줄 사람이 있을 때 하세요."
         }
     }
 
@@ -700,7 +704,7 @@ enum SOArmTeleopGate: String, Identifiable {
     var acknowledgement: String {
         switch self {
         case .arm: "현장에 사람·장애물·케이블이 없고, 전원 차단 위치를 알고 있습니다"
-        case .releaseTorque: "팔을 받치고 있는 사람이 있습니다"
+        case .releaseTorque: "팔이 내려앉아도 되는 자세인지 확인했습니다"
         }
     }
 }
@@ -730,7 +734,7 @@ private struct SOArmPhraseGate: View {
             }
             Label(
                 gate.isDangerous
-                    ? "받쳐 줄 사람이 없으면 하지 마세요."
+                    ? "뻗어 든 자세라면 받쳐 줄 사람이 있을 때만 하세요."
                     : "현장에 사람·장애물·케이블이 없는지, 전원 차단 위치가 어디인지 확인하세요.",
                 systemImage: "exclamationmark.triangle.fill"
             )

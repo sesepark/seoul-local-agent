@@ -364,8 +364,14 @@ struct SOArmVirtualLeaderTests {
         #expect(SOArmTeleopGate.arm.phrase != SOArmTeleopGate.releaseTorque.phrase)
         #expect(SOArmTeleopGate.arm.isDangerous == false)
         #expect(SOArmTeleopGate.releaseTorque.isDangerous)
-        // 토크 해제 안내에는 팔이 떨어진다는 말이 반드시 들어 있어야 한다.
-        #expect(SOArmTeleopGate.releaseTorque.copy.contains("떨어집니다"))
+        // 토크 해제 안내는 실제로 무슨 일이 일어나는지 말해야 한다.
+        //
+        // 처음에는 "팔이 떨어집니다"였다. 2026-09-02 실측에서 접힌 자세로 토크를 걸었다가
+        // 풀었더니 6초 동안 0.00° 움직였다 — 1/345 감속비가 사실상 스스로 잠근다. 틀린
+        // 경고는 두 번째부터 아무도 읽지 않으므로, 실제로 일어나는 일(버티고 있던 자세라면
+        // 그만큼 내려앉는다)로 바꿨다.
+        #expect(SOArmTeleopGate.releaseTorque.copy.contains("내려앉습니다"))
+        #expect(SOArmTeleopGate.releaseTorque.copy.contains("받쳐 줄 사람"))
     }
 
     // MARK: 화면 문구
