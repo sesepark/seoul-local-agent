@@ -1,4 +1,5 @@
 import Foundation
+import WebKit
 import Combine
 
 /// 원격 텔레옵 화면이 들고 있는 상태.
@@ -880,6 +881,9 @@ final class SOArmTeleopModel: ObservableObject {
 
     /// WKWebView에 자바스크립트를 넣어 줄 통로. 화면이 붙일 때 채운다.
     var evaluate: ((String) -> Void)?
+    /// 값을 **돌려받아야 하는** 호출을 위한 통로. 점검용이라 화면이 붙을 때만 채워진다.
+    weak var probeTarget: WKWebView?
+    private var viewerProbe: Task<Void, Never>?
 
     func viewerBecameReady() {
         isViewerReady = true
@@ -888,6 +892,7 @@ final class SOArmTeleopModel: ObservableObject {
         pushTelemetryToViewer()
         pushEnabledToViewer()
         pushModeToViewer()
+        probeViewerIfAsked()
     }
 
     func viewerWentAway() {
@@ -972,6 +977,40 @@ final class SOArmTeleopModel: ObservableObject {
         guard isViewerReady else { return }
         if value != 0 { isCommanding = true }
         evaluate?("window.soarmViewer && window.soarmViewer.setDepth(\(value))")
+    }
+
+    /// `--soarm-viewer-probe`로 띄웠을 때, 3D가 **정말로 그리고 있는지**를 한 줄로 찍는다.
+    ///
+    /// 화면 캡처만으로는 알 수 없는 것이 하나 있다. WebGL 레이어는 창이 가려져 있으면
+    /// 찍은 그림에서 검게 나오는데, 그것이 "그리지 못한 것"인지 "찍지 못한 것"인지
+    /// 구별할 방법이 없다. 페이지는 그린 직후 자기 프레임버퍼를 읽을 수 있으므로,
+    /// 그 답은 화면 바깥 사정과 무관하다. `--section`이 그러하듯 이것도 사람의 손을
+    /// 빌리지 않고 상태를 확인하기 위한 자리다.
+    /// 점검 결과를 표준 오류로 낸다.
+    ///
+    /// `print`를 쓰지 않는 이유: 파일로 넘긴 표준 출력은 블록 버퍼링이라, 끝나지 않는
+    /// 앱에서는 아무것도 흘러나오지 않는다. 실제로 한 줄도 나오지 않아 한참을 다른 데서
+    /// 찾았다. 표준 오류는 버퍼링하지 않는다.
+    private static func probeLog(_ message: String) {
+        FileHandle.standardError.write(Data("VIEWER-PROBE \(message)\n".utf8))
+    }
+
+    private func probeViewerIfAsked() {
+        guard CommandLine.arguments.contains("--soarm-viewer-probe") else { return }
+        Self.probeLog("ready=\(isViewerReady) target=\(probeTarget != nil)")
+        guard isViewerReady else { return }
+        viewerProbe?.cancel()
+        viewerProbe = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self else { return }
+            guard let webView = self.probeTarget else {
+                Self.probeLog("웹뷰 참조가 없습니다")
+                return
+            }
+            let script = "JSON.stringify(window.soarmViewer.debugState())"
+            let answer = try? await webView.evaluateJavaScript(script)
+            Self.probeLog(answer as? String ?? "답이 없습니다")
+        }
     }
 
     private func pushModeToViewer() {

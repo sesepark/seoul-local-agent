@@ -941,6 +941,7 @@ struct SOArmViewerWebView: NSViewRepresentable {
         }
 
         func attach(_ webView: WKWebView) {
+            model.probeTarget = webView
             self.webView = webView
             model.evaluate = { [weak webView] script in
                 webView?.evaluateJavaScript(script, completionHandler: nil)
