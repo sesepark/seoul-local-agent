@@ -326,11 +326,23 @@ struct SOArmVirtualLeaderTests {
         // 카메라 카드와 같은 규칙이다: 세로 스크롤 안에서는 높이 제안이 무한이라
         // `aspectRatio`가 풀 것이 없으므로, 가로를 재서 높이만 계산한다.
         #expect(SOArmTeleopLayout.stageHeight(for: 0) == SOArmTeleopLayout.minimumStageHeight)
-        #expect(SOArmTeleopLayout.stageHeight(for: 400) == SOArmTeleopLayout.minimumStageHeight)
-        #expect(SOArmTeleopLayout.stageHeight(for: 1200) == 552)
+        #expect(SOArmTeleopLayout.stageHeight(for: 400) == SOArmTeleopLayout.stageHeight(for: 600))
         #expect(SOArmTeleopLayout.stageHeight(for: 1600) > SOArmTeleopLayout.stageHeight(for: 1200))
         // 위로도 한계를 둔다. 이 칸이 창을 다 먹으면 관절 슬라이더가 한 줄도 보이지 않는다.
-        #expect(SOArmTeleopLayout.stageHeight(for: 4000) == 760)
+        #expect(SOArmTeleopLayout.stageHeight(for: 4000) == SOArmTeleopLayout.stageHeight(for: 8000))
+    }
+
+    @Test("줄 높이는 4:3 두 장이 정확히 들어가는 높이다")
+    func theStageIsExactlyTwoCamerasTall() {
+        // 카메라는 4:3 고정이다. 줄 높이가 그 비율과 무관하게 정해지면 남는 쪽으로 빈 띠가
+        // 생긴다 — 높으면 영상 위아래로, 낮으면 `aspectRatio(.fit)`이 폭을 줄여 양옆으로.
+        for width in [700, 900, 1200, 1600, 2400] as [CGFloat] {
+            let column = SOArmTeleopLayout.cameraColumnWidth(for: width)
+            let inner = SOArmTeleopLayout.stageHeight(for: width) - 2 * Spacing.l
+            let tiles = 2 * SOArmTeleopLayout.cameraTileHeight(forColumnWidth: column) + Spacing.s
+            // 반올림 한 번 말고는 남는 자리가 없어야 한다.
+            #expect(abs(inner - tiles) <= 1)
+        }
     }
 
     @Test("카메라도 창을 따라 커진다")
@@ -342,7 +354,7 @@ struct SOArmVirtualLeaderTests {
         #expect(wide > narrow)
         // 아래로는 알아볼 수 있을 만큼, 위로는 3D를 밀어내지 않을 만큼.
         #expect(SOArmTeleopLayout.cameraColumnWidth(for: 600) == 240)
-        #expect(SOArmTeleopLayout.cameraColumnWidth(for: 4000) == 460)
+        #expect(SOArmTeleopLayout.cameraColumnWidth(for: 4000) == SOArmTeleopLayout.maximumCameraColumnWidth)
         // 폭이 아직 측정되기 전에도 납작해지지 않는다.
         #expect(SOArmTeleopLayout.cameraColumnWidth(for: 0) == 260)
     }

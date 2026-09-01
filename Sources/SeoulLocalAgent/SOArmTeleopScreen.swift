@@ -374,12 +374,30 @@ private struct SOArmTeleopWorkspace: View {
 enum SOArmTeleopLayout {
     static let minimumStageHeight: CGFloat = 380
 
-    /// 창을 따라 커진다. 위쪽 한계는 두되 넉넉하게 — 이 화면에서 제일 오래 보는 것이
-    /// 3D와 카메라이고, 그 아래의 관절 슬라이더는 스크롤하면 된다. 다만 이 칸이 창을
-    /// 통째로 먹으면 슬라이더가 한 줄도 보이지 않은 채로 시작하므로 그 선은 지킨다.
+    /// 카메라가 내는 화면비. 두 카메라 모두 4:3 고정이라 화면에서 정할 것이 아니라
+    /// 맞춰야 하는 값이다.
+    static let cameraAspect: CGFloat = 4.0 / 3.0
+
+    /// 카메라 타일에서 영상 위에 붙는 이름표 한 줄의 높이. 높이 계산이 실제 배치와
+    /// 어긋나지 않도록 글꼴 크기에 맡기지 않고 이 값으로 못 박는다.
+    static let cameraLabelHeight: CGFloat = 15
+
+    /// 카메라 타일 하나가 차지하는 높이 — 4:3 영상 + 이름표.
+    static func cameraTileHeight(forColumnWidth width: CGFloat) -> CGFloat {
+        (width / cameraAspect) + cameraLabelHeight + Spacing.xs
+    }
+
+    /// 줄 높이는 **카메라가 정한다.**
+    ///
+    /// 예전에는 창 폭의 0.46으로 잡았는데, 그 높이는 4:3 두 장이 필요로 하는 높이와
+    /// 아무 관계가 없다. 남으면 영상 위아래로, 모자라면 영상 양옆으로 빈 띠가 생겼다.
+    /// 그래서 카메라 칸 폭에서 두 장이 정확히 들어가는 높이를 거꾸로 계산하고, 3D는
+    /// 그렇게 정해진 높이를 함께 쓴다. 어차피 3D는 어떤 비율이든 그려낸다.
     static func stageHeight(for width: CGFloat) -> CGFloat {
         guard width > 0 else { return minimumStageHeight }
-        return min(760, max((width * 0.46).rounded(), minimumStageHeight))
+        let column = cameraColumnWidth(for: width)
+        let needed = 2 * cameraTileHeight(forColumnWidth: column) + Spacing.s + 2 * Spacing.l
+        return max(needed.rounded(), minimumStageHeight)
     }
 
     /// 카메라 두 장이 세로로 쌓이는 칸의 폭.
@@ -390,8 +408,12 @@ enum SOArmTeleopLayout {
     /// 밀어내지 않게 둔다.
     static func cameraColumnWidth(for rowWidth: CGFloat) -> CGFloat {
         guard rowWidth > 0 else { return 260 }
-        return min(460, max((rowWidth * 0.30).rounded(), 240))
+        return min(maximumCameraColumnWidth, max((rowWidth * 0.30).rounded(), 240))
     }
+
+    /// 위쪽 한계. 이 폭에서 줄 높이가 768pt가 되는데, 그보다 커지면 카메라가 창을 통째로
+    /// 먹어 아래쪽 관절 슬라이더가 한 줄도 보이지 않는 채로 시작한다.
+    static let maximumCameraColumnWidth: CGFloat = 460
 }
 
 // MARK: - 관절 한 줄
@@ -498,6 +520,9 @@ private struct SOArmTeleopCameraTile: View {
                 Text(role.title).font(.caption).foregroundStyle(.secondary)
                 Spacer()
             }
+            // 이름표 높이를 글꼴에 맡기지 않는다. 줄 높이를 여기서 되짚어 계산하므로,
+            // 한 줄이 몇 pt인지 두 곳이 같은 숫자를 알고 있어야 영상에 빈 띠가 안 생긴다.
+            .frame(height: SOArmTeleopLayout.cameraLabelHeight)
             ZStack {
                 if let image = stream.image {
                     Image(nsImage: image).resizable().scaledToFit()
@@ -509,7 +534,7 @@ private struct SOArmTeleopCameraTile: View {
                 }
             }
             // 카메라가 내는 4:3 그대로. 비율을 맞춰 두지 않으면 영상 양옆에 빈 띠가 생긴다.
-            .aspectRatio(4.0 / 3.0, contentMode: .fit)
+            .aspectRatio(SOArmTeleopLayout.cameraAspect, contentMode: .fit)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .contentCard()
