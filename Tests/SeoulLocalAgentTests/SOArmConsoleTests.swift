@@ -337,7 +337,7 @@ struct SOArmConsoleTests {
     @Test("ssh 명령에 종료 보장과 포워딩이 들어 있다")
     func buildsTunnelCommand() {
         let server = SOArmServer(host: "192.168.0.20", user: "deploy", sshPort: 2222, localPort: 8088, remotePort: 8088)
-        let arguments = SOArmTunnel.arguments(for: server)
+        let arguments = SOArmTunnel.arguments(for: server, host: server.host)
         #expect(arguments.contains("-L"))
         #expect(arguments.contains("127.0.0.1:8088:127.0.0.1:8088"))
         #expect(arguments.contains("deploy@192.168.0.20"))
@@ -375,6 +375,14 @@ struct SOArmConsoleTests {
 
         let unreachable = SOArmTunnel.hint(for: "ssh: connect to host 192.168.0.20 port 22: No route to host", server: server)
         #expect(unreachable.contains("로컬 네트워크"))
+        // 주소가 하나뿐이면 두 번째 주소를 넣으라고 알려 준다. 집 밖에서 이 화면을 처음
+        // 만났을 때 무엇을 해야 하는지가 여기 말고는 적혀 있지 않다.
+        #expect(unreachable.contains("집 밖에서 쓸 주소"))
+        var twoAddresses = server
+        twoAddresses.alternateHost = "100.1.2.3"
+        let both = SOArmTunnel.hint(for: "ssh: connect to host 192.168.0.20 port 22: No route to host", server: twoAddresses)
+        #expect(both.contains("Tailscale"))
+        #expect(!both.contains("집 밖에서 쓸 주소"))
 
         // 아는 것이 없으면 원문을 그대로 둔다. 지어낸 조언이 틀린 조언보다 낫지 않다.
         let unknown = "ssh: something nobody has seen before"
@@ -643,3 +651,4 @@ struct SOArmLiveConsoleTests {
     }
 }
 #endif
+

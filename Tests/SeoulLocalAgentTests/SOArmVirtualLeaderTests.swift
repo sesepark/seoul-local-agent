@@ -224,6 +224,70 @@ struct SOArmVirtualLeaderTests {
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
     }
 
+    // MARK: 집에 있든 밖에 있든
+
+    @Test("주소를 둘 적어 두면 적어 둔 순서대로 시도한다")
+    func twoAddressesAreTriedInOrder() {
+        var server = SOArmServer()
+        server.user = "deploy"
+        server.host = "192.168.0.20"
+        server.alternateHost = "100.123.134.28"
+        #expect(server.candidateHosts == ["192.168.0.20", "100.123.134.28"])
+        #expect(server.isConfigured)
+        // 같은 주소를 두 번 적어도 두 번 시도하지 않는다.
+        server.alternateHost = " 192.168.0.20 "
+        #expect(server.sanitised().candidateHosts == ["192.168.0.20"])
+        // 집 주소를 비우고 tailnet 주소만 두는 것도 된다 — 그러면 그 하나만 시도한다.
+        server.host = ""
+        server.alternateHost = "100.123.134.28"
+        #expect(server.candidateHosts == ["100.123.134.28"])
+        #expect(server.isConfigured)
+    }
+
+    @Test("주소마다 그 주소로 붙는 ssh 명령을 만든다")
+    func theTunnelTargetsTheAddressItWasGiven() {
+        var server = SOArmServer()
+        server.user = "deploy"
+        server.host = "192.168.0.20"
+        server.alternateHost = "100.123.134.28"
+        let home = SOArmTunnel.arguments(for: server, host: "192.168.0.20")
+        let away = SOArmTunnel.arguments(for: server, host: "100.123.134.28")
+        #expect(home.contains("deploy@192.168.0.20"))
+        #expect(away.contains("deploy@100.123.134.28"))
+        // 포워딩은 어느 쪽으로 붙든 같은 로컬 포트다. 앱의 나머지는 주소를 모른 채 돈다.
+        #expect(home.contains("127.0.0.1:8088:127.0.0.1:8088"))
+        #expect(away.contains("127.0.0.1:8088:127.0.0.1:8088"))
+        // 주소가 여럿이면 닿지 않는 쪽에서 오래 기다리지 않는다.
+        #expect(away.contains("ConnectTimeout=4"))
+        var single = server
+        single.alternateHost = ""
+        #expect(SOArmTunnel.arguments(for: single, host: single.host).contains("ConnectTimeout=8"))
+    }
+
+    @Test("어느 쪽으로도 못 닿으면 주소별로 이유를 적는다")
+    func bothAddressesFailingSaysWhichIsWhich() {
+        var server = SOArmServer()
+        server.user = "deploy"
+        server.host = "192.168.0.20"
+        server.alternateHost = "100.123.134.28"
+        let text = SOArmTunnel.failureText(
+            [("192.168.0.20", "No route to host"), ("100.123.134.28", "Operation timed out")],
+            server: server, key: SOArmTunnelKey()
+        )
+        // 하나로 뭉뚱그리면 집에서 안 되는 것인지 밖에서 안 되는 것인지 읽을 수 없다.
+        #expect(text.contains("192.168.0.20: No route to host"))
+        #expect(text.contains("100.123.134.28: Operation timed out"))
+        // 주소가 하나뿐이면 그 하나의 조언만 나온다.
+        var single = server
+        single.alternateHost = ""
+        let one = SOArmTunnel.failureText(
+            [("192.168.0.20", "ssh: connect to host 192.168.0.20 port 22: No route to host")],
+            server: single, key: SOArmTunnelKey()
+        )
+        #expect(!one.contains("·"))
+        #expect(one.contains("로컬 네트워크"))
+    }
+
     @Test("예전 설정 파일에 토큰이 없어도 그대로 읽힌다")
     func oldSettingsFilesStillLoad() throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -235,6 +299,10 @@ struct SOArmVirtualLeaderTests {
         let loaded = SOArmServerStore(directory: directory).load()
         #expect(loaded.host == "192.168.0.20")
         #expect(loaded.motionToken.isEmpty)
+        // 두 번째 주소도 나중에 늘어난 칸이다. 없다고 파일 전체가 읽히지 않으면, 집 주소와
+        // 계정까지 함께 사라진다.
+        #expect(loaded.alternateHost.isEmpty)
+        #expect(loaded.candidateHosts == ["192.168.0.20"])
     }
 
     // MARK: 화면 배치

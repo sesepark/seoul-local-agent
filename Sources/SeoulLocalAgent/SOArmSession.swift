@@ -521,11 +521,16 @@ enum SOArmConnectionCheck {
             print("   설정 파일: \(SOArmServerStore().debugURL.path)")
             return false
         }
-        print("• 대상 \(server.sshTarget) · 콘솔 \(server.baseURL.absoluteString) → 서버 \(server.remotePort)")
+        let addresses = server.candidateHosts.joined(separator: ", ")
+        print("• 대상 \(server.user)@[\(addresses)] · 콘솔 \(server.baseURL.absoluteString) → 서버 \(server.remotePort)")
 
         do {
             try await SOArmTunnel.shared.ensureConnected(server: server)
-            print(SOArmTunnel.shared.isRunning ? "✅ SSH 터널을 열었습니다" : "✅ 콘솔이 이미 이 포트에서 응답합니다 (터널을 새로 열지 않았습니다)")
+            if let host = SOArmTunnel.shared.connectedHost {
+                print("✅ SSH 터널을 열었습니다 · \(host)")
+            } else {
+                print("✅ 콘솔이 이미 이 포트에서 응답합니다 (터널을 새로 열지 않았습니다)")
+            }
         } catch {
             print("❌ \(SOArmConsoleModel.message(for: error))")
             return false

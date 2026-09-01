@@ -873,7 +873,11 @@ struct SOArmSettingsTab: View {
     var body: some View {
         Form {
             Section("서버") {
-                TextField("주소 또는 호스트 이름", text: $model.server.host, prompt: Text("192.168.0.20"))
+                TextField("집에서 쓸 주소", text: $model.server.host, prompt: Text("192.168.0.20"))
+                TextField("집 밖에서 쓸 주소", text: $model.server.alternateHost, prompt: Text("100.x.y.z (Tailscale)"))
+                Text("같은 서버로 가는 두 번째 길입니다. 이 Mac이 집 네트워크를 벗어나면 LAN 주소는 닿지 않지만, 서버가 Tailscale로 같은 tailnet에 있으면 그 주소로는 계속 닿습니다. 두 칸을 채워 두면 앱이 먼저 열리는 쪽을 쓰고, 한 번 열린 주소는 다음 연결에서 먼저 시도합니다. 하나로 합치지 않은 이유는 Tailscale이 꺼져 있을 때 집에서도 못 닿기 때문입니다 — 두 길은 서로의 대비책입니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 TextField("SSH 계정", text: $model.server.user, prompt: Text("deploy"))
                 TextField("SSH 포트", value: $model.server.sshPort, format: .number.grouping(.never))
                 Text("앱은 암호를 묻지 않고 즉시 실패합니다 — 창 없는 자식 프로세스의 암호 프롬프트는 아무도 볼 수 없기 때문입니다. 그래서 아래 `이 앱의 열쇠`를 서버에 한 번 등록해야 합니다. 평소 터미널에서 쓰는 열쇠는 앱이 읽을 수 없으므로, 터미널에서 접속이 된다고 해서 여기서도 되는 것은 아닙니다.")
@@ -928,6 +932,7 @@ struct SOArmSettingsTab: View {
             }
             Section("지금 상태") {
                 LabeledContent("연결", value: connectionText)
+                LabeledContent("붙어 있는 주소", value: SOArmTunnel.shared.connectedHost ?? "없음")
                 HStack {
                     Button("지금 연결해 보기") { Task { await model.connect() } }
                     Button("연결 끊기") { model.disconnect() }

@@ -39,6 +39,7 @@ Sources/SeoulLocalAgent/
   BriefingArchive*.swift      브리핑 보관함: 저장 형식, 화면, 체크·메모·분류 교정·캘린더 연결
   ConnectionHealth.swift      각 소스에 실제로 닿는지 점검(설정 › 연결 상태, --connection-check)
   SOArm*.swift                로봇 콘솔 원격 조작: 서버 설정·API 클라이언트, SSH 터널, 화면
+  SOArmTunnel.swift           집·밖 두 주소를 순서대로 시도하는 SSH 터널 하나
   SOArmVirtualLeader.swift    가상 리더 계약(관절 한계·안전 정책·거절 코드)과 REST 클라이언트
   SOArmTeleopModel.swift      30Hz WebSocket, 조작 권한(리스)과 하트비트, 3D 뷰어와의 다리
   SOArmTeleopScreen.swift     원격 텔레옵 화면: 3D(WKWebView) + 네이티브 슬라이더·부하·정지

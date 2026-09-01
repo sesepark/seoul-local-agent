@@ -18,7 +18,17 @@ import Combine
 /// 집 서버의 주소와 계정은 개인 정보라 소스에 박지 않는다. `GmailAccountStore`와 같은
 /// 규칙으로 이 기기 안의 파일에만 둔다.
 struct SOArmServer: Codable, Equatable, Sendable {
+    /// 집에서 쓰는 주소. LAN의 고정 IP이거나 호스트 이름이다.
     var host = ""
+    /// 집 밖에서 쓰는 주소. 비워 두어도 된다.
+    ///
+    /// 같은 서버로 가는 **두 번째 길**이다. 맥이 집 네트워크를 벗어나면 LAN 주소는 닿지
+    /// 않는데, 그 서버는 Tailscale로 같은 tailnet에 있으므로 tailnet 주소로는 여전히
+    /// 닿는다. 두 칸을 두고 먼저 열리는 쪽을 쓰면, 어디에 있든 같은 화면이 그대로 뜬다.
+    ///
+    /// 주소를 하나로 합치지 않은 이유: tailnet 주소만 남기면 Tailscale이 꺼져 있을 때
+    /// **집에서도** 닿지 못한다. 집 안에서 쓰는 길과 밖에서 쓰는 길은 서로의 대비책이다.
+    var alternateHost = ""
     var user = ""
     var sshPort = 22
     /// 이 Mac에서 열 포트. 이미 다른 터널이 8088을 쓰고 있으면 여기서 바꾼다.
@@ -34,8 +44,19 @@ struct SOArmServer: Codable, Equatable, Sendable {
     var motionToken = ""
 
     var isConfigured: Bool {
-        !host.trimmingCharacters(in: .whitespaces).isEmpty
-            && !user.trimmingCharacters(in: .whitespaces).isEmpty
+        !candidateHosts.isEmpty && !user.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// 시도해 볼 주소들. 적어 둔 순서대로이고, 빈 칸과 중복은 빠진다.
+    var candidateHosts: [String] {
+        var seen = Set<String>()
+        return [host, alternateHost]
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    func sshTarget(host: String) -> String {
+        "\(user.trimmingCharacters(in: .whitespaces))@\(host)"
     }
 
     /// 항상 loopback. 서버를 `0.0.0.0`으로 열어 LAN에 노출하는 경로는 만들지 않는다.
@@ -43,8 +64,9 @@ struct SOArmServer: Codable, Equatable, Sendable {
         URL(string: "http://127.0.0.1:\(Self.validPort(localPort))") ?? URL(string: "http://127.0.0.1:8088")!
     }
 
+    /// 화면에 적을 이름. 지금 붙어 있는 주소가 있으면 그것을, 없으면 첫 번째 후보를 쓴다.
     var sshTarget: String {
-        "\(user.trimmingCharacters(in: .whitespaces))@\(host.trimmingCharacters(in: .whitespaces))"
+        sshTarget(host: SOArmTunnel.shared.connectedHost ?? candidateHosts.first ?? "")
     }
 
     static func validPort(_ value: Int) -> Int { min(max(value, 1), 65535) }
@@ -58,6 +80,7 @@ struct SOArmServer: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         host = try values.decodeIfPresent(String.self, forKey: .host) ?? ""
+        alternateHost = try values.decodeIfPresent(String.self, forKey: .alternateHost) ?? ""
         user = try values.decodeIfPresent(String.self, forKey: .user) ?? ""
         sshPort = try values.decodeIfPresent(Int.self, forKey: .sshPort) ?? 22
         localPort = try values.decodeIfPresent(Int.self, forKey: .localPort) ?? 8088
@@ -65,9 +88,10 @@ struct SOArmServer: Codable, Equatable, Sendable {
         motionToken = try values.decodeIfPresent(String.self, forKey: .motionToken) ?? ""
     }
 
-    init(host: String = "", user: String = "", sshPort: Int = 22, localPort: Int = 8088,
-         remotePort: Int = 8088, motionToken: String = "") {
+    init(host: String = "", alternateHost: String = "", user: String = "", sshPort: Int = 22,
+         localPort: Int = 8088, remotePort: Int = 8088, motionToken: String = "") {
         self.host = host
+        self.alternateHost = alternateHost
         self.user = user
         self.sshPort = sshPort
         self.localPort = localPort
@@ -79,6 +103,7 @@ struct SOArmServer: Codable, Equatable, Sendable {
     func sanitised() -> SOArmServer {
         SOArmServer(
             host: host.trimmingCharacters(in: .whitespaces),
+            alternateHost: alternateHost.trimmingCharacters(in: .whitespaces),
             user: user.trimmingCharacters(in: .whitespaces),
             sshPort: Self.validPort(sshPort),
             localPort: Self.validPort(localPort),
