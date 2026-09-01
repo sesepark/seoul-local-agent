@@ -416,6 +416,13 @@ final class SOArmTeleopModel: ObservableObject {
             // 쓰인다.
             viewerFrame &+= 1
             if viewerFrame % 2 == 0 { pushTelemetryToViewer() }
+            // 그리기를 **부탁한다.** 값만 넣어 두고 그리기는 페이지의
+            // `requestAnimationFrame`에 맡기고 있었는데, WebKit은 창이 가려지거나 다른
+            // 스페이스에 있으면 그 시계를 멈춘다. 그러면 값은 최신인데 화면은 검은
+            // 사각형이다 — 앱을 뒤에 두고 곁눈으로 보는 것이 이 화면의 정상적인
+            // 쓰임이므로, 그때 팔이 얼어 있으면 안 된다. 3D는 이런 경우를 위해
+            // `render()`를 내놓고 있었고, 부르는 쪽이 없었을 뿐이다.
+            if viewerFrame % 3 == 0 { requestViewerFrame() }
         case "ack":
             rejection = nil
         case "reject":
@@ -908,6 +915,12 @@ final class SOArmTeleopModel: ObservableObject {
     private func pushTelemetryToViewer() {
         guard isViewerReady, let json = Self.json(telemetryPayload()) else { return }
         evaluate?("window.soarmViewer && window.soarmViewer.telemetry(\(json))")
+    }
+
+    /// 3D에 한 장 그려 달라고 한다. 창이 가려져 있어도 그려진다.
+    private func requestViewerFrame() {
+        guard isViewerReady else { return }
+        evaluate?("window.soarmViewer && window.soarmViewer.render()")
     }
 
     private func pushEnabledToViewer() {
