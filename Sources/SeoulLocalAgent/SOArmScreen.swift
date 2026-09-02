@@ -868,10 +868,28 @@ struct SOArmOverviewTile: View {
 
 /// 서버 주소와 계정. 개인 정보라 소스가 아니라 이 기기의 파일에만 남는다.
 struct SOArmSettingsTab: View {
+    /// 조작 토큰을 클립보드에 넣는다. 넣은 값을 돌려준다.
+    ///
+    /// 화면에서 떼어 둔 이유는 이 한 줄에 판단이 하나 들어 있기 때문이다: **앞뒤 공백을
+    /// 뗀다.** 서버에 넣을 때 줄바꿈이 따라 들어간 값을 그대로 복사해 폰에 붙이면, 서버는
+    /// 그것을 다른 토큰으로 본다 — 그리고 화면에는 `조작 토큰이 다릅니다`만 뜬다.
+    /// 눈으로는 구별되지 않는 실패라 시험으로 잡아 두는 편이 낫다.
+    @discardableResult
+    static func copyMotionToken(_ raw: String, to pasteboard: NSPasteboard = .general) -> String {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        pasteboard.clearContents()
+        pasteboard.setString(token, forType: .string)
+        return token
+    }
+
     @ObservedObject var model: SOArmConsoleModel
     @State private var key = SOArmTunnelKey()
     @State private var publicKey = ""
     @State private var keyError = ""
+    /// 토큰을 눈에 보이게 둘 것인가. 기본은 가려 둔다.
+    @State private var showsToken = false
+    /// 방금 복사했다는 표시. 잠깐 떴다 사라진다.
+    @State private var copiedToken = false
     @StateObject private var tuning: SOArmTuningModel
 
     init(model: SOArmConsoleModel) {
@@ -902,9 +920,45 @@ struct SOArmSettingsTab: View {
                     .foregroundStyle(.secondary)
             }
             Section("조작 토큰") {
-                // 비밀번호 필드로 두는 이유: 이 값이 있으면 팔을 움직일 수 있고, 화면
+                // 가려 두는 것이 기본인 이유: 이 값이 있으면 팔을 움직일 수 있고, 화면
                 // 캡처나 어깨너머로 새어 나가는 것이 곧 조작 권한이 새는 것이다.
-                SecureField("서버 config/soarm.env의 SOARM_MOTION_TOKEN", text: $model.server.motionToken)
+                //
+                // 그런데 `SecureField`만 두었더니 **복사가 되지 않았다.** macOS가 보안
+                // 입력란에서 복사를 막기 때문이고, 그래서 이 값을 아이폰으로 옮기려면
+                // 서버에 들어가 `grep`을 하거나 32글자를 손으로 옮겨 적어야 했다. 가리는
+                // 것은 어깨너머를 막자는 것이지 주인이 자기 값을 못 쓰게 하자는 것이
+                // 아니다. 눌러서 보고, 눌러서 복사한다.
+                HStack(spacing: Spacing.s) {
+                    Group {
+                        if showsToken {
+                            TextField("서버 config/soarm.env의 SOARM_MOTION_TOKEN", text: $model.server.motionToken)
+                                .font(.system(.body, design: .monospaced))
+                        } else {
+                            SecureField("서버 config/soarm.env의 SOARM_MOTION_TOKEN", text: $model.server.motionToken)
+                        }
+                    }
+                    Button {
+                        showsToken.toggle()
+                    } label: {
+                        Image(systemName: showsToken ? "eye.slash" : "eye")
+                    }
+                    .help(showsToken ? "다시 가립니다" : "값을 화면에 보이게 합니다. 옆에 사람이 없을 때만 쓰세요")
+                    Button("복사", systemImage: "doc.on.doc") {
+                        SOArmSettingsTab.copyMotionToken(model.server.motionToken)
+                        copiedToken = true
+                        Task {
+                            try? await Task.sleep(for: .seconds(4))
+                            copiedToken = false
+                        }
+                    }
+                    .disabled(model.server.motionToken.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .help("아이폰의 조작 화면 `권한` 탭에 붙여 넣으려고 만든 자리입니다")
+                }
+                if copiedToken {
+                    Label("복사했습니다 — 아이폰 조작 화면의 `권한` 탭에 붙여 넣으세요", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(Color.snuBlueLabel)
+                }
                 Text("관찰과 조작의 권한을 가르는 값입니다. 상태와 카메라를 보는 데는 필요 없고, 팔로워를 움직이는 요청에만 붙습니다. 아이폰이 같은 tailnet에서 붙게 되면서 생긴 구분이라, 서버에서 이 값을 갈아 끼우면 조작 권한만 끊깁니다.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

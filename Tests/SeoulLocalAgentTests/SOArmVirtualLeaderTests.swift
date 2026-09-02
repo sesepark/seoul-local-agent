@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 #if canImport(Testing)
 import Testing
@@ -579,6 +580,21 @@ struct SOArmVirtualLeaderTests {
         #expect(model.profile == "quick")
         #expect(model.values["max_deg_per_s"] == 140.0)
         #expect(model.profiles.count == 2, "조작감 목록도 사라지지 않는다")
+    }
+
+    @Test("조작 토큰은 화면에서 바로 복사된다")
+    @MainActor
+    func theMotionTokenCanBeCopied() throws {
+        // `SecureField`만 두었더니 복사가 되지 않았다 — macOS가 보안 입력란에서 복사를
+        // 막는다. 그래서 이 값을 아이폰으로 옮기려면 서버에 들어가 `grep`을 하거나
+        // 32글자를 손으로 옮겨 적어야 했다. 가리는 것은 어깨너머를 막자는 것이지 주인이
+        // 자기 값을 못 쓰게 하자는 것이 아니다.
+        let board = NSPasteboard(name: NSPasteboard.Name("soarm-test-\(UUID().uuidString)"))
+        let copied = SOArmSettingsTab.copyMotionToken("  YroVzpSFsRmcCfX0\n", to: board)
+        // 앞뒤 공백과 줄바꿈은 뗀다. 따라 들어가면 서버가 다른 토큰으로 보고, 화면에는
+        // `조작 토큰이 다릅니다`만 뜬다 — 눈으로는 구별되지 않는 실패다.
+        #expect(copied == "YroVzpSFsRmcCfX0")
+        #expect(board.string(forType: NSPasteboard.PasteboardType.string) == "YroVzpSFsRmcCfX0")
     }
 
     @Test("조작 방식은 둘이고, 어느 쪽이든 나가는 것은 관절 절대 목표 하나다")

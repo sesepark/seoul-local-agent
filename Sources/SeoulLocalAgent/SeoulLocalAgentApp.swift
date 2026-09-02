@@ -169,13 +169,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // from whoever is using it.
         if CommandLine.arguments.contains("--settings") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                MainActor.assumeIsolated { Self.openSettingsWindow() }
             }
         }
         // Process discovery performs blocking system I/O and must never hold
         // SwiftUI's main thread during launch.
         DispatchQueue.global(qos: .utility).async {
             ActiveProcessRegistry.shared.terminateOrphanedRunners()
+        }
+    }
+
+    /// 설정 창을 연다. **판올림을 타지 않게 세 갈래로 시도한다.**
+    ///
+    /// `showSettingsWindow:` 하나만 부르고 있었는데 macOS 26에서는 아무 일도 일어나지
+    /// 않았다 — 오류도 없이 조용히. 그래서 `--settings`로 띄워 두고 화면을 확인하려던
+    /// 것이 되지 않았고, 그 사실조차 창이 안 뜨는 것으로만 보였다. 점검용 인자는 조용히
+    /// 실패하면 없는 것만 못하다.
+    ///
+    /// 마지막 갈래가 메뉴 항목이다. 이름이 무엇이든 `설정`을 여는 항목은 앱 메뉴에 반드시
+    /// 있고, 그것을 눌러 주는 것은 사람이 ⌘,를 치는 것과 같은 길이다.
+    @MainActor
+    private static func openSettingsWindow() {
+        for name in ["showSettingsWindow:", "showPreferencesWindow:"] {
+            if NSApp.sendAction(Selector((name)), to: nil, from: nil) { return }
+        }
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else { return }
+        for item in appMenu.items where item.title.contains("설정") || item.title.contains("Settings") {
+            NSApp.sendAction(item.action ?? Selector(("")), to: item.target, from: item)
+            return
         }
     }
 
