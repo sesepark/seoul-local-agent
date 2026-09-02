@@ -102,12 +102,14 @@ private struct SOArmTeleopWorkspace: View {
         }
         ToolbarItem {
             if model.holdsAuthority {
+                // `정지`와 `관찰 끄기` 사이. 팔은 서고 권한만 놓으므로 다른 기기가
+                // 이어받을 수 있고, 관찰은 계속 흐른다.
                 Button("권한 반납", systemImage: "hand.wave") {
                     Task { await model.releaseAuthority() }
                 }
                 .toolbarKeepsTitle()
                 .disabled(model.isBusy)
-                .help("조작 권한을 놓습니다. 팔은 지금 자세를 유지합니다")
+                .help("조작 권한을 놓아 다른 기기가 이어받을 수 있게 합니다. 팔은 지금 자세에 서고, 카메라와 3D는 계속 보입니다")
             } else {
                 Button("조작 권한 받기", systemImage: "dot.radiowaves.left.and.right") { gate = .arm }
                     .buttonStyle(.glassProminent)
@@ -389,9 +391,16 @@ private struct SOArmTeleopWorkspace: View {
                 }
                 HStack(spacing: Spacing.s) {
                     if model.telemetry.running {
-                        Button("가상 리더 중지", systemImage: "stop.circle") { model.stopVirtualLeader() }
+                        // 이름이 `관찰 시작`의 짝이어야 한다.
+                        //
+                        // 예전 이름은 `가상 리더 중지`였다. "중지"가 `정지`와 같은 말로
+                        // 읽혀서, 팔을 세우려고 이것을 누르면 관찰까지 끊겼다 — 사용자가
+                        // "정지랑 뭐가 다른 거냐"고 물은 자리다. 셋은 겹치는 것이 아니라
+                        // 범위가 다르고(팔을 세운다 / 권한을 놓는다 / 팔을 놓는다),
+                        // 그중 이것만 **하드웨어를 놓는** 것이다.
+                        Button("관찰 끄기", systemImage: "stop.circle") { model.stopVirtualLeader() }
                             .disabled(model.isBusy)
-                            .help("팔로워 serial을 놓습니다. 토크가 걸려 있으면 서버가 거절합니다")
+                            .help("서버가 팔로워 USB를 놓습니다. 관절값과 3D가 끊기고, 그때부터 데이터 수집이나 물리 리더 텔레옵이 팔을 쓸 수 있습니다. 팔을 세우려는 것이라면 `정지`입니다")
                     } else {
                         Button("관찰 시작", systemImage: "play.circle") { model.startObserving() }
                             .disabled(model.isBusy || !model.problems.isEmpty || model.blockedByOtherMode != nil)
@@ -435,6 +444,10 @@ private struct SOArmTeleopWorkspace: View {
 
     private var safetyNote: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {
+            Text("멈추는 자리가 셋이고 **범위가 다릅니다**. `정지`는 팔만 세웁니다 — 토크도 권한도 그대로이고 `확인하고 계속` 한 번으로 이어집니다. `권한 반납`은 거기에 더해 조작 권한을 놓아 다른 기기가 이어받게 합니다. `관찰 끄기`는 서버가 팔로워 USB까지 놓는 것이라 관절값과 3D가 끊깁니다 — 데이터 수집이나 물리 리더 텔레옵에 팔을 넘길 때만 씁니다.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text("`정지`는 자세를 유지한 채 멈추는 것이고 토크를 끄지 않습니다 — 멈춘 뒤에도 팔은 명령을 기다리는 상태로 서 있습니다. 소프트웨어 중지는 물리 전원 차단을 대신하지 않으니, 팔이 움직이는 동안에는 현장에 사람이 있어야 합니다.")
                 .font(.caption)
                 .foregroundStyle(.secondary)

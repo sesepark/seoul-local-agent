@@ -51,6 +51,9 @@ final class SOArmTuningModel: ObservableObject {
         return "최대 \(Int(speed))°/s · 막혔을 때 미는 거리 \(String(format: "%.0f", lead))°"
     }
 
+    /// 시험이 서버 없이 답 한 장을 넣어 볼 수 있게 하는 자리.
+    func acceptForTesting(_ answer: SOArmPolicyAnswer) { adopt(answer) }
+
     func load() async {
         guard server.isConfigured else { return }
         do {
@@ -62,12 +65,21 @@ final class SOArmTuningModel: ObservableObject {
         }
     }
 
+    /// 서버가 준 답을 받아 든다.
+    ///
+    /// **답에 없는 것은 지우지 않는다.** 난간(`ranges`)과 조작감 목록은 값이 바뀌어도
+    /// 그대로인 것들이라, 답에 실려 오지 않았다고 비우면 화면은 "아직 읽지 못했다"로
+    /// 되돌아간다. 실제로 그렇게 됐다 — 조작감을 `보통`에서 `빠름`으로 바꾸면 쓰기의
+    /// 답에는 난간이 없었고, 화면은 영영 `서버에서 지금 값을 읽는 중입니다`에 머물렀다.
+    ///
+    /// 서버 쪽도 이제 쓰기와 읽기가 같은 문서를 돌려주도록 고쳤다. 여기 방어를 함께 두는
+    /// 이유는 앱이 서버보다 먼저 올라가는 경우가 있기 때문이다.
     private func adopt(_ answer: SOArmPolicyAnswer) {
         values = answer.values
-        ranges = answer.ranges
-        profiles = answer.profiles
+        if !answer.ranges.isEmpty { ranges = answer.ranges }
+        if !answer.profiles.isEmpty { profiles = answer.profiles }
         profile = answer.profile
-        draft = answer.values.filter { ranges[$0.key] != nil }
+        draft = values.filter { ranges[$0.key] != nil }
     }
 
     /// 조작감 하나를 고른다. 속도·힘·민감도가 함께 옮겨 간다.

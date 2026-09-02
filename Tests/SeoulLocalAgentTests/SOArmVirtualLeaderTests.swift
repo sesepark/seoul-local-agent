@@ -544,6 +544,41 @@ struct SOArmVirtualLeaderTests {
         // 켜 두면 실제와 다른 말을 한다.
         let tuned = SOArmPolicyAnswer(["policy": ["lead_deg": 9.5], "profile": NSNull()])
         #expect(tuned.profile == nil)
+        // 난간이 실리지 않은 답. 이것을 그대로 받아 들면 화면이 "아직 못 읽었다"로
+        // 되돌아간다 — 조작감을 바꾼 뒤 영영 `읽는 중`에 머물렀던 자리다.
+        #expect(tuned.ranges.isEmpty)
+    }
+
+    @Test("조작감을 바꾼 답에 난간이 없어도 화면이 로딩으로 되돌아가지 않는다")
+    @MainActor
+    func changingTheFeelKeepsTheRailsOnScreen() throws {
+        // 사용자가 `보통`에서 `빠름`으로 바꾸자 화면이 `서버에서 지금 값을 읽는 중입니다`
+        // 에서 나오지 못했다. 쓰기의 답에는 난간이 없었고, "난간이 있으면 다 읽은 것"
+        // 이라는 화면의 판단이 그 답 한 장에 뒤집혔다.
+        let model = SOArmTuningModel(server: SOArmServer())
+        let full = """
+        {"policy": {"lead_deg": 12.0, "max_deg_per_s": 90.0},
+         "profile": "normal",
+         "profiles": [{"name": "normal", "title": "보통", "detail": "평소 조작"},
+                      {"name": "quick", "title": "빠름", "detail": "크게 움직일 때"}],
+         "tunable": {"lead_deg": {"min": 3.0, "max": 25.0, "integer": false}}}
+        """
+        model.acceptForTesting(SOArmPolicyAnswer(
+            try #require(try JSONSerialization.jsonObject(with: Data(full.utf8)) as? [String: Any])
+        ))
+        #expect(model.isLoaded)
+
+        // 옛 서버가 돌려주던 모양: 값만 있고 난간도 목록도 없다.
+        let thin = """
+        {"policy": {"lead_deg": 18.0, "max_deg_per_s": 140.0}, "profile": "quick"}
+        """
+        model.acceptForTesting(SOArmPolicyAnswer(
+            try #require(try JSONSerialization.jsonObject(with: Data(thin.utf8)) as? [String: Any])
+        ))
+        #expect(model.isLoaded, "난간이 안 실려 와도 화면은 읽은 상태로 남아야 한다")
+        #expect(model.profile == "quick")
+        #expect(model.values["max_deg_per_s"] == 140.0)
+        #expect(model.profiles.count == 2, "조작감 목록도 사라지지 않는다")
     }
 
     @Test("조작 방식은 둘이고, 어느 쪽이든 나가는 것은 관절 절대 목표 하나다")
