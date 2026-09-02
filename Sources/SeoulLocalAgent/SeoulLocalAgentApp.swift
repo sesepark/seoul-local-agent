@@ -223,6 +223,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // Tree, not just the direct child: the 정밀 문서 인식 helper starts a
         // local service of its own that would otherwise be left behind.
         ActiveProcessRegistry.shared.terminateAllTrees()
+        // 마지막으로 듣던 자리와 방금 만든 플레이리스트. 저장은 400ms 뒤로 미뤄져
+        // 있으므로, 그 사이에 끝나면 마지막 몇 초의 변경이 사라진다.
+        MusicPlayerModel.current?.saveNow()
     }
 }
 
@@ -268,6 +271,9 @@ final class AutomationController: ObservableObject {
     let briefingArchive = BriefingArchiveModel()
     /// Names and tags for the recording library, which had neither.
     let recordingOrganizer = RecordingOrganizer()
+    /// 음악 탭. 재생·대기열·플레이리스트를 모두 쥐고 있고, 화면을 떠나도 소리가
+    /// 이어져야 하므로 화면이 아니라 여기 산다.
+    let music = MusicPlayerModel()
     /// The SO-ARM 101 console on the home server. Nothing here touches hardware:
     /// the arms and cameras stay owned by that server, and this side only opens
     /// an SSH tunnel and asks it to start and stop.
@@ -586,6 +592,14 @@ final class AutomationController: ObservableObject {
         audioRecorder.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        // 음악도 같은 이유로 이어 붙인다. 개요 타일과 메뉴 막대가 컨트롤러를 통해
+        // 이 상태를 읽는다.
+        music.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        // 설정 창의 탭 선택은 컨트롤러가 쥐고 있고 그 창은 음악 화면의 뷰 트리 밖에
+        // 있다. 화면이 `설정 열기`를 누르면 정확히 음악 탭으로 가야 한다.
+        music.requestSettingsTab = { [weak self] in self?.settingsTab = .music }
     }
 
     func saveBriefingPreferences() {
@@ -2170,6 +2184,7 @@ private struct MainWorkspaceView: View {
                 case .audioCleanup: AudioCleanupView(controller: controller)
                 case .cutout: CutoutView(controller: controller)
                 case .upscale: UpscaleView(controller: controller)
+                case .music: MusicView(controller: controller)
                 case .compression: FileCompressionView(controller: controller)
                 case .convert: FileConversionView(controller: controller)
                 case .briefing: BriefingStatusWorkspaceView(controller: controller)
@@ -2784,7 +2799,7 @@ private struct BriefingStatusRow: View {
 /// Which pane ⌘, opens on, so a button elsewhere can send the reader somewhere
 /// specific rather than to wherever they were last.
 enum SettingsTab: String, Hashable {
-    case briefing, connections, classification, transcription, dictation, tools, robot
+    case briefing, connections, classification, transcription, dictation, tools, robot, music
 }
 
 /// The ⌘, window. These nine sections used to be one `Form` inside a sidebar

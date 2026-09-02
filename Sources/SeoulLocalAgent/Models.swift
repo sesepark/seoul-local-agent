@@ -324,6 +324,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case overview
     case documents, scan, pdf
     case transcription, audioCleanup, cutout, upscale
+    case music
     case compression, convert
     case briefing, archive
     case soarm, soarmTeleop, soarmData
@@ -344,6 +345,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .audioCleanup: "소리 다듬기"
         case .cutout: "누끼 따기"
         case .upscale: "화질 올리기"
+        case .music: "음악"
         case .compression: "용량 줄이기"
         case .convert: "형식 변환"
         case .briefing: "자동 브리핑"
@@ -364,6 +366,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .audioCleanup: "강의·회의 녹음에서 에어컨 소리와 웅성거림을 걷어내고 음량을 고르게 맞춥니다. 영상을 넣으면 소리만 꺼내 다듬습니다."
         case .cutout: "사진을 드롭하면 배경을 지운 투명 PNG를 만듭니다. 모델은 이 Mac에서만 실행되고 사진은 기기를 벗어나지 않습니다."
         case .upscale: "작거나 흐린 사진을 크고 또렷하게 만듭니다. 뒷자리에서 찍은 슬라이드나 저해상도 스캔에 씁니다."
+        case .music: "YouTube에서 곡을 찾아 내 플레이리스트를 만들고, 소리는 광고가 없는 음원으로만 냅니다 — 내 파일·Audius·Internet Archive."
         case .compression: "사진·PDF·영상의 용량을 이 Mac에서 줄입니다. 파일은 기기를 벗어나지 않고 원본도 그대로 남습니다."
         case .convert: "사진·오디오·영상·문서를 다른 형식으로 바꿉니다. 필요한 것은 전부 이 Mac 안에서 처리합니다."
         case .briefing: "메일·메시지·웹 공지를 모아 이 Mac의 모델로 정리합니다. 수집부터 저장까지의 상태를 여기서 봅니다."
@@ -386,6 +389,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .audioCleanup: "잡음 빼고 음량 고르게"
         case .cutout: "배경 지운 투명 PNG"
         case .upscale: "작고 흐린 사진을 크게"
+        case .music: "광고 없이 듣는 내 플레이리스트"
         case .compression: "사진·PDF·영상 용량 줄이기"
         case .convert: "다른 형식으로 바꾸기"
         case .briefing: "메일·공지 모아 정리하기"
@@ -408,6 +412,8 @@ enum AppSection: String, CaseIterable, Identifiable {
         // Deliberately the mirror image of 용량 줄이기: the two tools do opposite
         // things and the sidebar should say so before the label is read.
         case .upscale: "arrow.up.left.and.arrow.down.right"
+        // 음악 앱이 늘 쓰는 기호. 여기서 다른 것을 쓸 이유가 없다.
+        case .music: "music.note"
         case .compression: "arrow.down.right.and.arrow.up.left"
         case .convert: "arrow.triangle.2.circlepath"
         case .briefing: "tray.full"
@@ -438,6 +444,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .upscale: "8"
         case .compression: "9"
         case .convert: "0"
+        case .music: "m"
         case .briefing, .archive: "b"
         case .soarm, .soarmTeleop, .soarmData: "r"
         }
@@ -447,7 +454,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     /// 쓴다. `⌘R`은 이미 인박스 정리 시작이 쓰고 있어 `⇧`부터 시작한다.
     var shortcutModifiers: EventModifiers {
         switch self {
-        case .archive, .soarm: [.command, .shift]
+        case .archive, .soarm, .music: [.command, .shift]
         case .soarmTeleop: [.command, .control]
         case .soarmData: [.command, .option]
         default: .command
@@ -461,6 +468,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case start = "시작"
         case documents = "문서"
         case media = "미디어"
+        case music = "음악"
         case files = "변환"
         case automation = "자동화"
         case robot = "로봇"
@@ -472,6 +480,7 @@ enum AppSection: String, CaseIterable, Identifiable {
             case .start: [.overview]
             case .documents: [.documents, .scan, .pdf]
             case .media: [.transcription, .audioCleanup, .cutout, .upscale]
+            case .music: [.music]
             case .files: [.compression, .convert]
             case .automation: [.briefing, .archive]
             case .robot: [.soarm, .soarmTeleop, .soarmData]
