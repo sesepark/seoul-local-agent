@@ -111,7 +111,9 @@ struct SeoulLocalAgentApp: App {
         MenuBarExtra {
             MenuContentView(controller: controller)
         } label: {
-            Label("서울대 로컬 에이전트", systemImage: controller.dictation.isRecording ? "mic.circle.fill" : (controller.isRunning ? "graduationcap.circle.fill" : "graduationcap.circle"))
+            // 창을 닫아도 앱은 여기 남는다. 그때 마이크가 열려 있는지 알 수 있는 곳은
+            // 이 아이콘뿐이므로, 받아쓰기뿐 아니라 강의 녹음도 함께 비춘다.
+            Label("서울대 로컬 에이전트", systemImage: controller.audioRecorder.isRecording || controller.dictation.isRecording ? "mic.circle.fill" : (controller.isRunning ? "graduationcap.circle.fill" : "graduationcap.circle"))
         }
         .menuBarExtraStyle(.window)
 
@@ -208,11 +210,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Before anything else, because this one is the user's own recording. A take
-        // still running has no index on disk — `AVAudioRecorder` writes that only on
-        // stop — so quitting mid-lecture used to leave the whole thing as a file no
-        // player would open.
+        // 순서가 뜻을 갖는다. **사람이 만든 것을 먼저 지키고, 자원 반납은 그 다음이다.**
+        //
+        // 아래의 반납들은 하나하나가 최대 몇 초씩 기다린다(카메라 2대에 4초, 터널에 3.5초,
+        // 자식 프로세스 하나에 2초). 다 합치면 십수 초인데, 로그아웃·재시동으로 끝날 때
+        // macOS는 그만큼 기다려 주지 않고 앱을 끊어 버린다. 저장이 뒤에 있으면 바로 그때
+        // 사라진다 — 마지막으로 듣던 자리와 방금 고친 서버 주소가 실제로 그랬다.
+        //
+        // 녹음이 맨 앞인 이유는 따로 있다. `AVAudioRecorder`는 `stop()`을 불러야 색인을
+        // 쓰므로, 여기서 닫지 않으면 그 강의는 어떤 재생기도 열지 못하는 파일이 된다.
         AudioRecorder.current?.stopNow()
+        // 저장은 400ms 뒤로 미뤄져 있어서, 그 사이에 끝나면 마지막 몇 초의 변경이 사라진다.
+        MusicPlayerModel.current?.saveNow()
+        // 서버 주소·토큰도 마찬가지로 600ms 미뤄 두고 쓴다. 화면을 떠날 때만 즉시 저장하고
+        // 있었는데, 앱이 끝날 때는 `onDisappear`가 오지 않는다.
+        SOArmConsoleModel.current?.saveServerNow()
+
+        // 여기서부터는 이 앱이 가져간 자원을 돌려주는 일이다.
         // The 누끼 runner stays resident between photos, so it gets an explicit
         // close-then-terminate-then-kill pass that returns only once it is gone.
         // Everything else is a short-lived child that `terminateAll` covers.
@@ -235,9 +249,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // Tree, not just the direct child: the 정밀 문서 인식 helper starts a
         // local service of its own that would otherwise be left behind.
         ActiveProcessRegistry.shared.terminateAllTrees()
-        // 마지막으로 듣던 자리와 방금 만든 플레이리스트. 저장은 400ms 뒤로 미뤄져
-        // 있으므로, 그 사이에 끝나면 마지막 몇 초의 변경이 사라진다.
-        MusicPlayerModel.current?.saveNow()
     }
 }
 
@@ -2116,6 +2127,32 @@ struct MenuContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .glassPanel(Radius.card)
 
+            // 창을 닫아도 녹음은 계속 돈다 — 이 앱은 메뉴 막대에 남는 앱이니 그것이 맞다.
+            // 다만 창이 없으면 멈출 방법도, 돌고 있다는 표시도 없었다. 강의 하나가 통째로
+            // 마이크를 열어 둔 채 남는 길이라 여기에 둔다. 녹음 중이 아니면 나오지 않는다.
+            if controller.audioRecorder.isRecording {
+                HStack(spacing: Spacing.m) {
+                    Image(systemName: "record.circle.fill")
+                        .foregroundStyle(Color.red)
+                        .frame(width: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("녹음 중").font(.subheadline)
+                        Text(controller.audioRecorder.elapsed.playbackTimeLabel)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Spacer()
+                    Button("중지") { controller.toggleRecording() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(.red)
+                }
+                .padding(Spacing.m)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .glassPanel(Radius.card)
+            }
+
             HStack(spacing: Spacing.m) {
                 Image(systemName: controller.dictation.isRecording ? "mic.fill" : "mic")
                     .foregroundStyle(controller.dictation.isRecording ? AnyShapeStyle(Color.red) : AnyShapeStyle(Color.snuBlueLabel))
@@ -2172,6 +2209,7 @@ struct MenuContentView: View {
         .frame(width: 380)
         .animation(.appControl, value: controller.phase)
         .animation(.appControl, value: controller.dictation.isRecording)
+        .animation(.appControl, value: controller.audioRecorder.isRecording)
     }
 }
 

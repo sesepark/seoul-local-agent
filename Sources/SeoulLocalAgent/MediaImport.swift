@@ -105,17 +105,28 @@ struct MediaImporter {
             throw AgentError.processFailed("ffmpeg를 찾지 못했습니다.")
         }
         let directory = try AudioRecorder.recordingsDirectory()
-        let destination = Self.availableURL(in: directory, title: Self.safeFileName(title))
+        // ffmpeg를 보관함에 직접 쓰게 두지 않는다. 이것도 색인을 마지막에 쓰는 MPEG-4라,
+        // 변환 도중에 앱이 끝나거나 사용자가 취소하면 열리지 않는 반쪽 파일이 녹음 보관함에
+        // 그대로 남는다 — 0초짜리 녹음이 하나 생긴 것처럼 보인다. 작업 폴더에서 다 만든
+        // 뒤에 옮겨 놓으면, 보관함에는 완성된 것만 나타난다.
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "SeoulLocalAgent-Media-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let staged = workspace.appending(path: "converted.m4a")
         // ffmpeg's output is the destination file; anything it prints goes to stderr.
         _ = try await runner.run(ffmpeg, [
             "-hide_banner", "-loglevel", "error", "-y",
             "-i", source.path,
             "-vn", "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "48k",
-            destination.path,
+            staged.path,
         ], expectsStandardOutput: false)
-        guard FileManager.default.fileExists(atPath: destination.path) else {
+        guard FileManager.default.fileExists(atPath: staged.path) else {
             throw AgentError.processFailed("오디오 변환 결과 파일을 만들지 못했습니다.")
         }
+        // 이름은 옮기기 직전에 고른다. 변환하는 동안 같은 이름이 생겼을 수 있다.
+        let destination = Self.availableURL(in: directory, title: Self.safeFileName(title))
+        try FileManager.default.moveItem(at: staged, to: destination)
         return destination
     }
 

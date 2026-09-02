@@ -399,6 +399,23 @@ struct SeoulLocalAgentTests {
         #expect(ProcessRunner.childEnvironment(merging: ["FOO": "bar"])["FOO"] == "bar")
     }
 
+    @Test("강제 종료로 남은 도우미만 고아로 인정하고, 앱 자신과 남의 도구는 건드리지 않는다")
+    func orphanMarkersMatchHelpersOnly() {
+        func isOrphanedHelper(_ command: String) -> Bool {
+            ActiveProcessRegistry.runnerMarkers.contains { command.contains($0) }
+        }
+        // 이 앱이 띄운 것: 반드시 이 앱만 만드는 작업 폴더를 인자로 들고 있다.
+        #expect(isOrphanedHelper("/opt/homebrew/bin/ffmpeg -i /var/folders/a/b/T/SeoulLocalAgent-Media-9F2/source.m4a -vn out.m4a"))
+        #expect(isOrphanedHelper("/opt/homebrew/bin/yt-dlp --output /var/folders/a/b/T/SeoulLocalAgent-Media-9F2/source.%(ext)s https://example.com"))
+        #expect(isOrphanedHelper("/Applications/LibreOffice.app/Contents/MacOS/soffice --outdir /var/folders/a/b/T/SeoulLocalAgent-Convert x.docx"))
+        // 앱 자신도 launchd의 자식이라 같은 목록을 지나간다. 붙임표가 그것을 갈라 준다 —
+        // 여기서 참이 되면 새로 뜬 앱이 이미 떠 있는 앱을 죽인다.
+        #expect(!isOrphanedHelper("/Users/x/dist/SeoulLocalAgent.app/Contents/MacOS/SeoulLocalAgent --section transcription"))
+        #expect(!isOrphanedHelper("/Users/x/.build/release/SeoulLocalAgent"))
+        // 사용자가 터미널에서 돌리는 같은 도구는 이 앱의 것이 아니다.
+        #expect(!isOrphanedHelper("/opt/homebrew/bin/ffmpeg -i ~/Movies/lecture.mp4 out.mp4"))
+    }
+
     @Test("Cancelling process runner terminates its child promptly")
     func processRunnerCancellation() async {
         let started = Date()

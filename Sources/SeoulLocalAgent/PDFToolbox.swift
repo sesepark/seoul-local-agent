@@ -159,8 +159,27 @@ enum PDFToolbox {
             // readers treat as unprotected.
             options[.ownerPasswordOption] = userPassword
         }
-        let wrote = options.isEmpty ? document.write(to: url) : document.write(to: url, withOptions: options)
-        guard wrote else { throw AgentError.processFailed("PDF를 저장하지 못했습니다.") }
+        // 사용자가 고른 자리에 곧바로 쓰지 않는다. `PDFDocument.write`는 그 파일을 열어
+        // 처음부터 덮어 나가므로, 도중에 앱이 끝나거나 디스크가 차면 **그 자리에 있던
+        // 원래 PDF까지** 잘린 채로 남는다. 같은 폴더에 다 쓴 뒤 바꿔치기하면, 어느 순간에
+        // 끊기든 그 자리에는 온전한 옛 파일이거나 온전한 새 파일만 있다.
+        let staged = url.deletingLastPathComponent()
+            .appending(path: ".\(url.lastPathComponent).\(UUID().uuidString).쓰는중")
+        let wrote = options.isEmpty ? document.write(to: staged) : document.write(to: staged, withOptions: options)
+        guard wrote else {
+            try? FileManager.default.removeItem(at: staged)
+            throw AgentError.processFailed("PDF를 저장하지 못했습니다.")
+        }
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: staged)
+            } else {
+                try FileManager.default.moveItem(at: staged, to: url)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: staged)
+            throw AgentError.processFailed("PDF를 저장하지 못했습니다: \(error.localizedDescription)")
+        }
     }
 
     // MARK: 겹쳐 그리기

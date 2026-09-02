@@ -162,6 +162,33 @@ struct ToolTests {
         #expect(document.page(at: 1)?.rotation == 270)
     }
 
+    @Test("저장이 실패해도 그 자리에 있던 PDF는 그대로다")
+    func pdfSaveNeverDamagesWhatIsAlreadyThere() throws {
+        let directory = try Self.scratch("pdf")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // 사용자가 저장 창에서 이미 있는 파일을 고른 상황.
+        let existing = try Self.makePDF(pages: 7, in: directory, name: "기존.pdf")
+        let before = try Data(contentsOf: existing)
+        let replacement = try PDFToolbox.load(Self.makePDF(pages: 1, in: directory, name: "새것.pdf"))
+
+        // 실패하는 저장 하나(한글 암호는 PDF 표준이 담지 못한다)로 불변식을 붙들어 둔다:
+        // **저장이 끝나지 못하면 그 자리는 손대지 않은 채여야 한다.** 쓰다 만 채로 끊기는
+        // 경우까지 이 시험이 만들어 낼 수는 없고, 그것을 막는 것은 옆에서 다 쓴 뒤에
+        // 바꿔치기하는 `write`의 구조다 — 여기서는 그 구조가 남기는 자취를 확인한다.
+        #expect(throws: (any Error).self) {
+            try PDFToolbox.write(replacement, to: existing, userPassword: "한글암호")
+        }
+        #expect(try Data(contentsOf: existing) == before)
+        #expect(PDFDocument(url: existing)?.pageCount == 7)
+
+        // 성공하면 물론 바뀌고, 쓰다 만 임시 파일은 남지 않는다.
+        try PDFToolbox.write(replacement, to: existing)
+        #expect(PDFDocument(url: existing)?.pageCount == 1)
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasSuffix("쓰는중") }
+        #expect(leftovers.isEmpty)
+    }
+
     @Test("A password-protected PDF needs the password to reopen")
     func pdfPassword() throws {
         let directory = try Self.scratch("pdf")

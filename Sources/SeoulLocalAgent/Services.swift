@@ -65,6 +65,11 @@ final class ActiveProcessRegistry: @unchecked Sendable {
         // comment in its remote command, which is visible in the local `ps`
         // output and means nothing on the server.
         SOArmTunnel.marker,
+        // 나머지 도구들 — ffmpeg, yt-dlp, soffice, cwebp, screencapture — 은 전부
+        // `SeoulLocalAgent-<도구>` 작업 폴더를 인자로 받는다. 강제 종료로 부모를 잃으면
+        // 이름만으로는 사용자가 터미널에서 돌리는 같은 도구와 구별할 수 없는데, 이 경로는
+        // 이 앱만 만든다. 앱 자신은 `SeoulLocalAgent.app`이라 붙임표에 걸리지 않는다.
+        "/SeoulLocalAgent-",
     ]
 
     /// Terminates a process and everything it started, deepest first.
@@ -126,7 +131,12 @@ final class ActiveProcessRegistry: @unchecked Sendable {
     /// Python child reparented to launchd. Clean up only those orphaned runner
     /// processes on the next launch; never touch a runner owned by an app.
     func terminateOrphanedRunners() {
+        // 앱 자신도 launchd의 자식이다. 실행 인자에 작업 폴더 경로가 섞여 들어오면 새로 뜬
+        // 앱이 이미 떠 있는 앱을 죽이게 되므로, 앱 실행 파일은 무슨 일이 있어도 건너뛴다.
+        let own = Bundle.main.executablePath ?? ""
+        let mine = ProcessInfo.processInfo.processIdentifier
         for entry in Self.processTable() where entry.parent == 1 {
+            guard entry.pid != mine, own.isEmpty || !entry.command.contains(own) else { continue }
             guard Self.runnerMarkers.contains(where: { entry.command.contains($0) }) else { continue }
             kill(entry.pid, SIGTERM)
         }
