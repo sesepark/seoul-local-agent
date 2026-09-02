@@ -24,6 +24,19 @@ enum MusicPlayerStatus: Equatable {
     }
 }
 
+/// 지금 소리가 어디서 나는가.
+///
+/// 화면이 이 값을 그대로 보여 준다. 폴백으로 넘어간 곡에는 광고가 붙을 수 있고,
+/// 그 사실을 숨기지 않는 것이 이 기능의 조건이다.
+enum MusicRoute: Equatable {
+    case none
+    /// 내 파일·Audius·Internet Archive. `AVPlayer`가 직접 연다. 광고가 끼어들 자리가
+    /// 구조적으로 없다.
+    case adFree
+    /// YouTube 임베드 플레이어. 광고 없는 음원을 찾지 못한 곡만 여기로 온다.
+    case youtube
+}
+
 enum MusicSearchScope: String, CaseIterable, Identifiable, Sendable {
     case youtube, local, free
 
@@ -72,6 +85,17 @@ final class MusicPlayerModel: ObservableObject {
     @Published var isScrubbing = false
     /// 건너뛴 곡처럼 잠깐 알려 주고 사라져야 하는 말.
     @Published var notice: String?
+
+    @Published private(set) var route: MusicRoute = .none
+    /// 광고 없는 음원을 못 찾은 곡을 YouTube로 넘길지. 끄면 그런 곡은 재생하지 않는다.
+    @Published var allowsYouTubeFallback: Bool {
+        didSet {
+            UserDefaults.standard.set(allowsYouTubeFallback, forKey: "musicYouTubeFallback")
+            if !allowsYouTubeFallback, route == .youtube { stop() }
+        }
+    }
+    /// 마지막 수단. 처음 필요할 때까지 웹뷰를 만들지 않는다.
+    let embed = YouTubeEmbedPlayer()
 
     private let player = AVPlayer()
     private var timeObserver: Any?
@@ -137,6 +161,7 @@ final class MusicPlayerModel: ObservableObject {
         self.library = loaded
         self.query = loaded.lastQuery
         self.musicOnlySearch = UserDefaults.standard.object(forKey: "musicOnlySearch") as? Bool ?? true
+        self.allowsYouTubeFallback = UserDefaults.standard.object(forKey: "musicYouTubeFallback") as? Bool ?? true
         self.youtubeAPIKey = configuration.load()
 
         player.volume = Float(loaded.volume)
@@ -151,6 +176,7 @@ final class MusicPlayerModel: ObservableObject {
             status = .paused
         }
         installObservers()
+        installEmbedBridge()
         configureRemoteCommands()
         Self.current = self
         Task { await refreshLocalCount() }
@@ -217,7 +243,32 @@ final class MusicPlayerModel: ObservableObject {
         ]
     }
 
+    /// 임베드 플레이어가 보내오는 것을 앱의 상태로 옮긴다. `AVPlayer` 쪽과 같은 값을
+    /// 채우므로, 화면은 어느 경로인지 몰라도 같은 슬라이더와 같은 시간을 그린다.
+    private func installEmbedBridge() {
+        embed.onState = { [weak self] state in
+            guard let self, self.route == .youtube else { return }
+            switch state {
+            case .playing: self.status = .playing; self.updateNowPlaying()
+            case .paused: self.status = .paused; self.updateNowPlaying()
+            case .buffering: self.status = .buffering
+            case .ended: self.trackFinished()
+            case .unstarted, .cued: break
+            }
+        }
+        embed.onTime = { [weak self] time, duration in
+            guard let self, self.route == .youtube else { return }
+            if !self.isScrubbing { self.position = time }
+            if duration > 0 { self.duration = duration }
+        }
+        embed.onFailure = { [weak self] message in
+            guard let self, self.route == .youtube else { return }
+            self.status = .failed(message)
+        }
+    }
+
     private func tick(_ time: CMTime) {
+        guard route == .adFree else { return }
         if !isScrubbing, time.isNumeric { position = CMTimeGetSeconds(time) }
         if let item = player.currentItem {
             if item.duration.isNumeric {
@@ -316,13 +367,17 @@ final class MusicPlayerModel: ObservableObject {
     func togglePlayPause() {
         switch status {
         case .playing, .buffering:
-            player.pause()
+            if route == .youtube { embed.pause() } else { player.pause() }
             status = .paused
             updateNowPlaying()
             saveSoon()
         case .paused:
-            // 마지막에 듣던 곡을 복원만 해 둔 상태라면 아직 아이템이 없다.
-            if player.currentItem == nil, let index = library.queueIndex {
+            // 마지막에 듣던 곡을 복원만 해 둔 상태라면 아직 아무것도 열려 있지 않다.
+            if route == .youtube {
+                embed.play()
+                status = .playing
+                updateNowPlaying()
+            } else if player.currentItem == nil, let index = library.queueIndex {
                 startPlayback(at: index, autoAdvanced: false, from: position)
             } else {
                 player.play()
@@ -359,7 +414,11 @@ final class MusicPlayerModel: ObservableObject {
 
     func seek(to seconds: TimeInterval) {
         position = seconds
-        player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        if route == .youtube {
+            embed.seek(to: seconds)
+        } else {
+            player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        }
         updateNowPlaying()
     }
 
@@ -367,6 +426,8 @@ final class MusicPlayerModel: ObservableObject {
         playRequest = UUID()
         player.pause()
         player.replaceCurrentItem(with: nil)
+        embed.stop()
+        route = .none
         status = .idle
         currentTrack = nil
         position = 0
@@ -378,6 +439,7 @@ final class MusicPlayerModel: ObservableObject {
     func setVolume(_ value: Double) {
         library.volume = min(1, max(0, value))
         player.volume = Float(library.volume)
+        embed.setVolume(library.volume)
         saveSoon()
     }
 
@@ -469,13 +531,23 @@ final class MusicPlayerModel: ObservableObject {
             self.saveSoon()
             if let url = asset?.streamURL {
                 self.attach(url, track: updated, from: offset)
+            } else if self.canFallBack(updated) {
+                self.attachYouTube(updated, from: offset)
             } else {
                 self.unplayable(updated, autoAdvanced: autoAdvanced)
             }
         }
     }
 
+    /// 이 곡을 YouTube로 넘길 수 있는가. YouTube에서 찾은 곡이어야 하고, 폴백이
+    /// 켜져 있어야 한다.
+    private func canFallBack(_ track: Track) -> Bool {
+        allowsYouTubeFallback && track.origin == .youtube
+    }
+
     private func attach(_ url: URL, track: Track, from offset: TimeInterval) {
+        embed.stop()
+        route = .adFree
         let item = AVPlayerItem(url: url)
         observeItem(item)
         player.replaceCurrentItem(with: item)
@@ -490,9 +562,26 @@ final class MusicPlayerModel: ObservableObject {
         updateNowPlaying()
     }
 
+    /// 마지막 수단으로 YouTube에 맡긴다. 여기까지 온 곡에는 광고가 붙을 수 있고,
+    /// 화면이 그 사실을 계속 표시한다.
+    private func attachYouTube(_ track: Track, from offset: TimeInterval) {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        route = .youtube
+        status = .buffering
+        duration = track.duration
+        embed.load(videoID: track.originID, startAt: offset)
+        embed.setVolume(library.volume)
+        library.notePlayed(track)
+        saveSoon()
+        updateNowPlaying()
+    }
+
     /// 광고 없이 들을 방법을 못 찾은 곡. 조용히 넘기지 않고 왜 넘겼는지 남긴다.
     private func unplayable(_ track: Track, autoAdvanced: Bool) {
-        notice = "「\(track.title)」은 광고 없이 들을 수 있는 음원을 찾지 못해 건너뜁니다."
+        notice = allowsYouTubeFallback
+            ? "「\(track.title)」은 광고 없이 들을 수 있는 음원도, 재생 가능한 YouTube 영상도 없어 건너뜁니다."
+            : "「\(track.title)」은 광고 없이 들을 수 있는 음원을 찾지 못해 건너뜁니다. 설정 › 음악에서 YouTube 폴백을 켜면 재생할 수 있습니다."
         // 대기열에 재생 가능한 곡이 하나도 없으면 무한히 돌 수 있다. 남은 곡 수만큼만
         // 넘긴다.
         let remaining = library.queue.filter { library.track($0)?.searchedWithoutResultAt == nil }.count

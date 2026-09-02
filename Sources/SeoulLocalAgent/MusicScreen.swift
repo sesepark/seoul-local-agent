@@ -43,9 +43,12 @@ struct MusicView: View {
                 Divider()
                 MusicContent(model: model, rail: $rail)
                     .frame(maxWidth: .infinity)
-                if showsQueue {
+                // YouTube 폴백으로 재생 중이면 패널을 접지 않는다. 임베드 플레이어가
+                // 화면에서 사라지면 영상이 보이지 않는 채로 소리만 나게 되고, 그것은
+                // 임베드 플레이어를 가리는 것과 다르지 않다.
+                if showsQueue || model.route == .youtube {
                     Divider()
-                    MusicQueuePanel(model: model).frame(width: 300)
+                    MusicQueuePanel(model: model).frame(width: 320)
                 }
             }
             .frame(maxHeight: .infinity)
@@ -569,7 +572,7 @@ private struct MusicTrackRow: View {
             }
             Spacer(minLength: Spacing.s)
 
-            MusicSourceBadge(track: track)
+            MusicSourceBadge(model: model, track: track)
 
             Text(MusicFormat.time(track.duration))
                 .font(.caption.monospacedDigit())
@@ -600,6 +603,7 @@ private struct MusicTrackRow: View {
 /// 이 앱에서는 그것이 기능의 핵심이다 — 재생되는 것이 YouTube가 아니라는 사실과
 /// 어떤 곡이 아예 재생되지 않는지를 목록에서 바로 알 수 있어야 한다.
 private struct MusicSourceBadge: View {
+    @ObservedObject var model: MusicPlayerModel
     let track: Track
 
     var body: some View {
@@ -612,10 +616,17 @@ private struct MusicSourceBadge: View {
                       ? asset.provenance
                       : "비슷한 음원으로 재생합니다: \(asset.provenance)")
         } else if track.searchedWithoutResultAt != nil {
-            Label("재생 불가", systemImage: "speaker.slash")
-                .font(.caption2)
-                .foregroundStyle(.orange)
-                .help("광고 없이 들을 수 있는 음원을 찾지 못했습니다. 파일을 직접 지정할 수 있습니다.")
+            if model.allowsYouTubeFallback, track.origin == .youtube {
+                Label("YouTube · 광고", systemImage: "play.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("광고 없는 음원을 찾지 못해 YouTube로 재생합니다. 광고가 나올 수 있습니다.")
+            } else {
+                Label("재생 불가", systemImage: "speaker.slash")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("광고 없이 들을 수 있는 음원을 찾지 못했습니다. 파일을 직접 지정할 수 있습니다.")
+            }
         } else {
             Label("미확인", systemImage: "questionmark.circle")
                 .font(.caption2)
@@ -720,6 +731,22 @@ private struct MusicQueuePanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if model.route == .youtube {
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    YouTubeEmbedView(player: model.embed)
+                        .frame(height: 200)
+                    Label(
+                        "광고 없는 음원을 찾지 못해 YouTube로 재생합니다. 이 곡에는 광고가 나올 수 있습니다.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Spacing.m)
+                }
+                .padding(.bottom, Spacing.s)
+                Divider()
+            }
             HStack {
                 Text("재생 대기열").font(.headline)
                 Spacer()
@@ -809,12 +836,16 @@ private struct MusicPlayerBar: View {
         case .resolving: "광고 없는 음원을 찾는 중…"
         case .failed(let message): message
         case .idle: "왼쪽에서 곡을 고르세요"
-        default: model.currentTrack?.availabilityNote ?? ""
+        default:
+            model.route == .youtube
+                ? "YouTube로 재생 중 · 광고가 나올 수 있습니다"
+                : (model.currentTrack?.availabilityNote ?? "")
         }
     }
 
     private var statusIsProblem: Bool {
         if case .failed = model.status { return true }
+        if model.route == .youtube { return true }
         if let track = model.currentTrack, track.asset == nil, track.searchedWithoutResultAt != nil { return true }
         return false
     }
@@ -989,5 +1020,123 @@ struct MusicOverviewTile: View {
             isBusy: model.status.isActive,
             open: open
         )
+    }
+}
+
+// MARK: - 설정 › 음악
+
+/// 음악 탭이 필요로 하는 것 전부를 한 화면에.
+///
+/// 키를 여기서만 받는다. 소스에는 없고, 저장소에도 커밋되지 않으며, 이 Mac의
+/// `youtube-config.json`(0600)에만 들어간다.
+struct MusicSettingsTab: View {
+    @ObservedObject var model: MusicPlayerModel
+    @State private var key = ""
+    @State private var saveMessage = ""
+
+    var body: some View {
+        Form {
+            Section("YouTube 검색") {
+                HStack {
+                    SecureField("YouTube Data API v3 키", text: $key)
+                    Button("저장") {
+                        saveMessage = model.saveYouTubeKey(key)
+                        key = ""
+                    }
+                    .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                LabeledContent("현재 상태") {
+                    Label(
+                        model.isYouTubeConfigured ? "키가 있습니다" : "키가 없습니다",
+                        systemImage: model.isYouTubeConfigured ? "checkmark.seal" : "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(model.isYouTubeConfigured ? Color.secondary : Color.orange)
+                }
+                if !saveMessage.isEmpty {
+                    Text(saveMessage).font(.caption).foregroundStyle(.secondary)
+                }
+                Toggle("음악 카테고리만 검색", isOn: $model.musicOnlySearch)
+                Text("Google Cloud 콘솔에서 YouTube Data API v3를 켜고 API 키를 만드세요. 키는 이 Mac의 다음 파일에만 저장되고, 소스 코드에는 들어가지 않습니다.\n\(model.configurationFileURL.path)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                HStack {
+                    Button("Google Cloud 콘솔 열기") {
+                        if let url = URL(string: "https://console.cloud.google.com/apis/library/youtube.googleapis.com") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    Button("설정 파일 위치 보기") {
+                        NSWorkspace.shared.activateFileViewerSelecting([model.configurationFileURL])
+                    }
+                }
+            }
+
+            Section("재생") {
+                Text("YouTube는 검색과 플레이리스트에만 씁니다. 소리는 광고가 구조적으로 없는 세 곳에서만 납니다.")
+                    .font(.callout)
+                ForEach(PlaybackProviderKind.allCases, id: \.rawValue) { provider in
+                    Label {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(provider.displayName)
+                            Text(Self.explanation(provider)).font(.caption).foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: provider.symbol).foregroundStyle(Color.snuBlueLabel)
+                    }
+                }
+                Text("셋 중 어디에서도 음원을 찾지 못했을 때 비슷한 다른 곡을 대신 틀지는 않습니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("찾지 못한 곡") {
+                Toggle("YouTube로 재생 (광고가 나올 수 있음)", isOn: $model.allowsYouTubeFallback)
+                Text(model.allowsYouTubeFallback
+                     ? "위 세 곳에서 음원을 찾지 못한 곡만 YouTube가 공식으로 제공하는 임베드 플레이어로 재생합니다. 그 곡에는 YouTube가 붙이는 광고가 나올 수 있고, 목록과 플레이어에 `YouTube · 광고`로 표시됩니다. 광고를 막거나 영상을 가리거나 음원을 꺼내는 코드는 이 앱에 없습니다."
+                     : "음원을 찾지 못한 곡은 재생하지 않고 `재생 불가`로 표시합니다. 어떤 곡에서도 광고가 나오지 않지만, 상용 음악은 파일을 직접 갖고 있어야 들을 수 있습니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("어느 쪽이든 곡에 파일을 직접 연결하면(목록의 `⋯ › 파일 직접 지정`) 그 곡은 언제나 광고 없이 재생됩니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("내 음악 폴더") {
+                ForEach(model.library.resolvedLocalFolders, id: \.path) { folder in
+                    LabeledContent(folder.lastPathComponent) {
+                        Text(folder.path).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                HStack {
+                    Text("색인에 \(model.localTrackCount)곡")
+                    Spacer()
+                    if let status = model.scanStatus {
+                        Text(status).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button("다시 훑기") { model.rescanLocalLibrary() }
+                }
+            }
+
+            Section("저장 위치") {
+                Text("플레이리스트·좋아요·최근 재생·대기열은 전부 이 Mac의 파일 하나에 있습니다. 계정도 서버도 없습니다.\n\(model.libraryFileURL.path)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Button("보관함 파일 위치 보기") {
+                    NSWorkspace.shared.activateFileViewerSelecting([model.libraryFileURL])
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private static func explanation(_ provider: PlaybackProviderKind) -> String {
+        switch provider {
+        case .localFile: "이 Mac에 있는 내 음악 파일. 네트워크도 광고도 없습니다."
+        case .audius: "아티스트가 무료 청취용으로 올린 공개 트랙. 공개 API이고 광고가 없습니다."
+        case .internetArchive: "퍼블릭 도메인과 CC 음원. 공개 API이고 광고가 없습니다."
+        }
     }
 }

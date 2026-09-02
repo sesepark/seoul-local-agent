@@ -2249,6 +2249,8 @@ private struct OverviewView: View {
                     isBusy: controller.dictation.isRecording || controller.dictation.isTranscribing
                 ) { openSettings() }
 
+                MusicOverviewTile(model: controller.music) { controller.section = .music }
+
                 SOArmOverviewTile(model: controller.soarm) { controller.section = .soarm }
 
                 SOArmTeleopOverviewTile(model: controller.soarmTeleop) { controller.section = .soarmTeleop }
@@ -2832,6 +2834,9 @@ private struct SettingsWindow: View {
             }
             Tab("도구", systemImage: "wand.and.stars", value: SettingsTab.tools) {
                 ToolSettingsTab(controller: controller)
+            }
+            Tab("음악", systemImage: "music.note", value: SettingsTab.music) {
+                MusicSettingsTab(model: controller.music)
             }
             Tab("로봇", systemImage: "arrow.up.and.down.and.arrow.left.and.right", value: SettingsTab.robot) {
                 SOArmSettingsTab(model: controller.soarm)
