@@ -208,6 +208,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Before anything else, because this one is the user's own recording. A take
+        // still running has no index on disk — `AVAudioRecorder` writes that only on
+        // stop — so quitting mid-lecture used to leave the whole thing as a file no
+        // player would open.
+        AudioRecorder.current?.stopNow()
         // The 누끼 runner stays resident between photos, so it gets an explicit
         // close-then-terminate-then-kill pass that returns only once it is gone.
         // Everything else is a short-lived child that `terminateAll` covers.
@@ -1929,13 +1934,21 @@ final class AutomationController: ObservableObject {
     /// delete, or refresh once the library grew.
     func refreshRecordings(selecting url: URL? = nil) {
         recordingLibraryStatus = "녹음 보관함을 불러오는 중"
+        // A take still being written has no finalised MPEG-4 container, so it would
+        // sit in the library as a recording that can only fail — and the repair pass
+        // inside `load` must not touch a file the recorder still has open, which is
+        // why this is read before the scan starts rather than after it.
+        let recording = audioRecorder.currentFileURL
+        let report: @Sendable (String) -> Void = { [weak self] status in
+            Task { @MainActor [weak self] in self?.recordingLibraryStatus = status }
+        }
         Task { [weak self] in
-            let library = await Task.detached(priority: .utility) { RecordingLibrary.load() }.value
+            let library = await Task.detached(priority: .utility) {
+                RecordingLibrary.load(skipping: recording, status: report)
+            }.value
             guard let self else { return }
             let external = self.transcriptArchive.externalRecordings.values.compactMap(\.item)
-            // A take still being written has no finalised MPEG-4 container, so it
-            // would sit in the library as a recording that can only fail.
-            let inProgress = self.audioRecorder.currentFileURL?.standardizedFileURL.path
+            let inProgress = recording?.standardizedFileURL.path
             self.recordings = Dictionary((library + external).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                 .values.filter { $0.url.standardizedFileURL.path != inProgress }
                 .sorted { $0.date > $1.date }

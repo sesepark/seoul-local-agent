@@ -73,7 +73,12 @@ final class RecordingPlayer: NSObject, ObservableObject, @preconcurrency AVAudio
             currentTime = 0
             return true
         } catch {
-            fail("녹음을 재생하지 못했습니다: \(error.localizedDescription)")
+            // The OSStatus behind this is `'dta?'` — 1685348671 — which said nothing
+            // to anyone reading it. A take that ends without its index has a cause and
+            // a cure worth naming instead.
+            fail(RecordingRepair.isUnfinished(recording.url)
+                 ? "녹음이 저장되지 않은 채로 끝났습니다. 보관함을 새로 고치면 복구를 시도합니다."
+                 : "녹음 파일이 손상되어 재생할 수 없습니다.")
             return false
         }
     }

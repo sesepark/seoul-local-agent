@@ -182,13 +182,29 @@ struct TranscriptArchive: Codable {
 enum RecordingLibrary {
     static let selectedVoiceMemosFolderKey = "selectedVoiceMemosFolder"
 
-    static func load() -> [RecordingItem] {
-        appRecordings() + voiceMemoRecordings()
+    /// - Parameters:
+    ///   - recording: the take the microphone is writing right now, if any. It is
+    ///     the one file here that is *supposed* to have no index yet, so the repair
+    ///     pass has to leave it alone.
+    ///   - status: what to show on the library's status line. Rebuilding a take that
+    ///     was cut off takes seconds, and a list that simply sits there for that long
+    ///     looks like a hang.
+    static func load(skipping recording: URL? = nil, status: (@Sendable (String) -> Void)? = nil) -> [RecordingItem] {
+        appRecordings(skipping: recording, status: status) + voiceMemoRecordings()
     }
 
-    private static func appRecordings() -> [RecordingItem] {
+    private static func appRecordings(skipping recording: URL?, status: (@Sendable (String) -> Void)?) -> [RecordingItem] {
         guard let directory = try? AudioRecorder.recordingsDirectory(), let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
-        return urls.filter { $0.pathExtension.lowercased() == "m4a" }.compactMap { url in
+        let takes = urls.filter { $0.pathExtension.lowercased() == "m4a" }
+        // A take left unfinished by a quit or a crash is rebuilt here, before anything
+        // measures it, so it enters the library with its real length instead of as a
+        // 0초 entry that only ever produces an error when played.
+        for url in takes where url.standardizedFileURL != recording?.standardizedFileURL {
+            guard RecordingRepair.isUnfinished(url) else { continue }
+            status?("중단된 녹음을 복구하는 중: \(url.deletingPathExtension().lastPathComponent)")
+            RecordingRepair.repairIfUnfinished(url)
+        }
+        return takes.compactMap { url in
             let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return RecordingItem(id: "app:\(url.path)", source: .app, title: url.deletingPathExtension().lastPathComponent, url: url, date: date, duration: duration(of: url), isLocallyAvailable: true)
         }
