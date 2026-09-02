@@ -218,9 +218,22 @@ struct InternetArchiveSource: MusicCatalogSource, MusicStreamSource {
         return Array(tracks.prefix(limit))
     }
 
+    /// 아카이브의 파일 `title`은 비어 있거나 `1`처럼 트랙 번호만 든 경우가 흔하고,
+    /// 파일 이름 자체가 `1.mp3`·`2.mp3`인 항목도 많다(실제로 `CHOPIN Klavierwerke`가
+    /// 그렇다). 그대로 두면 같은 이름의 줄이 세 개 늘어서서 어느 것이 어느 곡인지
+    /// 알 수 없으므로, 번호뿐일 때는 항목 이름에 번호를 붙여 구별해 준다.
+    static func displayTitle(fileTitle: String, fileName: String, itemTitle: String) -> String {
+        let trimmed = fileTitle.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty, Double(trimmed) == nil { return trimmed }
+        let base = (fileName as NSString).deletingPathExtension.trimmingCharacters(in: .whitespaces)
+        if !base.isEmpty, Double(base) == nil { return base }
+        let number = trimmed.isEmpty ? base : trimmed
+        return number.isEmpty ? itemTitle : "\(itemTitle) — \(number)"
+    }
+
     private static func track(item: Item, file: ArchiveFile) -> Track {
         let id = "\(item.identifier)/\(file.name)"
-        let title = file.title.isEmpty ? item.title : file.title
+        let title = displayTitle(fileTitle: file.title, fileName: file.name, itemTitle: item.title)
         return Track(
             origin: .internetArchive,
             originID: id,
@@ -243,12 +256,15 @@ struct InternetArchiveSource: MusicCatalogSource, MusicStreamSource {
     }
 
     func findAsset(title: String, artist: String, duration: TimeInterval?) async throws -> PlaybackAsset? {
-        let query = artist.isEmpty ? title : "\(artist) \(title)"
+        // 아티스트를 붙여 한 번, 제목만으로 한 번. 아카이브의 항목 이름은 대개 앨범이나
+        // 연주회 이름이라 아티스트를 붙이면 오히려 0건이 되는 경우가 있다.
+        var items = try await searchItems(artist.isEmpty ? title : "\(artist) \(title)", limit: 10)
+        if items.isEmpty, !artist.isEmpty { items = try await searchItems(title, limit: 10) }
         var best: (score: Double, asset: PlaybackAsset)?
-        for item in try await searchItems(query, limit: 10).prefix(5) {
+        for item in items.prefix(5) {
             let files = (try? await self.files(in: item.identifier)) ?? []
             for file in files {
-                let candidateTitle = file.title.isEmpty ? item.title : file.title
+                let candidateTitle = Self.displayTitle(fileTitle: file.title, fileName: file.name, itemTitle: item.title)
                 let score = MusicMatching.score(
                     queryTitle: title, queryArtist: artist, queryDuration: duration,
                     candidateTitle: candidateTitle, candidateArtist: item.creator,

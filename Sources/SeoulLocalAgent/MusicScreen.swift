@@ -9,6 +9,7 @@ enum MusicRailItem: Hashable {
     case likes
     case recent
     case localLibrary
+    case resolve
     case playlist(UUID)
 }
 
@@ -91,6 +92,8 @@ private struct MusicRail: View {
                 Label("최근 재생", systemImage: "clock.arrow.circlepath").tag(MusicRailItem.recent)
                 Label("내 음악", systemImage: "internaldrive").tag(MusicRailItem.localLibrary)
                     .badge(model.localTrackCount)
+                Label("음원 찾기", systemImage: "waveform.badge.magnifyingglass").tag(MusicRailItem.resolve)
+                    .badge(model.tracksNeedingAsset.count)
             }
             Section("플레이리스트") {
                 ForEach(model.library.playlists) { playlist in
@@ -179,6 +182,8 @@ private struct MusicContent: View {
             )
         case .localLibrary:
             MusicLocalScreen(model: model)
+        case .resolve:
+            MusicResolveScreen(model: model)
         case .playlist(let id):
             if let playlist = model.library.playlists.first(where: { $0.id == id }) {
                 MusicPlaylistScreen(model: model, playlist: playlist)
@@ -317,7 +322,6 @@ private struct MusicCollectionHeader: View {
     let subtitle: String
     let symbol: String
     let tracks: [Track]
-    var extra: AnyView? = nil
 
     private var unresolved: Int {
         tracks.filter { $0.asset == nil }.count
@@ -353,7 +357,7 @@ private struct MusicCollectionHeader: View {
                 Button("대기열에 추가", systemImage: "text.badge.plus") { model.enqueue(tracks) }
                     .disabled(tracks.isEmpty)
                 Spacer()
-                if let status = model.resolveStatus, model.resolveStatus != nil {
+                if let status = model.resolveStatus {
                     Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Button("음원 찾기", systemImage: "waveform.badge.magnifyingglass") {
@@ -361,7 +365,6 @@ private struct MusicCollectionHeader: View {
                 }
                 .disabled(unresolved == 0)
                 .help("광고 없이 들을 수 있는 음원을 미리 찾아 둡니다")
-                if let extra { extra }
             }
             .toolbarKeepsTitle()
         }
@@ -564,7 +567,9 @@ private struct MusicTrackRow: View {
                     .lineLimit(1)
                     .foregroundStyle(isCurrent ? Color.snuBlueLabel : Color.primary)
                 HStack(spacing: Spacing.xs) {
-                    Text(track.artist.isEmpty ? track.origin.displayName : track.artist)
+                    // 아티스트가 없으면 앨범이나 항목 이름을 대신 보여 준다. 여기에
+                    // 출처 이름을 넣으면 오른쪽의 출처 딱지와 같은 말이 두 번 나온다.
+                    Text(track.artist.isEmpty ? (track.album ?? "아티스트 미상") : track.artist)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -763,12 +768,16 @@ private struct MusicQueuePanel: View {
                     .frame(maxHeight: .infinity)
             } else {
                 List {
-                    ForEach(Array(model.library.queueTracks.enumerated()), id: \.offset) { index, track in
+                    // 대기열의 인덱스를 그대로 쓴다. 곡 목록으로 바꿔 놓고 세면 카탈로그에
+                    // 없는 id 하나가 뒤의 번호를 전부 한 칸씩 밀어, 누른 줄과 재생되는
+                    // 곡이 어긋난다.
+                    ForEach(Array(model.library.queue.enumerated()), id: \.offset) { index, id in
+                        let track = model.library.track(id)
                         HStack(spacing: Spacing.s) {
-                            MusicArtwork(url: track.thumbnailURL, size: 30)
+                            MusicArtwork(url: track?.thumbnailURL, size: 30)
                             VStack(alignment: .leading, spacing: 0) {
-                                Text(track.title).font(.callout).lineLimit(1)
-                                Text(track.artist).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                Text(track?.title ?? "알 수 없는 곡").font(.callout).lineLimit(1)
+                                Text(track?.artist ?? "").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                             }
                             Spacer()
                             if model.library.queueIndex == index {
@@ -794,6 +803,8 @@ private struct MusicQueuePanel: View {
 private struct MusicPlayerBar: View {
     @ObservedObject var model: MusicPlayerModel
     @Binding var showsQueue: Bool
+    /// 손가락이 잡고 있는 동안의 값. 놓을 때 한 번만 실제로 옮긴다.
+    @State private var scrubValue: Double?
 
     var body: some View {
         HStack(spacing: Spacing.l) {
@@ -877,13 +888,22 @@ private struct MusicPlayerBar: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: 42, alignment: .trailing)
+                // 끄는 동안에는 값만 따라가고, 손을 뗄 때 한 번만 옮긴다. 값이 바뀔
+                // 때마다 `seek`을 부르면 스트리밍에서는 매번 다시 버퍼링하고, YouTube
+                // 폴백에서는 명령이 밀려 재생이 끊긴다.
                 Slider(
                     value: Binding(
-                        get: { min(model.position, model.duration ?? model.position) },
-                        set: { model.seek(to: $0) }
+                        get: { scrubValue ?? min(model.position, model.duration ?? model.position) },
+                        set: { scrubValue = $0 }
                     ),
                     in: 0...max(1, model.duration ?? 1),
-                    onEditingChanged: { model.isScrubbing = $0 }
+                    onEditingChanged: { editing in
+                        model.isScrubbing = editing
+                        if !editing {
+                            if let value = scrubValue { model.seek(to: value) }
+                            scrubValue = nil
+                        }
+                    }
                 )
                 .disabled(model.duration == nil)
                 .controlSize(.small)
@@ -1138,5 +1158,259 @@ struct MusicSettingsTab: View {
         case .audius: "아티스트가 무료 청취용으로 올린 공개 트랙. 공개 API이고 광고가 없습니다."
         case .internetArchive: "퍼블릭 도메인과 CC 음원. 공개 API이고 광고가 없습니다."
         }
+    }
+}
+
+// MARK: - 음원 찾기
+
+/// 광고 없는 음원을 아직 못 찾은 곡을 모아 놓고, 사람이 직접 고르는 화면.
+///
+/// 자동 매칭만 두면 못 찾은 곡은 그냥 방치된다. 그런데 못 찾은 곡의 대부분은 **표기가
+/// 달라서** 못 찾은 것이다 — 한글 제목과 로마자 제목, 앨범 이름과 곡 이름, 채널 이름과
+/// 아티스트 이름. 사람이 한 번 다르게 쳐 보면 바로 나오는 경우가 많고, 그 한 번을
+/// 편하게 해 주는 것이 이 화면이 있는 이유다.
+private struct MusicResolveScreen: View {
+    @ObservedObject var model: MusicPlayerModel
+    @State private var selectedID: String?
+    @State private var query = ""
+    @State private var candidates: [MusicCandidate] = []
+    @State private var isLoading = false
+    @State private var searchGeneration = 0
+
+    private var pending: [Track] { model.tracksNeedingAsset }
+    private var selected: Track? { selectedID.flatMap { model.library.track($0) } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider()
+            HStack(spacing: 0) {
+                pendingList.frame(width: 300)
+                Divider()
+                detail.frame(maxWidth: .infinity)
+            }
+        }
+        .onDisappear { model.stopPreview() }
+        .onChange(of: selectedID) { _, _ in
+            query = selected.map { "\($0.artist) \($0.title)".trimmingCharacters(in: .whitespaces) } ?? ""
+            model.stopPreview()
+            reload()
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    Text("음원 찾기").font(.title2.weight(.semibold))
+                    Text("광고 없이 들을 수 있는 음원을 아직 못 찾은 곡입니다. 자동으로 못 찾은 곡은 대개 표기가 달라서 못 찾은 것이라, 오른쪽에서 다르게 쳐 보면 나오는 경우가 많습니다.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+            HStack(spacing: Spacing.s) {
+                Button("전체 자동 찾기", systemImage: "wand.and.stars") {
+                    model.resolveMissing(in: pending, force: true)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(pending.isEmpty)
+                if model.resolveStatus != nil {
+                    Button("중지", systemImage: "stop.fill") { model.cancelResolving() }
+                }
+                Spacer()
+                if let status = model.resolveStatus {
+                    Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            .toolbarKeepsTitle()
+        }
+        .padding(Spacing.l)
+    }
+
+    private var pendingList: some View {
+        Group {
+            if pending.isEmpty {
+                EmptyResults(symbol: "checkmark.seal", message: "모든 곡에 광고 없는 음원이 붙어 있습니다.")
+            } else {
+                List(selection: $selectedID) {
+                    ForEach(pending) { track in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(track.title).font(.callout).lineLimit(1)
+                            HStack(spacing: Spacing.xs) {
+                                Text(track.artist).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                if track.searchedWithoutResultAt != nil {
+                                    Text("· 자동으로 못 찾음").font(.caption2).foregroundStyle(.orange)
+                                }
+                            }
+                        }
+                        .tag(track.id)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        if let track = selected {
+            VStack(alignment: .leading, spacing: Spacing.m) {
+                HStack(spacing: Spacing.m) {
+                    MusicArtwork(url: track.thumbnailURL, size: 56)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(track.title).font(.headline).lineLimit(1)
+                        Text("\(track.artist) · \(MusicFormat.time(track.duration))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("파일 직접 지정", systemImage: "folder") { pickFile(for: track) }
+                        .toolbarKeepsTitle()
+                    if let url = track.externalURL, track.origin == .youtube {
+                        Button("YouTube에서 확인", systemImage: "arrow.up.forward.square") {
+                            NSWorkspace.shared.open(url)
+                        }
+                        .toolbarKeepsTitle()
+                        .help("원곡을 확인해 아티스트 표기를 바로잡은 뒤 다시 찾아보세요")
+                    }
+                }
+
+                HStack(spacing: Spacing.s) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("다르게 쳐 보기 — 로마자 표기, 영문 제목, 앨범 이름", text: $query)
+                        .textFieldStyle(.plain)
+                        .onSubmit(reload)
+                    Button("찾기", action: reload)
+                        .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                .padding(Spacing.s)
+                .glassPanel(Radius.card)
+
+                if isLoading {
+                    HStack(spacing: Spacing.s) {
+                        ProgressView().controlSize(.small)
+                        Text("내 음악 · Audius · Internet Archive에서 찾는 중…")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                } else if candidates.isEmpty {
+                    EmptyResults(
+                        symbol: "questionmark.circle",
+                        message: "후보가 없습니다.\n제목을 다르게 쳐 보거나, 갖고 계신 파일을 직접 지정하세요."
+                    )
+                    Spacer()
+                } else {
+                    candidateList(for: track)
+                }
+            }
+            .padding(Spacing.l)
+        } else {
+            EmptyResults(symbol: "hand.point.left", message: "왼쪽에서 곡을 고르세요.")
+        }
+    }
+
+    private func candidateList(for track: Track) -> some View {
+        List {
+            ForEach(candidates) { candidate in
+                HStack(spacing: Spacing.m) {
+                    MusicArtwork(url: candidate.thumbnailURL, size: 36)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(candidate.title).font(.callout).lineLimit(1)
+                        HStack(spacing: Spacing.xs) {
+                            Label(candidate.asset.provider.displayName, systemImage: candidate.asset.provider.symbol)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(candidate.artist).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: Spacing.s)
+                    MusicMatchMeter(score: candidate.score)
+                    Text(MusicFormat.time(candidate.duration))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 46, alignment: .trailing)
+                    Button(
+                        model.previewingID == candidate.id ? "미리 듣기 중지" : "미리 듣기",
+                        systemImage: model.previewingID == candidate.id ? "stop.circle" : "play.circle"
+                    ) {
+                        model.togglePreview(candidate)
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    Button("이 음원으로") {
+                        model.stopPreview()
+                        model.choose(candidate, for: track)
+                        advanceSelection()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .listStyle(.inset)
+    }
+
+    /// 하나를 붙이면 다음 곡으로 넘어간다. 열 곡을 붙이는 동안 열 번 왼쪽을 누르게
+    /// 하지 않는다.
+    private func advanceSelection() {
+        let remaining = model.tracksNeedingAsset
+        selectedID = remaining.first?.id
+    }
+
+    private func reload() {
+        guard let track = selected else { return }
+        searchGeneration += 1
+        let generation = searchGeneration
+        let text = query
+        isLoading = true
+        Task {
+            let found = await model.candidates(for: track, query: text)
+            guard generation == searchGeneration else { return }
+            candidates = found
+            isLoading = false
+        }
+    }
+
+    private func pickFile(for track: Track) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.audio, .mp3, .mpeg4Audio, .wav, .aiff]
+        panel.prompt = "이 파일로 재생"
+        if panel.runModal() == .OK, let url = panel.url {
+            model.assignFile(url, to: track)
+            advanceSelection()
+        }
+    }
+}
+
+/// 후보가 얼마나 닮았는지를 한눈에. 숫자만 적으면 0.71이 좋은 건지 나쁜 건지 알 수 없다.
+private struct MusicMatchMeter: View {
+    let score: Double
+
+    private var color: Color {
+        if score >= MusicMatching.confidentThreshold { return .green }
+        if score >= MusicMatching.acceptanceThreshold { return .orange }
+        return .secondary
+    }
+
+    private var label: String {
+        if score >= MusicMatching.confidentThreshold { return "거의 확실" }
+        if score >= MusicMatching.acceptanceThreshold { return "비슷함" }
+        return "다를 수 있음"
+    }
+
+    var body: some View {
+        HStack(spacing: Spacing.xs) {
+            Capsule()
+                .fill(.quaternary)
+                .frame(width: 44, height: 4)
+                .overlay(alignment: .leading) {
+                    Capsule().fill(color).frame(width: 44 * min(1, max(0.04, score)), height: 4)
+                }
+            Text(label).font(.caption2).foregroundStyle(color).frame(width: 62, alignment: .leading)
+        }
+        .help("제목·아티스트·길이를 견준 값입니다 (\(String(format: "%.2f", score)))")
     }
 }

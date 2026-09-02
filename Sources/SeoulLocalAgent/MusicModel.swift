@@ -110,8 +110,10 @@ struct PlaybackAsset: Codable, Hashable, Sendable {
     var provenance: String {
         switch provider {
         case .localFile: (id as NSString).lastPathComponent
-        case .audius: "Audius · \(artist)"
-        case .internetArchive: "Internet Archive · \(artist)"
+        // 아티스트를 모르는 항목이 흔하다. 빈 이름을 붙이면 `Audius · `로 끝나는
+        // 어색한 문장이 되므로 이름이 있을 때만 붙인다.
+        case .audius: artist.isEmpty ? "Audius" : "Audius · \(artist)"
+        case .internetArchive: artist.isEmpty ? "Internet Archive · \(title)" : "Internet Archive · \(artist)"
         }
     }
 }
@@ -238,6 +240,41 @@ enum RepeatMode: String, Codable, Sendable, CaseIterable {
         case .all: "전체 반복"
         case .one: "한 곡 반복"
         }
+    }
+}
+
+// MARK: - 재생 순서
+
+/// 대기열의 어느 칸을 다음에 틀 것인가.
+///
+/// 모델에서 떼어 낸 이유는 이 규칙이 화면도 네트워크도 필요 없는 순수한 결정이고,
+/// 동시에 틀리기 쉬운 곳이기 때문이다 — 셔플과 반복이 겹칠 때 마지막 곡에서 무엇이
+/// 일어나야 하는지는 눈으로 보고 알기 어렵다.
+enum MusicQueueOrder {
+    /// 셔플이 켜져 있으면 순서를 섞되 **지금 듣는 곡을 맨 앞에** 둔다. 그러지 않으면
+    /// 셔플을 켜는 순간 듣던 곡이 대기열 한가운데로 밀려나 `이전`이 엉뚱한 곳으로 간다.
+    static func order(count: Int, shuffle: Bool, current: Int?) -> [Int] {
+        guard count > 0 else { return [] }
+        guard shuffle else { return Array(0..<count) }
+        var indices = Array(0..<count).shuffled()
+        if let current, let at = indices.firstIndex(of: current) { indices.swapAt(0, at) }
+        return indices
+    }
+
+    /// 다음 자리. `nil`이면 여기서 멈춘다.
+    static func next(from position: Int, count: Int, repeatMode: RepeatMode) -> Int? {
+        guard count > 0 else { return nil }
+        let candidate = position + 1
+        if candidate < count { return candidate }
+        return repeatMode == .all ? 0 : nil
+    }
+
+    /// 이전 자리. `nil`이면 처음으로 되감는다.
+    static func previous(from position: Int, count: Int, repeatMode: RepeatMode) -> Int? {
+        guard count > 0 else { return nil }
+        let candidate = position - 1
+        if candidate >= 0 { return candidate }
+        return repeatMode == .all ? count - 1 : nil
     }
 }
 

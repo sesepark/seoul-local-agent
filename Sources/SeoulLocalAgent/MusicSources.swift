@@ -148,12 +148,20 @@ enum MusicMatching {
         return max(0, min(1, total))
     }
 
-    /// 낱말 겹침. 짧은 쪽을 기준으로 재므로 `제목`과 `제목 (Remix)`가 크게 벌어지지 않는다.
+    /// 낱말 겹침.
+    ///
+    /// 짧은 쪽만 기준으로 재면(`shared / min`) 짧은 제목이 긴 제목을 전부 통과한다.
+    /// 실제로 `Chopin — Nocturne in E flat major`를 찾다가 다른 아티스트의 `Nocturne`
+    /// 한 곡에 1.0이 붙었고, 문턱을 넘어 재생될 뻔했다. 양쪽 길이를 함께 세는 Dice를
+    /// 주로 쓰고, `제목`과 `제목 (Remix)`가 지나치게 벌어지지 않도록 짧은 쪽 기준을
+    /// 조금만 섞는다.
     private static func overlap(_ left: [String], _ right: [String]) -> Double {
         guard !left.isEmpty, !right.isEmpty else { return 0 }
         let leftSet = Set(left), rightSet = Set(right)
-        let shared = leftSet.intersection(rightSet).count
-        return Double(shared) / Double(min(leftSet.count, rightSet.count))
+        let shared = Double(leftSet.intersection(rightSet).count)
+        let dice = 2 * shared / Double(leftSet.count + rightSet.count)
+        let containment = shared / Double(min(leftSet.count, rightSet.count))
+        return dice * 0.75 + containment * 0.25
     }
 
     /// 이 점수 아래로는 재생하지 않는다. 엉뚱한 곡을 조용히 틀어 주는 것이 아무것도

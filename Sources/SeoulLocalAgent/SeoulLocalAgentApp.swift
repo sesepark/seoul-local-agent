@@ -54,6 +54,13 @@ struct SeoulLocalAgentApp: App {
         // read the console's status, pull one frame from each camera and report
         // whether anything was left running. Useful when the arms will not start
         // and the question is whether this Mac can reach the server at all.
+        // 음악 탭이 닿는 곳을 한 번씩 두드려 본다. 창을 열지 않고도 무엇이 되고
+        // 무엇이 안 되는지 알 수 있어야 한다.
+        if CommandLine.arguments.contains("--music-check") {
+            Task { @MainActor in
+                exit(await MusicConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
+            }
+        }
         if CommandLine.arguments.contains("--soarm-check") {
             Task { @MainActor in
                 exit(await SOArmConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)

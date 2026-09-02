@@ -98,6 +98,10 @@ final class MusicPlayerModel: ObservableObject {
     let embed = YouTubeEmbedPlayer()
 
     private let player = AVPlayer()
+    /// 후보를 들어 보는 용도의 두 번째 플레이어. 본 재생과 섞이면 어느 소리가 어느
+    /// 곡인지 알 수 없으므로, 미리 듣기를 시작하면 본 재생은 멈춘다.
+    private let previewPlayer = AVPlayer()
+    @Published private(set) var previewingID: String?
     private var timeObserver: Any?
     private var observers: [NSObjectProtocol] = []
     /// 앞선 요청이 늦게 끝나 방금 고른 곡을 덮어쓰는 것을 막는다. 음원 찾기는 몇 초가
@@ -180,6 +184,21 @@ final class MusicPlayerModel: ObservableObject {
         configureRemoteCommands()
         Self.current = self
         Task { await refreshLocalCount() }
+        // `--section`과 같은 이유다: 창을 눌러 보지 않고도 이 화면이 실제로 무엇을
+        // 그리는지 확인할 수 있어야 한다. 검색만 하고 재생은 하지 않는다 — 확인하려고
+        // 남의 Mac에서 소리를 내지는 않는다.
+        if let index = CommandLine.arguments.firstIndex(of: "--music-query"),
+           index + 1 < CommandLine.arguments.count {
+            query = CommandLine.arguments[index + 1]
+            if let scopeIndex = CommandLine.arguments.firstIndex(of: "--music-scope"),
+               scopeIndex + 1 < CommandLine.arguments.count,
+               let requested = MusicSearchScope(rawValue: CommandLine.arguments[scopeIndex + 1]) {
+                scope = requested
+            } else {
+                scope = .free
+            }
+            Task { @MainActor in self.runSearch() }
+        }
     }
 
     deinit {
@@ -403,10 +422,11 @@ final class MusicPlayerModel: ObservableObject {
             return
         }
         guard !playOrder.isEmpty else { return }
-        var target = orderPosition - 1
-        if target < 0 {
-            guard library.repeatMode == .all else { seek(to: 0); return }
-            target = playOrder.count - 1
+        guard let target = MusicQueueOrder.previous(
+            from: orderPosition, count: playOrder.count, repeatMode: library.repeatMode
+        ) else {
+            seek(to: 0)
+            return
         }
         orderPosition = target
         startPlayback(at: playOrder[target], autoAdvanced: false)
@@ -457,19 +477,12 @@ final class MusicPlayerModel: ObservableObject {
     // MARK: 순서
 
     private func rebuildOrder() {
-        let count = library.queue.count
-        guard count > 0 else { playOrder = []; orderPosition = 0; return }
-        if library.shuffle {
-            var indices = Array(0..<count).shuffled()
-            if let current = library.queueIndex, let at = indices.firstIndex(of: current) {
-                indices.swapAt(0, at)
-            }
-            playOrder = indices
-            orderPosition = 0
-        } else {
-            playOrder = Array(0..<count)
-            orderPosition = library.queueIndex ?? 0
-        }
+        playOrder = MusicQueueOrder.order(
+            count: library.queue.count,
+            shuffle: library.shuffle,
+            current: library.queueIndex
+        )
+        orderPosition = library.shuffle ? 0 : (library.queueIndex ?? 0)
     }
 
     private func trackFinished() {
@@ -482,18 +495,18 @@ final class MusicPlayerModel: ObservableObject {
 
     private func advance(auto: Bool) {
         guard !playOrder.isEmpty else { stop(); return }
-        var target = orderPosition + 1
-        if target >= playOrder.count {
-            guard library.repeatMode == .all else {
-                player.pause()
-                status = .paused
-                position = 0
-                seek(to: 0)
-                return
-            }
-            target = 0
-            if library.shuffle { rebuildOrder(); target = 0 }
+        guard let target = MusicQueueOrder.next(
+            from: orderPosition, count: playOrder.count, repeatMode: library.repeatMode
+        ) else {
+            // 끝났다. 멈추되 대기열은 그대로 둔다 — 다시 누르면 처음부터 간다.
+            if route == .youtube { embed.pause() } else { player.pause() }
+            status = .paused
+            seek(to: 0)
+            return
         }
+        // 한 바퀴를 돌아 다시 시작할 때는 순서를 새로 섞는다. 같은 셔플을 두 번 도는
+        // 것은 셔플이라기보다 정해진 순서다.
+        if target == 0, library.shuffle { rebuildOrder() }
         orderPosition = target
         startPlayback(at: playOrder[target], autoAdvanced: auto)
     }
@@ -939,5 +952,212 @@ final class MusicPlayerModel: ObservableObject {
         if let track = currentTrack, status.isActive || status == .paused { return track.availabilityNote }
         if !isYouTubeConfigured { return "설정 › 음악에서 YouTube API 키를 넣으세요" }
         return "내 음악 \(localTrackCount)곡 · 좋아요 \(library.likedIDs.count)곡"
+    }
+}
+
+// MARK: - 터미널 점검
+
+/// `--music-check`. 화면을 열지 않고 음악 탭이 실제로 닿는 곳을 한 번씩 두드려 본다.
+///
+/// `--connection-check`·`--soarm-check`와 같은 이유로 있다: 무엇이 되고 무엇이 안 되는지를
+/// 창을 눌러 보지 않고 알 수 있어야 하고, 고정 문자열이 아니라 **실제 시도**여야 한다.
+/// 소리는 내지 않는다 — 음량 0으로 열어서 재생 준비까지만 확인한다.
+enum MusicConnectionCheck {
+    @MainActor
+    static func run() async -> Bool {
+        var failed = false
+        func report(_ ok: Bool?, _ title: String, _ detail: String) {
+            let mark = ok == nil ? "⚠️" : (ok! ? "✅" : "❌")
+            if ok == false { failed = true }
+            print("\(mark) \(title): \(detail)")
+        }
+
+        // 1. YouTube — 검색과 메타데이터에만 쓴다.
+        let configuration = YouTubeConfigurationStore()
+        if let key = configuration.load() {
+            let catalog = YouTubeCatalogSource(apiKey: key, musicOnly: true)
+            do {
+                let tracks = try await catalog.search("아이유", limit: 5)
+                report(!tracks.isEmpty, "YouTube 검색", "\(tracks.count)건" + (tracks.first.map { " · 예: \($0.artist) — \($0.title)" } ?? ""))
+            } catch {
+                report(false, "YouTube 검색", error.localizedDescription)
+            }
+        } else {
+            report(nil, "YouTube 검색", "API 키가 없습니다 (\(configuration.debugURL.path))")
+        }
+
+        // 2. 광고 없는 음원 세 곳.
+        let index = LocalMusicIndex()
+        let localCount = await index.count
+        report(localCount > 0 ? true : nil, "내 음악 색인", "\(localCount)곡" + (localCount == 0 ? " · 앱의 `내 음악 › 다시 훑기`를 한 번 누르세요" : ""))
+
+        let audius = AudiusSource()
+        var audiusAsset: PlaybackAsset?
+        do {
+            let tracks = try await audius.search("lofi", limit: 5)
+            audiusAsset = tracks.first?.asset
+            report(!tracks.isEmpty, "Audius 검색", "\(tracks.count)건" + (tracks.first.map { " · 예: \($0.artist) — \($0.title)" } ?? ""))
+        } catch {
+            report(false, "Audius 검색", error.localizedDescription)
+        }
+
+        let archive = InternetArchiveSource()
+        var archiveAsset: PlaybackAsset?
+        do {
+            let tracks = try await archive.search("chopin nocturne", limit: 5)
+            archiveAsset = tracks.first?.asset
+            report(!tracks.isEmpty, "Internet Archive 검색", "\(tracks.count)건" + (tracks.first.map { " · 예: \($0.title)" } ?? ""))
+        } catch {
+            report(false, "Internet Archive 검색", error.localizedDescription)
+        }
+
+        // 3. 실제로 열리는가. 주소를 만들 수 있는 것과 소리가 나는 것은 다른 문제다.
+        for (name, asset) in [("Audius 재생", audiusAsset), ("Internet Archive 재생", archiveAsset)] {
+            guard let asset, let url = asset.streamURL else {
+                report(false, name, "재생 주소를 만들지 못했습니다")
+                continue
+            }
+            let ready = await canOpen(url)
+            report(ready, name, ready ? "재생 준비 완료 · \(asset.provenance)" : "열지 못했습니다 · \(url.absoluteString.prefix(80))")
+        }
+
+        // 4. 맞추기 — YouTube에서 고른 곡이 광고 없는 음원으로 이어지는가.
+        let sample = Track(origin: .youtube, originID: "checkcheck1",
+                           title: "Nocturne in E flat major", artist: "Chopin", duration: 270)
+        let resolved = await PlaybackResolver(local: LocalMusicSource(index: index)).resolve(sample)
+        // 못 찾는 것 자체는 고장이 아니다. 상용 음악은 무료로 합법적인 음원이 아예
+        // 없는 경우가 많고, 그때는 폴백이 있는지 없는지가 답이 된다.
+        report(resolved != nil ? true : nil, "음원 맞추기",
+               resolved.map { "\($0.provider.displayName) · \($0.provenance) · 확신 \(String(format: "%.2f", $0.confidence))" }
+               ?? "이 곡에 맞는 광고 없는 음원을 찾지 못했습니다 (폴백이 켜져 있으면 YouTube로 재생됩니다)")
+
+        print("• 보관함: \(MusicLibraryStore().debugURL.path)")
+        return !failed
+    }
+
+    /// 소리를 내지 않고 열리는지만 본다. 음량 0으로 준비 상태까지만 기다린다.
+    private static func canOpen(_ url: URL) async -> Bool {
+        let item = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: item)
+        player.volume = 0
+        player.isMuted = true
+        for _ in 0..<40 {
+            switch item.status {
+            case .readyToPlay: return true
+            case .failed: return false
+            default: try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        return false
+    }
+}
+
+// MARK: - 음원 후보
+
+/// 한 곡에 붙일 수 있는 음원 하나. 어디서 왔고, 얼마나 닮았고, 들어 보면 어떤지.
+struct MusicCandidate: Identifiable, Equatable, Sendable {
+    var id: String { "\(asset.provider.rawValue):\(asset.id)" }
+    var asset: PlaybackAsset
+    var title: String
+    var artist: String
+    var duration: TimeInterval?
+    var thumbnailURL: URL?
+    /// 대상 곡과 얼마나 닮았는지, 0…1.
+    var score: Double
+
+    var isConfident: Bool { score >= MusicMatching.confidentThreshold }
+    var isAcceptable: Bool { score >= MusicMatching.acceptanceThreshold }
+}
+
+extension MusicPlayerModel {
+
+    /// 보관함이 실제로 들고 있는 곡 중 광고 없는 음원이 아직 없는 것들.
+    ///
+    /// 검색 결과는 세지 않는다 — 아직 내 것이 아닌 곡이고, 그것까지 세면 목록이
+    /// 무엇을 하라는 목록인지 알 수 없게 된다.
+    var tracksNeedingAsset: [Track] {
+        var seen = Set<String>()
+        var result: [Track] = []
+        for id in library.playlists.flatMap(\.trackIDs) + library.likedIDs + library.queue {
+            guard !seen.contains(id), let track = library.track(id), track.asset == nil else { continue }
+            seen.insert(id)
+            result.append(track)
+        }
+        return result
+    }
+
+    /// 한 곡에 붙일 수 있는 음원 후보를 세 곳에서 모아 점수 순으로.
+    ///
+    /// `query`를 비워 두면 곡의 아티스트와 제목으로 찾는다. 비워 두지 않는 것이
+    /// 이 화면의 핵심이다 — 자동으로 못 찾은 곡은 대개 표기가 달라서 못 찾은 것이고
+    /// (한글 제목 대 로마자, 앨범명 대 곡명), 사람이 다르게 쳐 보면 바로 나온다.
+    func candidates(for track: Track, query: String = "") async -> [MusicCandidate] {
+        let text = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "\(track.artist) \(track.title)".trimmingCharacters(in: .whitespaces)
+            : query
+        guard !text.isEmpty else { return [] }
+
+        let local = localSource
+        async let localTracks = local.rank(text, limit: 15)
+        async let audiusTracks = try? audius.search(text, limit: 20)
+        async let archiveTracks = try? archive.search(text, limit: 15)
+        let found = await localTracks + (audiusTracks ?? []) + (archiveTracks ?? [])
+
+        var seen = Set<String>()
+        return found.compactMap { candidate -> MusicCandidate? in
+            guard let asset = candidate.asset else { return nil }
+            let key = "\(asset.provider.rawValue):\(asset.id)"
+            guard seen.insert(key).inserted else { return nil }
+            return MusicCandidate(
+                asset: asset,
+                title: candidate.title,
+                artist: candidate.artist,
+                duration: candidate.duration,
+                thumbnailURL: candidate.thumbnailURL,
+                score: MusicMatching.score(
+                    queryTitle: track.title, queryArtist: track.artist, queryDuration: track.duration,
+                    candidateTitle: candidate.title, candidateArtist: candidate.artist,
+                    candidateDuration: candidate.duration
+                )
+            )
+        }
+        .sorted { $0.score > $1.score }
+    }
+
+    /// 사람이 고른 후보를 곡에 붙인다. 자동 매칭이 나중에 이것을 덮지 않는다.
+    func choose(_ candidate: MusicCandidate, for track: Track) {
+        var asset = candidate.asset
+        asset.isManual = true
+        asset.confidence = max(asset.confidence, candidate.score)
+        asset.resolvedAt = Date()
+        library.remember(track)
+        library.attach(asset, to: track.id)
+        if currentTrack?.id == track.id { currentTrack = library.track(track.id) }
+        notice = "「\(track.title)」에 \(asset.provider.displayName) 음원을 연결했습니다."
+        saveNow()
+    }
+}
+
+// MARK: - 미리 듣기
+
+extension MusicPlayerModel {
+    func togglePreview(_ candidate: MusicCandidate) {
+        if previewingID == candidate.id {
+            stopPreview()
+            return
+        }
+        guard let url = candidate.asset.streamURL else { return }
+        // 사람은 두 곡을 동시에 들을 수 없다. 본 재생을 멈추고 후보만 들려준다.
+        if status == .playing || status == .buffering { togglePlayPause() }
+        previewPlayer.replaceCurrentItem(with: AVPlayerItem(url: url))
+        previewPlayer.volume = Float(library.volume)
+        previewPlayer.play()
+        previewingID = candidate.id
+    }
+
+    func stopPreview() {
+        previewPlayer.pause()
+        previewPlayer.replaceCurrentItem(with: nil)
+        previewingID = nil
     }
 }

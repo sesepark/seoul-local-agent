@@ -138,6 +138,30 @@ struct MusicTests {
         #expect(loop < MusicMatching.acceptanceThreshold)
     }
 
+    @Test("짧은 제목이 긴 제목을 통째로 통과하지 못한다")
+    func rejectsShortTitleSubsumption() {
+        // 실제로 걸렸던 것: `Chopin — Nocturne in E flat major`를 찾다가 다른 아티스트의
+        // `Nocturne` 한 곡이 문턱을 넘어 재생될 뻔했다. 짧은 쪽만 기준으로 겹침을 재면
+        // 한 낱말짜리 제목이 무엇에나 1.0으로 맞는다.
+        let score = MusicMatching.score(
+            queryTitle: "Nocturne in E flat major", queryArtist: "Chopin", queryDuration: 270,
+            candidateTitle: "Nocturne", candidateArtist: "Durmen", candidateDuration: 210
+        )
+        #expect(score < MusicMatching.acceptanceThreshold)
+    }
+
+    @Test("Internet Archive의 번호뿐인 제목은 파일 이름이나 항목 이름으로 대신한다")
+    func repairsArchiveTitles() {
+        // 아카이브의 파일 `title`은 `1`처럼 트랙 번호만 든 경우가 흔하다. 그대로 두면
+        // 목록에 숫자만 늘어선다.
+        #expect(InternetArchiveSource.displayTitle(fileTitle: "1", fileName: "nocturne-op9-no2.mp3", itemTitle: "Chopin Nocturnes") == "nocturne-op9-no2")
+        // `1.mp3`·`2.mp3`처럼 번호뿐인 파일이 한 항목에 여럿 있으면 같은 이름의 줄이
+        // 여럿 늘어선다. 번호를 붙여 구별한다.
+        #expect(InternetArchiveSource.displayTitle(fileTitle: "", fileName: "03.mp3", itemTitle: "Chopin Nocturnes") == "Chopin Nocturnes — 03")
+        #expect(InternetArchiveSource.displayTitle(fileTitle: "", fileName: "", itemTitle: "Chopin Nocturnes") == "Chopin Nocturnes")
+        #expect(InternetArchiveSource.displayTitle(fileTitle: "Nocturne Op.9 No.2", fileName: "a.mp3", itemTitle: "X") == "Nocturne Op.9 No.2")
+    }
+
     @Test("한쪽이 아티스트를 모르면 제목만으로 판단한다")
     func toleratesMissingArtist() {
         // Internet Archive는 업로더 이름밖에 없는 항목이 많다. 모르는 것을 틀린 것으로
@@ -305,6 +329,41 @@ struct MusicTests {
         let store = MusicLibraryStore(directory: directory)
         try Data("이건 JSON이 아닙니다".utf8).write(to: store.debugURL)
         #expect(store.load().playlists.isEmpty)
+    }
+
+    // MARK: 재생 순서
+
+    @Test("셔플을 켜도 지금 듣는 곡이 맨 앞에 온다")
+    func shuffleKeepsCurrentFirst() {
+        // 그러지 않으면 셔플을 켜는 순간 듣던 곡이 순서 한가운데로 밀려나고, `이전`이
+        // 방금 듣던 곡이 아니라 엉뚱한 곡으로 간다.
+        for _ in 0..<20 {
+            let order = MusicQueueOrder.order(count: 8, shuffle: true, current: 5)
+            #expect(order.first == 5)
+            #expect(Set(order) == Set(0..<8))
+        }
+    }
+
+    @Test("셔플이 꺼져 있으면 순서는 대기열 그대로다")
+    func plainOrder() {
+        #expect(MusicQueueOrder.order(count: 4, shuffle: false, current: 2) == [0, 1, 2, 3])
+        #expect(MusicQueueOrder.order(count: 0, shuffle: true, current: nil).isEmpty)
+    }
+
+    @Test("마지막 곡 다음은 전체 반복일 때만 처음으로 돌아간다")
+    func nextAtEnd() {
+        #expect(MusicQueueOrder.next(from: 1, count: 3, repeatMode: .off) == 2)
+        #expect(MusicQueueOrder.next(from: 2, count: 3, repeatMode: .off) == nil)
+        #expect(MusicQueueOrder.next(from: 2, count: 3, repeatMode: .all) == 0)
+        // 한 곡 반복은 이 함수까지 오지 않는다(같은 곡을 다시 튼다). 와도 멈춘다.
+        #expect(MusicQueueOrder.next(from: 2, count: 3, repeatMode: .one) == nil)
+    }
+
+    @Test("첫 곡의 이전은 전체 반복일 때만 마지막으로 간다")
+    func previousAtStart() {
+        #expect(MusicQueueOrder.previous(from: 1, count: 3, repeatMode: .off) == 0)
+        #expect(MusicQueueOrder.previous(from: 0, count: 3, repeatMode: .off) == nil)
+        #expect(MusicQueueOrder.previous(from: 0, count: 3, repeatMode: .all) == 2)
     }
 
     // MARK: 반복

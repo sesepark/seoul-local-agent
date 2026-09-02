@@ -202,6 +202,22 @@ struct LocalMusicSource: MusicCatalogSource, MusicStreamSource {
         return scored.sorted { $0.0 > $1.0 }.prefix(limit).map(\.1)
     }
 
+    /// 후보를 고를 때 쓰는 느슨한 검색. `search`는 친 낱말이 전부 맞아야 하지만,
+    /// 여기서는 조금이라도 닮은 것을 점수 순으로 보여 줘야 한다 — 못 찾은 곡을 사람이
+    /// 직접 고르는 화면에서는 "0건"보다 "닮은 것 다섯 개"가 훨씬 쓸모 있다.
+    func rank(_ query: String, limit: Int = 15) async -> [Track] {
+        let needle = MusicMatching.tokens(query)
+        guard !needle.isEmpty else { return [] }
+        let scored = await index.all.compactMap { entry -> (Double, Track)? in
+            let haystack = MusicMatching.tokens("\(entry.artist) \(entry.title) \(entry.album ?? "")")
+            guard !haystack.isEmpty else { return nil }
+            let hits = needle.filter { token in haystack.contains { $0.hasPrefix(token) } }.count
+            guard hits > 0 else { return nil }
+            return (Double(hits) / Double(needle.count), Self.track(entry))
+        }
+        return scored.sorted { $0.0 > $1.0 }.prefix(limit).map(\.1)
+    }
+
     static func track(_ entry: LocalMusicEntry) -> Track {
         Track(
             origin: .local,
