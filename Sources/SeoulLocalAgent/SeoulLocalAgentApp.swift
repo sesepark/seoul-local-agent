@@ -486,6 +486,34 @@ final class AutomationController: ObservableObject {
         didSet { UserDefaults.standard.set(conversionQuality, forKey: "conversionQuality") }
     }
 
+    // MARK: 자동 브리핑
+
+    /// 밤에 스스로 한 번 돌릴 것인가. 기본은 **꺼짐** — 사람이 켜지 않은 자동 실행은
+    /// 자동화가 아니라 놀라운 일이다.
+    @Published var autoBriefingEnabled: Bool {
+        didSet { UserDefaults.standard.set(autoBriefingEnabled, forKey: "autoBriefingEnabled") }
+    }
+    /// 시간대의 시작. 끝은 여기서 `autoBriefingWindowHours` 뒤다.
+    @Published var autoBriefingStartHour: Int {
+        didSet { UserDefaults.standard.set(autoBriefingStartHour, forKey: "autoBriefingStartHour") }
+    }
+    /// 왜 지금 돌지 않는지, 또는 마지막으로 언제 돌았는지. 화면이 그대로 적는다.
+    @Published private(set) var autoBriefingStatus = ""
+    /// 자동으로 돌린 마지막 시각. 사람이 직접 누른 실행은 여기에 적히지 않는다 —
+    /// 아침에 답해야 하는 질문은 "어젯밤 자동으로 돌았나"이기 때문이다.
+    @Published private(set) var lastAutoBriefingAt: Date? {
+        didSet { UserDefaults.standard.set(lastAutoBriefingAt?.timeIntervalSince1970 ?? 0, forKey: "lastAutoBriefingAt") }
+    }
+    private var autoBriefingFailures = 0
+    private var autopilotTimer: Timer?
+    private let sleepGuard = SleepGuard()
+    /// 자동 실행이 걸어 둔 절전 방지를 이 실행이 잡고 있는가.
+    private var isAutoBriefing = false
+
+    /// 시간대의 길이. 세 시간인 이유는 사용자가 그렇게 정했기 때문이고(3시–6시), 그
+    /// 길이면 조건이 맞는 밤에는 넉넉히 걸리면서 아침에 사람이 돌아오기 전에 끝난다.
+    static let autoBriefingWindowHours = 3
+
     let audioRecorder = AudioRecorder()
     let recordingPlayer = RecordingPlayer()
     let dictation = DictationController()
@@ -542,6 +570,10 @@ final class AutomationController: ObservableObject {
 
     init() {
         let briefingPreferences = BriefingPreferencesStore().load()
+        autoBriefingEnabled = UserDefaults.standard.bool(forKey: "autoBriefingEnabled")
+        autoBriefingStartHour = UserDefaults.standard.object(forKey: "autoBriefingStartHour") as? Int ?? 3
+        let storedAuto = UserDefaults.standard.double(forKey: "lastAutoBriefingAt")
+        lastAutoBriefingAt = storedAuto > 0 ? Date(timeIntervalSince1970: storedAuto) : nil
         briefingUserInstructions = briefingPreferences.userInstructions
         briefingIgnoredPatternsText = briefingPreferences.ignoredPatterns.joined(separator: "\n")
         briefingImportantPatternsText = briefingPreferences.importantPatterns.joined(separator: "\n")
@@ -634,6 +666,115 @@ final class AutomationController: ObservableObject {
         // 설정 창의 탭 선택은 컨트롤러가 쥐고 있고 그 창은 음악 화면의 뷰 트리 밖에
         // 있다. 화면이 `설정 열기`를 누르면 정확히 음악 탭으로 가야 한다.
         music.requestSettingsTab = { [weak self] in self?.settingsTab = .music }
+    }
+
+    // MARK: - 자동 브리핑
+
+    /// 1분에 한 번, 지금 돌아도 되는지 본다.
+    ///
+    /// 1분인 이유는 이 검사가 거의 공짜이기 때문이다 — 전원 상태와 유휴 시간을 읽는 것이
+    /// 전부다. 더 드물게 보면 조건이 맞는 짧은 창을 놓치고, 더 자주 볼 이유는 없다.
+    private func startAutopilot() {
+        updateAutoBriefingStatus()
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.autopilotTick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autopilotTimer = timer
+    }
+
+    private func autopilotConditions(now: Date = Date()) -> BriefingAutopilot.Conditions {
+        BriefingAutopilot.Conditions(
+            isEnabled: autoBriefingEnabled,
+            now: now,
+            startHour: autoBriefingStartHour,
+            windowHours: Self.autoBriefingWindowHours,
+            isOnPower: BriefingAutopilot.isOnPower,
+            isLidClosed: LidState.isClosed,
+            idleSeconds: BriefingAutopilot.idleSeconds,
+            busyWith: currentWorkName,
+            isHot: BriefingAutopilot.isHot,
+            lastAttemptAt: lastAutoBriefingAt,
+            consecutiveFailures: autoBriefingFailures
+        )
+    }
+
+    /// 지금 이 Mac이 하고 있는 무거운 일. 자동 실행은 그 위에 얹지 않는다.
+    ///
+    /// 녹음과 받아쓰기까지 세는 이유는, 로컬 모델이 GPU를 통째로 쓰는 동안 마이크가
+    /// 도는 것을 굳이 겹치게 할 이유가 없기 때문이다.
+    private var currentWorkName: String? {
+        if isRunning { return "브리핑" }
+        if isTranscribing { return "전사" }
+        if isOrganizingTranscript { return "AI 정리" }
+        if audioRecorder.isRecording { return "녹음" }
+        if dictation.isRecording || dictation.isTranscribing { return "받아쓰기" }
+        if isRecognizingDocument { return "문서 인식" }
+        return nil
+    }
+
+    private func autopilotTick() {
+        guard !isAutoBriefing else { return }
+        let conditions = autopilotConditions()
+        guard BriefingAutopilot.blocker(conditions) == nil else {
+            updateAutoBriefingStatus(conditions)
+            return
+        }
+        runBriefingAutomatically()
+    }
+
+    private func updateAutoBriefingStatus(_ conditions: BriefingAutopilot.Conditions? = nil) {
+        let conditions = conditions ?? autopilotConditions()
+        guard let blocker = BriefingAutopilot.blocker(conditions) else {
+            autoBriefingStatus = "조건이 맞습니다 · 곧 시작합니다"
+            return
+        }
+        // 마지막으로 자동 실행한 시각은 막힌 이유와 함께 남긴다. "왜 지금 안 도는가"와
+        // "마지막으로 언제 돌았는가"는 아침에 둘 다 궁금한 것이다.
+        var line = blocker.reason
+        if case .disabled = blocker {} else if let last = lastAutoBriefingAt {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "ko_KR")
+            formatter.dateFormat = "M월 d일 HH:mm"
+            line += " · 마지막 자동 실행 \(formatter.string(from: last))"
+        }
+        autoBriefingStatus = line
+    }
+
+    /// 사람이 없는 동안 도는 실행. 도는 내내 유휴 절전을 막아 두고, 끝나면 놓는다.
+    private func runBriefingAutomatically() {
+        isAutoBriefing = true
+        lastAutoBriefingAt = Date()
+        sleepGuard.hold("서울대 로컬 에이전트 · 자동 브리핑")
+        autoBriefingStatus = "자동 실행 중입니다"
+        startBriefing()
+        // `startBriefing`이 만든 작업이 끝나는 것을 기다린다. 브리핑 모델이 상태를
+        // 직접 알려 주지 않으므로 `isRunning`이 내려가는 것을 본다.
+        Task { [weak self] in
+            while let self, self.isRunning {
+                try? await Task.sleep(for: .seconds(2))
+            }
+            guard let self else { return }
+            self.sleepGuard.release()
+            self.isAutoBriefing = false
+            // 실패가 이어지면 그만둔다. 밤새 같은 실패를 반복하는 것은 고치는 데 도움이
+            // 되지 않고 배터리와 열만 쓴다.
+            if self.phase == .failed {
+                self.autoBriefingFailures += 1
+            } else {
+                self.autoBriefingFailures = 0
+            }
+            self.updateAutoBriefingStatus()
+        }
+    }
+
+    /// 파일에 있는 분류 기준을 화면의 사본으로 다시 읽는다.
+    func reloadBriefingPreferences() {
+        let preferences = briefingPreferencesStore.load()
+        briefingUserInstructions = preferences.userInstructions
+        briefingIgnoredPatternsText = preferences.ignoredPatterns.joined(separator: "\n")
+        briefingImportantPatternsText = preferences.importantPatterns.joined(separator: "\n")
+        briefingInterestPatternsText = preferences.interestPatterns.joined(separator: "\n")
     }
 
     func saveBriefingPreferences() {
@@ -2738,8 +2879,42 @@ private struct BriefingStatusWorkspaceView: View {
 
     private var isDone: Bool { controller.phase == .completed }
 
+    /// 자동 실행이 켜져 있으면 **왜 지금 돌지 않는지**를 적는다.
+    ///
+    /// 자동화는 안 돌았을 때 이유를 말해 주지 않으면 고장과 구별되지 않는다. 아침에
+    /// 사람이 던지는 질문은 "어젯밤에 돌았나"이고, 답이 "아니오"라면 곧바로 "왜"가
+    /// 따라온다. 꺼져 있을 때는 아무것도 그리지 않는다 — 쓰지 않는 기능이 자리를
+    /// 차지할 이유가 없다.
+    @ViewBuilder
+    private var autoRun: some View {
+        if controller.autoBriefingEnabled {
+            HStack(alignment: .top, spacing: Spacing.s) {
+                Image(systemName: "moon.zzz")
+                    .foregroundStyle(Color.snuBlueLabel)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("밤 자동 실행 켜짐 · \(controller.autoBriefingStartHour)시–\((controller.autoBriefingStartHour + AutomationController.autoBriefingWindowHours) % 24)시")
+                        .font(.callout.weight(.medium))
+                    Text(controller.autoBriefingStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Button("설정") { openSettings() }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, Spacing.l)
+            .padding(.vertical, Spacing.m)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .glassPanel(Radius.card)
+            .transition(.appCard)
+        }
+    }
+
     var body: some View {
         WorkspaceScreen(title: AppSection.briefing.title, subtitle: AppSection.briefing.subtitle) {
+            autoRun
             conditions
             progressPanel
             if let error = controller.errorMessage {
@@ -2748,6 +2923,7 @@ private struct BriefingStatusWorkspaceView: View {
         }
         .animation(.appContent, value: controller.phase)
         .animation(.appContent, value: controller.errorMessage)
+        .animation(.appContent, value: controller.autoBriefingEnabled)
         .toolbar {
             ToolbarItem {
                 Button("보관함 열기", systemImage: "checklist", action: controller.openLatestResult)
@@ -2947,6 +3123,24 @@ private struct BriefingSettingsTab: View {
                 TextField("내 Slack Member ID (채널 멘션용)", text: $slackMentionUserID)
                 Text("Slack DM은 Member ID 없이 수집하며, 채널은 이 ID의 멘션만 수집합니다. `마지막 성공 이후`는 직전 실행이 수동 재검토였어도 그 시점부터 이어서 수집하고, 기록이 없으면 최대 30일까지 거슬러 봅니다.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("밤에 스스로 실행") {
+                // 확인은 체크박스 하나. 위험한 동작이 아니고, 끄는 것도 같은 한 번이다.
+                Toggle("조건이 맞으면 밤에 한 번 자동으로 정리", isOn: $controller.autoBriefingEnabled)
+                Picker("시작 시각", selection: $controller.autoBriefingStartHour) {
+                    ForEach([0, 1, 2, 3, 4], id: \.self) { hour in
+                        Text("\(hour)시–\((hour + AutomationController.autoBriefingWindowHours) % 24)시").tag(hour)
+                    }
+                }
+                .disabled(!controller.autoBriefingEnabled)
+                Text("**전원이 꽂혀 있고, 노트북이 열려 있고, \(Int(BriefingAutopilot.idleThreshold) / 60)분 넘게 아무것도 누르지 않았고, 다른 작업이 돌고 있지 않을 때** 하루 한 번 실행합니다. 도는 동안에는 이 Mac이 유휴로 잠들지 않게 잡아 두고 끝나면 놓습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("**노트북을 닫으면 이 Mac은 잠들고, 잠든 동안에는 돌지 않습니다.** 뚜껑을 닫아 둔 밤에도 돌게 하려면 예약 기상(`pmset repeat`)이나 launch agent가 필요하고, 둘 다 이 앱이 설치하지 않습니다. 로그인·화면 열기·잠자기 해제로 시작하는 일은 여전히 없습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if controller.autoBriefingEnabled {
+                    LabeledContent("지금 상태", value: controller.autoBriefingStatus)
+                        .font(.caption)
+                }
             }
             Section("무엇을 읽는가") {
                 // These rows say what each source is *for*. What each source can
