@@ -257,7 +257,16 @@ final class SOArmTunnel: @unchecked Sendable {
         process.standardError = errors
         errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
-            guard !chunk.isEmpty, let self else { return }
+            // **빈 덩이는 EOF다.** ssh가 끝나면 파이프의 쓰는 쪽이 닫히고, 그 뒤로 이
+            // 핸들러는 계속 불리면서 매번 빈 값을 돌려준다. 그냥 지나치면 그 자리에서
+            // 끝없이 도는 고리가 되어 코어 하나를 통째로 태운다 — 실제로 그렇게 돌고
+            // 있었다. 앱이 아무 일도 하지 않는 채 CPU 100%를 쓰고 있었고 이유가 여기였다.
+            // EOF에서는 더 읽을 것이 없으므로 핸들러를 떼는 것이 유일하게 맞는 답이다.
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard let self else { return }
             self.lock.lock()
             self.errorTail = String(self.errorTail.suffix(400)) + String(decoding: chunk, as: UTF8.self)
             self.lock.unlock()
