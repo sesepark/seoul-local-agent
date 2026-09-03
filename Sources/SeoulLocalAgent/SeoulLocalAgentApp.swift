@@ -238,6 +238,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // resource this app took, and a worker left holding a camera makes the
         // next recording refuse to start.
         SOArmConsoleModel.current?.releaseHeldCamerasNow()
+        // 원격 텔레옵 화면은 자기 카메라 두 대를 따로 들고 있다. 위 줄은 `SO-ARM 101`
+        // 화면의 프리뷰만 놓으므로, 이것이 없으면 텔레옵을 열어 둔 채 끝냈을 때 서버가
+        // 카메라를 계속 물고 있는다.
+        SOArmTeleopModel.current?.releaseHeldCamerasNow()
         // 조작 권한도 이 앱이 가져간 자원이다. 놓지 않고 끝나면 만료될 때까지 몇 초 동안
         // 아무도 팔을 만질 수 없다. 팔 자체는 건드리지 않는다 — 창을 닫았다는 이유로
         // 움직이던 팔을 세우거나 토크를 푸는 것은 이 앱이 내릴 결정이 아니다.

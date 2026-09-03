@@ -42,6 +42,9 @@ final class SOArmConsoleModel: ObservableObject {
 
     let sceneCamera = MJPEGStream()
     let wristCamera = MJPEGStream()
+    /// 영상을 얼마나 받을지. 원격 텔레옵 화면과 같은 값이다.
+    let cameraPolicy = SOArmCameraPolicy.shared
+    private var cameraPolicyWatch: AnyCancellable?
 
     // 수집 데이터 화면
     @Published private(set) var datasets: [SOArmDatasetSummary] = []
@@ -88,6 +91,27 @@ final class SOArmConsoleModel: ObservableObject {
         self.store = store
         server = store.load()
         Self.current = self
+        // 영상 받기를 끄면 이 화면의 프리뷰도 함께 내려간다. 한 화면에서 껐는데 다른
+        // 화면이 계속 받고 있으면 그것은 끈 것이 아니다.
+        cameraPolicyWatch = cameraPolicy.$mode
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] mode in self?.cameraPolicyChanged(to: mode) }
+    }
+
+    /// 데이터 정책이 바뀌었다. 끄면 프리뷰를 내리고, 켜면 고른 값을 서버에 건다.
+    ///
+    /// 켤 때 프리뷰를 자동으로 다시 열지는 **않는다.** 이 화면의 프리뷰는 원래 눌러야
+    /// 열리는 것이고, 데이터 설정을 만졌다는 이유로 카메라를 점유하기 시작하면 그것은
+    /// 고른 적 없는 일이 벌어지는 것이다.
+    private func cameraPolicyChanged(to mode: SOArmCameraDataMode) {
+        guard let profile = mode.profile else {
+            stopPreviews()
+            return
+        }
+        for role in SOArmCameraRole.allCases {
+            setCameraProfile(profile, for: role)
+        }
     }
 
     var client: SOArmClient { SOArmClient(baseURL: server.baseURL) }
@@ -410,6 +434,10 @@ final class SOArmConsoleModel: ObservableObject {
     // MARK: 카메라
 
     func startPreview(_ role: SOArmCameraRole) {
+        // 꺼 둔 상태에서는 열지 않는다. 화면이 버튼을 이미 막고 있지만, 프리뷰를 여는
+        // 길이 하나가 아니므로(수집이 끝난 뒤 자동으로 다시 켜는 자리가 있다) 여는
+        // 자리에서 한 번 더 본다.
+        guard !cameraPolicy.isOff else { return }
         stream(role).start(client.cameraURL(role.rawValue))
     }
 

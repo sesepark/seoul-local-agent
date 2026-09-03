@@ -6,6 +6,46 @@ import Testing
 @Suite("SO-ARM 101 콘솔")
 struct SOArmConsoleTests {
 
+    // MARK: 영상 데이터 정책
+
+    @Test("`끔`은 설정이 아니라 연결을 닫는 것이다")
+    func offIsNotAProfile() {
+        // 프로필이 없다는 것이 요점이다. 값을 하나 골라 두면 어딘가에서 그것을 걸고
+        // 스트림을 여는 길이 생기고, 그러면 껐다고 적힌 화면이 데이터를 쓴다.
+        #expect(SOArmCameraDataMode.off.profile == nil)
+        #expect(SOArmCameraDataMode.off.hourlyBytesPerCamera == nil)
+        for mode in SOArmCameraDataMode.allCases where mode != .off {
+            #expect(mode.profile != nil)
+        }
+    }
+
+    @Test("아끼는 쪽일수록 실제로 덜 받는다")
+    func loweringTheModeLowersTheBytes() {
+        let saver = try? #require(SOArmCameraDataMode.saver.hourlyBytesPerCamera)
+        let medium = try? #require(SOArmCameraDataMode.medium.hourlyBytesPerCamera)
+        let full = try? #require(SOArmCameraDataMode.full.hourlyBytesPerCamera)
+        #expect((saver ?? 0) < (medium ?? 0))
+        #expect((medium ?? 0) < (full ?? 0))
+        // 절약은 밖에서 쓰라고 만든 값이다. 시간당 100MB를 넘으면 그 목적을 잃는다.
+        #expect((saver ?? .max) < 100_000_000)
+    }
+
+    @Test("고르는 값은 서버가 실제로 낼 수 있는 모드다")
+    func everyModeIsOneTheCameraCanOpen() {
+        // 서버는 장치가 가진 목록에 없는 해상도를 400으로 거절한다. 두 카메라 모두
+        // 320×240과 640×480을 내주므로 그 둘만 쓴다. 프레임은 장치 최대(30) 이하이면
+        // 서버가 받아서 스스로 솎아 낸다.
+        let allowed: Set<SOArmCameraResolution> = [
+            SOArmCameraResolution(width: 320, height: 240),
+            SOArmCameraResolution(width: 640, height: 480),
+        ]
+        for mode in SOArmCameraDataMode.allCases {
+            guard let profile = mode.profile else { continue }
+            #expect(allowed.contains(profile.resolution))
+            #expect(profile.fps >= 1 && profile.fps <= 30)
+        }
+    }
+
     // MARK: 상태 읽기
 
     /// 서버 `app.py`의 `/api/status`가 실제로 내놓는 모양.

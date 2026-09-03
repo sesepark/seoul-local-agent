@@ -115,6 +115,13 @@ final class SOArmTeleopModel: ObservableObject {
 
     let sceneCamera = MJPEGStream()
     let wristCamera = MJPEGStream()
+    /// 영상을 얼마나 받을지. `SO-ARM 101` 화면과 같은 값을 본다 — 데이터를 쓰는 것은
+    /// 한 기기이고, 화면마다 따로 정하게 두면 한 곳에서 껐다고 믿는 동안 다른 곳이
+    /// 계속 받는다.
+    let cameraPolicy = SOArmCameraPolicy.shared
+    /// 서버가 고른 값을 받지 않았으면 그 말. 받는 양은 그때 서버가 쓰던 값 그대로다.
+    @Published private(set) var cameraPolicyNote: String?
+    private var cameraPolicyWatch: AnyCancellable?
 
     private let console: SOArmConsoleModel
     private var socket: URLSessionWebSocketTask?
@@ -151,6 +158,10 @@ final class SOArmTeleopModel: ObservableObject {
     init(console: SOArmConsoleModel) {
         self.console = console
         Self.current = self
+        cameraPolicyWatch = cameraPolicy.$mode
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] mode in self?.cameraPolicyChanged(to: mode) }
     }
 
     // MARK: 파생 상태
@@ -406,7 +417,10 @@ final class SOArmTeleopModel: ObservableObject {
             pushSpecToViewer()
             // 카메라는 스트림이 붙은 뒤에 켠다. 화면이 나타나는 순간에는 터널이 아직
             // 서지 않아 첫 요청이 반드시 실패했고, 그 실패에는 다시 시도할 길이 없었다.
-            startCameras()
+            //
+            // 켜기 **전에** 데이터 정책을 서버에 건다. 순서가 반대면 `절약`을 골라 둔
+            // 채로도 최고 화질을 몇 초 동안 받는다.
+            applyCameraPolicy()
         case "telemetry":
             connection = .streaming
             var updated = status
@@ -836,27 +850,93 @@ final class SOArmTeleopModel: ObservableObject {
 
     // MARK: 카메라
 
-    /// 이 화면에서는 카메라가 켜져 있는 것이 기본이다.
+    /// 이 화면에서는 카메라가 켜져 있는 것이 기본이다 — **`끔`을 고르지 않았다면.**
     ///
     /// `SO-ARM 101` 화면과 다른 점이다. 그쪽은 상태를 보는 화면이라 `프리뷰`를 눌러야
     /// 카메라를 점유하지만, 여기서는 카메라를 보면서 조작하는 것이 이 화면의 전부다.
     /// 화면을 떠나면 곧바로 놓는다.
+    ///
+    /// 이미 나오고 있는 스트림은 건드리지 않는다. `MJPEGStream.start`는 열기 전에 닫으므로,
+    /// 다시 부르면 서버 worker를 놓았다 잡는 동안 화면이 한 번 검게 된다.
     func startCameras() {
-        guard isVisible else { return }
-        let client = console.client
-        sceneCamera.start(client.cameraURL(SOArmCameraRole.scene.rawValue))
-        wristCamera.start(client.cameraURL(SOArmCameraRole.wrist.rawValue))
-    }
-
-    /// 끊긴 카메라만 다시 연다. 잘 나오고 있는 쪽은 건드리지 않는다 — 다시 열면 서버의
-    /// worker를 놓았다 잡는 동안 화면이 한 번 검게 된다.
-    private func restartFailedCameras() {
-        guard isVisible else { return }
+        guard isVisible, !cameraPolicy.isOff else { return }
         let client = console.client
         for role in SOArmCameraRole.allCases {
             let stream = stream(role)
             guard !stream.isRunning else { continue }
             stream.start(client.cameraURL(role.rawValue))
+        }
+    }
+
+    /// 끊긴 카메라만 다시 연다. 지금은 `startCameras`가 하는 일과 같지만, 부르는 자리의
+    /// 뜻이 다르므로 이름을 남겨 둔다 — 이쪽은 30초마다 도는 회복 고리다.
+    private func restartFailedCameras() {
+        startCameras()
+    }
+
+    /// 데이터 정책이 바뀌었다. **`끔`은 설정이 아니라 닫기다.**
+    ///
+    /// 프레임을 클라이언트에서 솎아 내는 것으로는 데이터가 줄지 않는다 — 바이트는 이미
+    /// 도착한 뒤다. 그래서 줄이는 쪽은 서버에 새 프로필을 걸고, 끄는 쪽은 스트림을 닫고
+    /// 서버의 카메라까지 놓는다.
+    private func cameraPolicyChanged(to mode: SOArmCameraDataMode) {
+        cameraPolicyNote = nil
+        guard mode != .off else {
+            stopCameras()
+            return
+        }
+        applyCameraPolicy(force: true)
+    }
+
+    /// 고른 값을 서버에 걸고, 그 다음에 (필요하면) 스트림을 연다.
+    ///
+    /// 서버가 거절하는 경우가 실제로 있다 — 데이터 수집이 도는 동안에는 카메라 설정이
+    /// 고정이라 409로 돌아온다. 그때 조용히 넘어가면 화면은 `절약`이라고 적힌 채 최고
+    /// 화질을 받는다. 그래서 거절은 화면에 적는다.
+    func applyCameraPolicy(force: Bool = false) {
+        guard isVisible, let profile = cameraPolicy.mode.profile else { return }
+        // 서버가 이미 그 값으로 있으면 부르지 않는다. 화면을 열 때마다 두 번씩 POST를
+        // 보내면, 그때마다 서버는 장치를 닫았다 다시 여느라 영상이 한 번 끊긴다.
+        if !force, SOArmCameraRole.allCases.allSatisfy({ console.camera($0).requested == profile }) {
+            startCameras()
+            return
+        }
+        let client = console.client
+        Task { [weak self] in
+            var failure: String?
+            for role in SOArmCameraRole.allCases {
+                do { try await client.setCameraProfile(role.rawValue, profile) }
+                catch { failure = SOArmConsoleModel.message(for: error) }
+            }
+            guard let self else { return }
+            self.cameraPolicyNote = failure.map { "서버가 이 설정을 받지 않았습니다 — \($0) 받는 양은 서버가 지금 쓰는 값 그대로입니다." }
+            self.startCameras()
+        }
+    }
+
+    /// 앱이 끝날 때 서버가 이 화면 때문에 쥐고 있는 카메라를 돌려준다.
+    ///
+    /// **`SOArmConsoleModel`의 같은 이름 메서드로는 이 화면의 카메라가 덮이지 않는다.**
+    /// 두 화면이 각자의 `MJPEGStream`을 들고 있어서, 종료 정리에 콘솔 쪽만 적어 두었더니
+    /// 텔레옵 화면을 열어 둔 채 ⌘Q를 하면 서버는 half-open 소켓이 시간 초과될 때까지
+    /// 카메라 worker를 계속 물고 있었다. 실제로 확인했다 — 끝낸 뒤에도 서버가
+    /// `clients 1 · active true`라고 답했다. 그 사이에 데이터 수집을 시작하면
+    /// `record.sh`의 `fuser` 검사가 카메라가 이미 쓰이는 중이라며 거절한다.
+    ///
+    /// `applicationWillTerminate`에서 불리므로 동기다. 각 요청에 짧은 상한을 두어 종료가
+    /// 네트워크 때문에 늘어지지 않게 한다.
+    func releaseHeldCamerasNow() {
+        let running = SOArmCameraRole.allCases.filter { stream($0).isRunning }
+        guard !running.isEmpty else { return }
+        running.forEach { stream($0).stop() }
+        let base = console.server.baseURL
+        for role in running {
+            var request = URLRequest(url: base.appending(path: "api/cameras/\(role.rawValue)/stop"))
+            request.httpMethod = "POST"
+            request.timeoutInterval = 1.5
+            let done = DispatchSemaphore(value: 0)
+            URLSession.shared.dataTask(with: request) { _, _, _ in done.signal() }.resume()
+            _ = done.wait(timeout: .now() + 2)
         }
     }
 

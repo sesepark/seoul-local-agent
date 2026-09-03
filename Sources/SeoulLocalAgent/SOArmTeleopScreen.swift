@@ -18,6 +18,8 @@ struct SOArmTeleopView: View {
 
 private struct SOArmTeleopWorkspace: View {
     @ObservedObject var model: SOArmTeleopModel
+    /// 데이터 정책은 화면 둘이 나눠 보는 값이라 모델이 아니라 여기에서 직접 본다.
+    @ObservedObject private var cameraPolicy = SOArmCameraPolicy.shared
     @Environment(\.openSettings) private var openSettings
     @State private var gate: SOArmTeleopGate?
     @State private var stageWidth: CGFloat = 0
@@ -47,6 +49,7 @@ private struct SOArmTeleopWorkspace: View {
                             .transition(.appCard)
                     }
                     banner
+                    cameraData
                     joints
                     authority
                     safetyNote
@@ -61,6 +64,7 @@ private struct SOArmTeleopWorkspace: View {
         .animation(.appContent, value: model.errorMessage)
         .animation(.appControl, value: model.state)
         .animation(.appControl, value: model.holdsAuthority)
+        .animation(.appControl, value: cameraPolicy.mode)
         .toolbar { toolbar }
         .sheet(item: $gate) { gate in
             // 멈춰 있는 이유를 게이트 안에서 보여 준다. 확인은 "현장을 봤다"와 "왜 멈췄는지
@@ -89,6 +93,32 @@ private struct SOArmTeleopWorkspace: View {
                 .fixedSize()
                 .foregroundStyle(model.badge.isAlarming ? Color.orange : .secondary)
                 .help(help)
+        }
+        ToolbarItem {
+            // 영상을 끄는 자리는 **툴바에 있어야 한다.** 아래로 스크롤해야 닿는 자리에
+            // 두면, 밖에서 데이터가 새는 것을 알아차린 그 순간에 바로 누를 수가 없다.
+            // 무대의 높이 계산과도 무관해서 카메라 칸을 밀어내지 않는다.
+            Menu {
+                Picker("영상 받기", selection: $cameraPolicy.mode) {
+                    ForEach(SOArmCameraDataMode.allCases) { mode in
+                        Text("\(mode.title) — \(mode.detail)").tag(mode)
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            } label: {
+                Label("영상 \(cameraPolicy.mode.title)", systemImage: cameraPolicy.mode.symbol)
+            }
+            // 이름을 지우지 않는다. 아이콘만 남으면 지금 무엇으로 받고 있는지 툴바가
+            // 말해 주지 못하고, 그러면 늘 보이는 자리에 둔 뜻이 없어진다 — 실제로 처음
+            // 만들었을 때 카메라 글리프 하나만 떠서 모드를 알 수 없었다.
+            .toolbarKeepsTitle()
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .tint(cameraPolicy.isOff ? .secondary : nil)
+            .help(cameraPolicy.isOff
+                  ? "카메라 영상을 받지 않고 있습니다. 서버의 카메라도 놓은 상태입니다"
+                  : "서버 카메라에서 받는 양입니다 · \(cameraPolicy.mode.detail)")
         }
         ToolbarSpacer(.flexible)
         ToolbarItem {
@@ -341,10 +371,27 @@ private struct SOArmTeleopWorkspace: View {
     private var cameras: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
             ForEach(SOArmCameraRole.allCases) { role in
-                SOArmTeleopCameraTile(role: role, stream: model.stream(role))
+                SOArmTeleopCameraTile(role: role, stream: model.stream(role), isOff: cameraPolicy.isOff)
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    /// 받는 양을 정하는 자리. 툴바에도 같은 것이 있지만, 여기에는 **왜** 그 값인지가
+    /// 함께 적힌다 — 시간당 몇 GB인지 모르면 넷 가운데 무엇을 골라야 할지 알 수 없다.
+    private var cameraData: some View {
+        GroupBox("카메라 영상") {
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                SOArmCameraDataControl(policy: cameraPolicy, note: model.cameraPolicyNote)
+                // 한 문단이면 충분하다. 두 문단으로 나눠 두었더니 네 자리짜리 스위치
+                // 하나에 설명이 다섯 줄이 붙어, 정작 읽어야 할 시간당 데이터가 묻혔다.
+                Text("밖에서 쓸 때를 위한 값입니다. `끔`은 연결을 닫고 서버의 카메라까지 놓으므로 데이터를 한 바이트도 쓰지 않고, 나머지 셋은 서버가 더 작게 찍어 덜 보내게 합니다. 서버가 쥔 카메라 자체의 설정이라 폰에서 보고 있으면 그쪽도 같은 값이 되고, 데이터 수집이 도는 동안에는 서버가 변경을 거절합니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     // MARK: 관절
@@ -724,6 +771,9 @@ private struct SOArmJointRow: View {
 private struct SOArmTeleopCameraTile: View {
     let role: SOArmCameraRole
     @ObservedObject var stream: MJPEGStream
+    /// 영상 받기를 꺼 두었는가. 꺼서 비어 있는 것과 안 나와서 비어 있는 것은 다른 일이고,
+    /// 같은 문구로 적으면 사람은 고장 났다고 읽는다.
+    var isOff = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {
@@ -736,7 +786,9 @@ private struct SOArmTeleopCameraTile: View {
             // 한 줄이 몇 pt인지 두 곳이 같은 숫자를 알고 있어야 영상에 빈 띠가 안 생긴다.
             .frame(height: SOArmTeleopLayout.cameraLabelHeight)
             ZStack {
-                if let image = stream.image {
+                if isOff {
+                    EmptyResults(symbol: "video.slash.fill", message: "영상 받기를 껐습니다 · 데이터를 쓰지 않습니다")
+                } else if let image = stream.image {
                     Image(nsImage: image).resizable().scaledToFit()
                 } else {
                     EmptyResults(

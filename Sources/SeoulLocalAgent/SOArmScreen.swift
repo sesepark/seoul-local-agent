@@ -17,6 +17,8 @@ struct SOArmView: View {
 
 private struct SOArmWorkspace: View {
     @ObservedObject var model: SOArmConsoleModel
+    /// 받는 양. 원격 텔레옵 화면과 같은 값이라 모델이 아니라 여기에서 직접 본다.
+    @ObservedObject private var cameraPolicy = SOArmCameraPolicy.shared
     @Environment(\.openSettings) private var openSettings
     @State private var pending: SOArmStartRequest?
     /// 카메라 두 장이 나눠 쓸 수 있는 가로 폭. 창을 줄이고 늘릴 때마다 다시 들어온다.
@@ -189,6 +191,16 @@ private struct SOArmWorkspace: View {
     // MARK: 카메라
 
     private var cameras: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            // 받는 양이 먼저다. 이 아래의 두 카드가 실제로 데이터를 쓰는 자리이므로,
+            // 얼마나 쓰는지가 카드보다 위에 적혀 있어야 한다.
+            SOArmCameraDataControl(policy: cameraPolicy)
+            cameraCards
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var cameraCards: some View {
         HStack(alignment: .top, spacing: Spacing.l) {
             ForEach(SOArmCameraRole.allCases) { role in
                 SOArmCameraCard(
@@ -201,7 +213,8 @@ private struct SOArmWorkspace: View {
                     recordingProfile: model.status?.recordingProfile ?? .recordingDefault,
                     isRecording: model.status?.recording.running ?? false,
                     stream: model.stream(role),
-                    enabled: model.connection.isConnected && !(model.status?.recording.running ?? false),
+                    enabled: model.connection.isConnected && !(model.status?.recording.running ?? false) && !cameraPolicy.isOff,
+                    isDataOff: cameraPolicy.isOff,
                     start: { model.startPreview(role) },
                     stop: { model.stopPreview(role) },
                     apply: { model.setCameraProfile($0, for: role) }
@@ -418,6 +431,8 @@ private struct SOArmCameraCard: View {
     let isRecording: Bool
     @ObservedObject var stream: MJPEGStream
     let enabled: Bool
+    /// 영상 받기를 꺼 두었는가. 서버가 못 주는 것과 우리가 안 받는 것은 다른 일이다.
+    let isDataOff: Bool
     let start: () -> Void
     let stop: () -> Void
     let apply: (SOArmCameraProfile) -> Void
@@ -440,6 +455,7 @@ private struct SOArmCameraCard: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(!enabled)
+                        .help(isDataOff ? "위에서 `영상 받기`를 껐습니다. 켜면 프리뷰를 열 수 있습니다" : "서버 카메라를 잠시 점유해 지금 화면을 봅니다")
                 }
             }
             reading
@@ -448,6 +464,8 @@ private struct SOArmCameraCard: View {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
+                } else if isDataOff {
+                    EmptyResults(symbol: "video.slash.fill", message: "영상 받기를 껐습니다 · 데이터를 쓰지 않습니다")
                 } else {
                     EmptyResults(
                         symbol: stream.failure == nil ? "video.slash" : "exclamationmark.triangle",
