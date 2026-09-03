@@ -49,6 +49,23 @@ struct SeoulLocalAgentTests {
         #expect(DiarizationChoice.legacy31.isEnabled)
     }
 
+    @Test("Locally quantized models name the command that rebuilds them")
+    func quantizedModelsCarryRecoveryCommand() {
+        // The two 8-bit models are built on this machine, so the app must be able
+        // to tell the user which command produces the folder it could not find.
+        for model in [ASRModelChoice.qwen06B8Bit, .qwen17B] {
+            let directory = TranscriptionService.localModelDirectory(for: model)
+            #expect(directory?.lastPathComponent.hasSuffix("-8bit") == true)
+            #expect(TranscriptionService.conversionCommand(for: model)?.contains("convert-qwen3-asr-8bit.py") == true)
+        }
+        // The Hugging Face choices repair themselves by downloading, so they have
+        // no local folder to rebuild and must not claim one.
+        for model in [ASRModelChoice.qwen06B, .qwen17BSpeculative] {
+            #expect(TranscriptionService.localModelDirectory(for: model) == nil)
+            #expect(TranscriptionService.conversionCommand(for: model) == nil)
+        }
+    }
+
     @Test("Transcript loader ignores status JSON created before transcript")
     func transcriptLoaderIgnoresStatusJSON() throws {
         let directory = FileManager.default.temporaryDirectory

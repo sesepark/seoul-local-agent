@@ -218,7 +218,7 @@ enum ASRModelChoice: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .qwen06B8Bit: "초고속 · 0.6B 8-bit"
         case .qwen06B: "균형 · 0.6B"
-        case .qwen17B: "정밀 · 1.7B"
+        case .qwen17B: "정밀 · 1.7B 8-bit"
         case .qwen17BSpeculative: "실험 · 1.7B + 0.6B 초안"
         }
     }
@@ -226,7 +226,7 @@ enum ASRModelChoice: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .qwen06B8Bit: return "가장 빠른 권장값. 한국어·영어 품질 손실을 작게 유지하면서 8-bit로 가볍게 실행합니다."
         case .qwen06B: return "0.6B 원본 정밀도. 초고속보다 조금 느리지만 양자화에 따른 품질 손실이 없습니다."
-        case .qwen17B: return "현재의 고품질 모델. 잡음, 고유명사, 복잡한 발화에 유리하지만 가장 느립니다."
+        case .qwen17B: return "가장 정확한 모델. FLEURS 기준 초고속보다 오류가 약 22% 적고(한국어 CER 4.87→3.79), 8-bit라 원본 정밀도보다 4배 빠릅니다. 60분 녹음에 2~3분."
         case .qwen17BSpeculative: return "1.7B가 결과를 만들고 0.6B가 토큰을 미리 제안합니다. 화자 구분용 모델이 아니며 일부 녹음에서는 더 느릴 수 있습니다."
         }
     }

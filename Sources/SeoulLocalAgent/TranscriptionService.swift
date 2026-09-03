@@ -34,6 +34,14 @@ struct TranscriptionService {
         guard MediaImporter.ffmpegPath != nil else {
             throw AgentError.processFailed("ffmpeg를 찾지 못했습니다. 터미널에서 `brew install ffmpeg` 후 다시 시도해 주세요.")
         }
+        // The quantized models are built on this machine, not downloaded, so an
+        // absent folder cannot repair itself the way a Hugging Face cache does.
+        // Say which command rebuilds it instead of surfacing a Python traceback.
+        if let local = Self.localModelDirectory(for: asrModel),
+           !FileManager.default.fileExists(atPath: local.appending(path: "weights.safetensors").path) {
+            let command = Self.conversionCommand(for: asrModel) ?? ""
+            throw AgentError.processFailed("‘\(asrModel.title)’ 모델이 아직 준비되지 않았습니다. 프로젝트 폴더에서 `\(command)`를 실행한 뒤 다시 시도해 주세요.")
+        }
         let token = try? Keychain.string(service: Self.tokenService, account: Self.tokenAccount)
         guard !diarization.isEnabled || (token?.isEmpty == false) else {
             throw AgentError.missingCredential("화자 분리를 위해 Hugging Face의 pyannote 토큰을 설정에 저장해 주세요.")
@@ -196,16 +204,40 @@ struct TranscriptionService {
         throw AgentError.processFailed("전사 결과 JSON 파일을 찾지 못했습니다.")
     }
 
-    /// The pre-status progress hint must watch the cache of the model that was
-    /// actually selected; a fixed 1.7B path reported 0 bytes for every other choice.
-    private static func modelCacheDirectory(for model: ASRModelChoice) -> URL {
+    /// The quantized models this app builds itself, rather than downloads. Their
+    /// folders are the whole model, so a missing folder is a missing model — the
+    /// Hugging Face choices below can still repair themselves by downloading.
+    static func localModelDirectory(for model: ASRModelChoice) -> URL? {
         let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         switch model {
         case .qwen06B8Bit:
             return home.appending(path: ".cache/seoul-local-agent/Qwen3-ASR-0.6B-8bit", directoryHint: .isDirectory)
+        case .qwen17B:
+            return home.appending(path: ".cache/seoul-local-agent/Qwen3-ASR-1.7B-8bit", directoryHint: .isDirectory)
+        case .qwen06B, .qwen17BSpeculative:
+            return nil
+        }
+    }
+
+    /// Which conversion produces the folder above, named the way the user would
+    /// type it, so a missing model is a one-line fix instead of a search.
+    static func conversionCommand(for model: ASRModelChoice) -> String? {
+        switch model {
+        case .qwen06B8Bit: ".venv-transcription/bin/python scripts/convert-qwen3-asr-8bit.py 0.6B"
+        case .qwen17B: ".venv-transcription/bin/python scripts/convert-qwen3-asr-8bit.py 1.7B"
+        case .qwen06B, .qwen17BSpeculative: nil
+        }
+    }
+
+    /// The pre-status progress hint must watch the cache of the model that was
+    /// actually selected; a fixed 1.7B path reported 0 bytes for every other choice.
+    private static func modelCacheDirectory(for model: ASRModelChoice) -> URL {
+        if let local = localModelDirectory(for: model) { return local }
+        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        switch model {
         case .qwen06B:
             return home.appending(path: ".cache/huggingface/hub/models--Qwen--Qwen3-ASR-0.6B", directoryHint: .isDirectory)
-        case .qwen17B, .qwen17BSpeculative:
+        default:
             return home.appending(path: ".cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B", directoryHint: .isDirectory)
         }
     }
@@ -214,7 +246,8 @@ struct TranscriptionService {
         switch model {
         case .qwen06B8Bit: 900_000_000
         case .qwen06B: 1_700_000_000
-        case .qwen17B, .qwen17BSpeculative: 4_200_000_000
+        case .qwen17B: 2_300_000_000
+        case .qwen17BSpeculative: 4_200_000_000
         }
     }
 

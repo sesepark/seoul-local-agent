@@ -1743,7 +1743,7 @@ final class AutomationController: ObservableObject {
         let asrFactor: Double = switch asrModel {
         case .qwen06B8Bit: 0.05
         case .qwen06B: 0.10
-        case .qwen17B: 0.30
+        case .qwen17B: 0.09
         case .qwen17BSpeculative: 0.50
         }
         let expected = duration * (asrFactor + (diarization.isEnabled ? 0.25 : 0)) + 8
