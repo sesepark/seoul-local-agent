@@ -57,8 +57,18 @@ struct BriefingMark: Codable, Equatable {
 
 struct BriefingArchiveState: Codable {
     var marks: [String: BriefingMark] = [:]
+    /// 사람이 "이건 규칙으로 만들지 않겠다"고 말한 제안들.
+    ///
+    /// 없으면 같은 제안이 매일 다시 뜬다. 제안은 도움이 되는 동안에만 제안이고, 거절한
+    /// 뒤에도 계속 나오면 그때부터는 화면을 가리는 것일 뿐이다.
+    var dismissedRuleSuggestions: Set<String> = []
 
     var completedIDs: Set<String> { Set(marks.filter(\.value.isDone).map(\.key)) }
+
+    /// 사람이 직접 옮긴 분류. 이월할 때는 모델이 매긴 분류가 아니라 이쪽을 봐야 한다 —
+    /// `기타`로 내린 항목이 다음 날 다시 `오늘 꼭 할 일`에 서면, 옮긴 것이 아무 뜻도
+    /// 없었던 것이 된다.
+    var categoryOverrides: [String: BriefCategory] { marks.compactMapValues(\.categoryOverride) }
 
     /// Briefings themselves are pruned at thirty days; their marks are kept
     /// longer and by count instead, because a mark is two hundred bytes and
@@ -72,11 +82,15 @@ struct BriefingArchiveState: Codable {
         return Dictionary(uniqueKeysWithValues: kept.map { ($0.key, $0.value) })
     }
 
-    init(marks: [String: BriefingMark] = [:]) { self.marks = marks }
+    init(marks: [String: BriefingMark] = [:], dismissedRuleSuggestions: Set<String> = []) {
+        self.marks = marks
+        self.dismissedRuleSuggestions = dismissedRuleSuggestions
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         marks = try container.decodeIfPresent([String: BriefingMark].self, forKey: .marks) ?? [:]
+        dismissedRuleSuggestions = try container.decodeIfPresent(Set<String>.self, forKey: .dismissedRuleSuggestions) ?? []
     }
 }
 
@@ -105,6 +119,14 @@ struct BriefingArchiveStore: Sendable {
         var stored = state
         stored.marks = BriefingArchiveState.pruned(state.marks)
         try LocalFileStorage.write(try JSONEncoder().encode(stored), to: url)
+    }
+
+    /// 표를 건드리지 않고 거절 목록만 고친다. 보관함 모델이 표의 사본을 들고 있으므로,
+    /// 통째로 덮어쓰면 그 사이에 눌린 체크 하나가 사라질 수 있다.
+    func dismissSuggestion(_ id: String) throws {
+        var state = load()
+        state.dismissedRuleSuggestions.insert(id)
+        try LocalFileStorage.write(try JSONEncoder().encode(state), to: url)
     }
 }
 
@@ -283,6 +305,59 @@ final class BriefingArchiveModel: ObservableObject {
         }
     }
 
+    /// 달력의 한 칸에 놓이는 일 하나.
+    ///
+    /// 같은 항목이 두 가지 이유로 날짜를 가질 수 있다. 본문에 적힌 **마감**과, 사람이
+    /// 캘린더·미리 알림으로 넘기며 확인한 **일정**이다. 둘은 같은 날일 수도 다른 날일 수도
+    /// 있어서 하나로 뭉뚱그리면 달력이 거짓말을 한다 — "금요일까지"인 과제를 수요일에
+    /// 하겠다고 정해 둔 것은 서로 다른 두 사실이다.
+    struct DatedEntry: Identifiable, Equatable {
+        enum Kind: String {
+            /// 항목에 적힌 마감을 날짜로 읽은 것.
+            case deadline
+            /// 사람이 캘린더나 미리 알림으로 넘기면서 고른 시각.
+            case scheduled
+
+            var title: String { self == .deadline ? "마감" : "일정" }
+            var symbol: String { self == .deadline ? "flag.checkered" : "calendar.badge.checkmark" }
+        }
+
+        let entry: Entry
+        let kind: Kind
+        let date: Date
+        /// 시각까지 읽혔는가. 아니면 그날 하루를 뜻하고, 화면은 시간을 적지 않는다.
+        let includesTime: Bool
+
+        var id: String { "\(entry.id)|\(kind.rawValue)" }
+        var isDone: Bool { entry.mark.isDone }
+
+        /// 지난 마감인가. 끝낸 것은 지난 것이 아니다 — 지났다고 표시하는 것은 아직
+        /// 해야 하는 일에만 뜻이 있다.
+        func isLate(now: Date = Date()) -> Bool {
+            guard kind == .deadline, !isDone else { return false }
+            return date < now
+        }
+
+        /// 화면이 이 항목을 두고 재촉해도 되는가.
+        ///
+        /// 지났다는 사실만으로는 부족하다. **사람이 `기타`로 내린 것은 모델이 급하다고
+        /// 본 것보다 앞선다** — 이미 "이 일은 나와 상관없다"고 말한 항목을 지났다고 붉게
+        /// 세우면, 매일 같은 것을 다시 내리라고 조르는 화면이 된다. 이월과 보관함이
+        /// 따르는 것과 같은 순서다.
+        func nags(now: Date = Date()) -> Bool {
+            entry.bucket != .other && isLate(now: now)
+        }
+
+        var timeText: String? {
+            guard includesTime else { return nil }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "ko_KR")
+            formatter.timeZone = KoreanDeadline.timeZone
+            formatter.dateFormat = "HH:mm"
+            return formatter.string(from: date)
+        }
+    }
+
     @Published private(set) var days: [DailyBriefing] = []
     @Published var selectedDateKey: String = ""
     @Published var search = ""
@@ -312,10 +387,15 @@ final class BriefingArchiveModel: ObservableObject {
     private let injectedPreferences: BriefingPreferences?
     private let writer = CalendarWriter()
     private var marks: [String: BriefingMark] = [:]
+    /// 규칙으로 만들지 않겠다고 거절한 제안들. `persist()`가 표만 쓰고 이것을 빠뜨리면
+    /// 체크 한 번에 거절이 통째로 지워지므로 모델이 함께 들고 있는다.
+    private var dismissedSuggestions: Set<String> = []
     /// Bumped whenever the days or the marks change. Both caches below key on it.
     private var revision = 0
     private var visibleCache: (key: String, entries: [Entry])?
     private var dueCache: (key: String, groups: (due: [Entry], overdue: [Entry]))?
+    private var datedCache: (key: String, entries: [DatedEntry])?
+    private var correctionsCache: (key: Int, corrections: [ClassificationCorrection])?
 
     /// Both stores are injectable so a test can point them at a temporary
     /// directory. Without that, running the suite would read — and the write
@@ -341,7 +421,9 @@ final class BriefingArchiveModel: ObservableObject {
         if injectedPreferences == nil { preferences = BriefingPreferencesStore().load() }
         let state = stateStore.load()
         days = state.dailyBriefings.values.sorted { sortKey($0) > sortKey($1) }
-        marks = archiveStore.load().marks
+        let archived = archiveStore.load()
+        marks = archived.marks
+        dismissedSuggestions = archived.dismissedRuleSuggestions
         if days.first(where: { $0.dateKey == selectedDateKey }) == nil {
             selectedDateKey = days.first?.dateKey ?? ""
         }
@@ -465,6 +547,10 @@ final class BriefingArchiveModel: ObservableObject {
         // ties break on when the thing arrived.
         return shown.sorted { lhs, rhs in
             if lhs.mark.isDone != rhs.mark.isDone { return !lhs.mark.isDone }
+            // 지난 마감은 끝낸 것 바로 위로 가라앉는다. 중요도만으로 세우면 3주 전에
+            // 지나간 일이 오늘 해야 하는 일보다 위에 서고, 그 자리는 그때부터 읽히지 않는다.
+            let leftLate = lhs.isOverdue(), rightLate = rhs.isOverdue()
+            if leftLate != rightLate { return !leftLate }
             if lhs.item.importance != rhs.item.importance { return lhs.item.importance > rhs.item.importance }
             return lhs.receivedAt > rhs.receivedAt
         }
@@ -593,6 +679,166 @@ final class BriefingArchiveModel: ObservableObject {
         })
     }
 
+    // MARK: - 분류 교정 학습
+
+    /// 설정의 분류 기준을 고쳤을 때 알린다. 컨트롤러가 화면에 들고 있는 사본을 다시 읽어야
+    /// 하기 때문이다 — 그러지 않으면 설정 창에서 다음에 `저장`을 누르는 순간, 방금 규칙으로
+    /// 굳힌 한 줄이 낡은 사본에 덮여 사라진다.
+    var didChangePreferences: (() -> Void)?
+
+    /// 사람이 옮긴 분류들, 최근 것부터. 화면과 프롬프트가 같은 것을 본다.
+    ///
+    /// `visible`·`dueToday`와 같은 이유로 기억해 둔다. 이 계산은 보관된 90일을 전부
+    /// 훑는데, SwiftUI는 자료가 바뀌지 않아도 `body`를 몇 번이고 다시 부른다 — 검색창에
+    /// 한 글자 칠 때마다 만 건을 다시 훑는 것은 화면이 감당할 일이 아니다.
+    var corrections: [ClassificationCorrection] {
+        if let cached = correctionsCache, cached.key == revision { return cached.corrections }
+        let computed = ClassificationLearning.corrections(days: days, marks: marks)
+        correctionsCache = (revision, computed)
+        return computed
+    }
+
+    /// 규칙으로 굳히자고 제안할 것들. 거절한 것은 빠져 있다.
+    var ruleSuggestions: [RuleSuggestion] {
+        ClassificationLearning.suggestions(from: corrections, dismissed: dismissedSuggestions)
+    }
+
+    /// 제안을 받아 분류 기준 목록에 한 줄 넣는다.
+    ///
+    /// 넣은 뒤에는 같은 제안이 다시 뜨지 않게 거절 목록에도 넣는다. 규칙이 이미 있는데
+    /// 제안이 남아 있으면, 누른 것이 아무 일도 하지 않은 것처럼 보인다.
+    func applyRuleSuggestion(_ suggestion: RuleSuggestion) {
+        let store = BriefingPreferencesStore()
+        var preferences = store.load()
+        switch suggestion.destination {
+        case .ignored:
+            guard !preferences.ignoredPatterns.contains(where: { $0.caseInsensitiveCompare(suggestion.pattern) == .orderedSame }) else { break }
+            preferences.ignoredPatterns.append(suggestion.pattern)
+        case .important:
+            guard !preferences.importantPatterns.contains(where: { $0.caseInsensitiveCompare(suggestion.pattern) == .orderedSame }) else { break }
+            preferences.importantPatterns.append(suggestion.pattern)
+        }
+        do {
+            try store.save(preferences)
+        } catch {
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return
+        }
+        dismissRuleSuggestion(suggestion, quietly: true)
+        // 새 규칙은 이미 쌓인 브리핑에도 곧바로 적용된다. `reload`가 분류 기준을 다시
+        // 읽으므로, 모델을 한 번 더 돌리지 않고도 화면이 새 규칙대로 다시 그려진다.
+        reload()
+        didChangePreferences?()
+        status = "‘\(suggestion.pattern)’을 \(suggestion.destination.title) 규칙에 넣었습니다. 설정 › 분류 기준에서 지울 수 있습니다."
+    }
+
+    func dismissRuleSuggestion(_ suggestion: RuleSuggestion, quietly: Bool = false) {
+        objectWillChange.send()
+        dismissedSuggestions.insert(suggestion.id)
+        do {
+            try archiveStore.dismissSuggestion(suggestion.id)
+        } catch {
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        if !quietly { status = "이 제안을 다시 띄우지 않습니다. 분류 기준은 그대로입니다." }
+    }
+
+    // MARK: - 달력
+
+    /// 보관함이 들고 있는 모든 날의 항목 가운데 **날짜가 읽히는 것들**, 이른 것부터.
+    ///
+    /// 보관함의 `visible`과 달리 고른 날짜와 검색에 매이지 않는다. 달력은 하루가 아니라
+    /// 한 달을 보는 화면이고, 어제 온 메일의 다음 주 마감은 어제를 펼쳐 보지 않아도
+    /// 보여야 하기 때문이다.
+    ///
+    /// `dueToday`와 같은 방식으로 기억해 둔다. 이 계산은 보관된 모든 날을 훑고,
+    /// SwiftUI는 자료가 바뀌지 않아도 `body`를 몇 번이고 다시 부른다.
+    func datedEntries(now: Date = Date()) -> [DatedEntry] {
+        let key = "\(revision)|\(KoreanDeadline.calendar.startOfDay(for: now).timeIntervalSince1970)"
+        if let cached = datedCache, cached.key == key { return cached.entries }
+        let computed = computeDatedEntries(now: now)
+        datedCache = (key, computed)
+        return computed
+    }
+
+    /// 날짜(그날 0시)별로 묶은 것. 달력 칸 하나가 곧 이 사전의 열쇠 하나다.
+    ///
+    /// 하루 안의 차례는 **끝낸 것을 맨 아래로** 내린다. 달력 칸에는 두 줄만 들어가는데,
+    /// 이미 끝낸 일이 그 두 자리를 차지하면 아직 해야 하는 일은 `+3`이라는 숫자 뒤로
+    /// 숨는다 — 달력을 여는 이유가 정확히 그 두 줄이므로, 거기에 끝난 일이 서면 안 된다.
+    func datedEntriesByDay(now: Date = Date()) -> [Date: [DatedEntry]] {
+        Dictionary(grouping: datedEntries(now: now)) { KoreanDeadline.calendar.startOfDay(for: $0.date) }
+            .mapValues { group in
+                group.sorted { lhs, rhs in
+                    if lhs.isDone != rhs.isDone { return !lhs.isDone }
+                    return lhs.date < rhs.date
+                }
+            }
+    }
+
+    private func computeDatedEntries(now: Date) -> [DatedEntry] {
+        let calendar = KoreanDeadline.calendar
+        var seen = Set<String>()
+        var deadlines: [DatedEntry] = []
+        var scheduled: [DatedEntry] = []
+        for day in days {
+            // 보관함이 보여 주는 것과 같은 정규화를 거친다. 이것을 건너뛰면 달력과
+            // 보관함이 같은 메일에 대해 서로 다른 말을 하게 된다.
+            for item in BriefingQualityGate.normalized(day.items, preferences: preferences)
+            where seen.insert(item.trackingID).inserted {
+                let mark = marks[item.trackingID] ?? BriefingMark()
+                let entry = Entry(item: item, dateKey: day.dateKey, mark: mark)
+                // 사람이 넘긴 일정. `scheduledAt`만으로는 부족하다 — 시트를 열어 날짜를
+                // 고르다 취소해도 값이 남을 수 있으므로, 실제로 캘린더나 미리 알림에
+                // 들어간 것만 일정으로 친다.
+                if entry.placement != nil, let at = mark.scheduledAt {
+                    scheduled.append(DatedEntry(entry: entry, kind: .scheduled, date: at, includesTime: true))
+                }
+                if let parsed = KoreanDeadline.parse(item.deadline, now: now) {
+                    deadlines.append(DatedEntry(entry: entry, kind: .deadline, date: parsed.date, includesTime: parsed.includesTime))
+                }
+            }
+        }
+        // 같은 항목의 마감과 일정이 **같은 날**이면 일정 하나만 남긴다. 사람이 확인해
+        // 넣은 시각이 본문에서 읽어 낸 것보다 정확하고, 한 칸에 같은 제목이 두 줄로
+        // 서면 달력은 그만큼 읽기 어려워진다.
+        let scheduledDays = Set(scheduled.map { "\($0.entry.id)|\(calendar.startOfDay(for: $0.date).timeIntervalSince1970)" })
+        let kept = deadlines.filter { !scheduledDays.contains("\($0.entry.id)|\(calendar.startOfDay(for: $0.date).timeIntervalSince1970)") }
+        return (kept + scheduled).sorted { $0.date < $1.date }
+    }
+
+    /// 마감이 적혀 있는데 날짜로 읽히지 않은 항목들.
+    ///
+    /// 달력이 이것을 조용히 빠뜨리면 사람은 달력에 없는 것을 없는 일로 읽는다. "가급적
+    /// 빠른 시일 내"처럼 날짜가 아닌 말이 대부분이라 없앨 수 있는 것이 아니고, 그래서
+    /// 세어서 화면에 적는다.
+    func undatedDeadlineEntries(now: Date = Date()) -> [Entry] {
+        var seen = Set<String>()
+        var result: [Entry] = []
+        for day in days {
+            for item in BriefingQualityGate.normalized(day.items, preferences: preferences)
+            where seen.insert(item.trackingID).inserted {
+                guard !item.deadline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      KoreanDeadline.parse(item.deadline, now: now) == nil else { continue }
+                let mark = marks[item.trackingID] ?? BriefingMark()
+                guard mark.scheduledAt == nil, !mark.isDone else { continue }
+                result.append(Entry(item: item, dateKey: day.dateKey, mark: mark))
+            }
+        }
+        return result.sorted { $0.receivedAt > $1.receivedAt }
+    }
+
+    /// 달력에서 고른 날을 보관함에서 열 수 있게, 그 항목이 실려 온 날로 옮긴다.
+    ///
+    /// 달력의 날짜(마감)와 보관함의 날짜(브리핑이 만들어진 날)는 다른 값이다. 이것이
+    /// 없으면 달력에서 다음 주 마감을 눌렀을 때 보관함은 다음 주를 펼치려 하고, 그런
+    /// 날의 브리핑은 아직 없다.
+    func revealInArchive(_ dated: DatedEntry) {
+        selectedDateKey = dated.entry.dateKey
+        search = ""
+        expanded.insert(dated.entry.id)
+    }
+
     // MARK: - 분류 교정
 
     /// Move one item to another heading.
@@ -646,7 +892,13 @@ final class BriefingArchiveModel: ObservableObject {
         )
         do {
             let classifier = LocalClassifier()
-            let answered = try await classifier.classify([rebuilt], userInstructions: preferences.userInstructions)
+            // 다시 분석할 때도 교정 예시를 같이 보낸다. 그러지 않으면 이 한 번만 다른
+            // 프롬프트로 돌아, 브리핑 전체와 다른 기준으로 판단한 결과가 섞인다.
+            let answered = try await classifier.classify(
+                [rebuilt],
+                userInstructions: preferences.userInstructions,
+                corrections: ClassificationLearning.promptBlock(from: corrections) ?? ""
+            )
             await classifier.unload()
             guard var replacement = BriefingQualityGate.normalized(answered, preferences: preferences).first else {
                 error = "모델이 이 항목에 대한 결과를 돌려주지 않았습니다."
@@ -699,7 +951,7 @@ final class BriefingArchiveModel: ObservableObject {
 
     private func persist() {
         do {
-            try archiveStore.save(BriefingArchiveState(marks: marks))
+            try archiveStore.save(BriefingArchiveState(marks: marks, dismissedRuleSuggestions: dismissedSuggestions))
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }

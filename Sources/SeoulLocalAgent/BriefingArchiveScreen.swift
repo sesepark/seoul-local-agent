@@ -19,6 +19,7 @@ struct BriefingArchiveView: View {
                 empty
             } else {
                 staleness
+                ruleSuggestions
                 dayBar
                 filterBar
                 ForEach(BriefingArchiveModel.Bucket.allCases) { bucket in
@@ -275,6 +276,59 @@ struct BriefingArchiveView: View {
         }
     }
 
+    /// 같은 교정을 여러 번 한 것을 규칙으로 굳히자는 제안.
+    ///
+    /// **제안이지 자동 적용이 아니다.** `항상 무시`는 본문을 읽지 않고 수집 단계에서
+    /// 빼는 규칙이라, 앱이 혼자 채워 넣기 시작하면 어느 날부터 안 오는 메일이 왜 안
+    /// 오는지 알 수 없게 된다. 그래서 규칙은 언제나 사람이 눌러서 들어가고, 무엇이
+    /// 근거인지(몇 번 옮겼는지)를 함께 적는다.
+    ///
+    /// 자리가 여기인 이유도 같다. 교정은 이 화면에서 일어나므로, 세 번째로 같은 것을
+    /// 내린 바로 그 자리에서 "이제 규칙으로 만들까요"가 떠야 고리가 닫힌다.
+    @ViewBuilder
+    private var ruleSuggestions: some View {
+        let suggestions = model.ruleSuggestions
+        if !suggestions.isEmpty {
+            VStack(alignment: .leading, spacing: Spacing.m) {
+                Label("반복해서 옮긴 것이 있습니다", systemImage: "wand.and.sparkles")
+                    .font(.headline)
+                    .foregroundStyle(Color.snuBlueLabel)
+                ForEach(suggestions) { suggestion in
+                    HStack(alignment: .top, spacing: Spacing.m) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(suggestion.title).font(.callout.weight(.medium))
+                            Text(suggestion.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: Spacing.s)
+                        VStack(alignment: .trailing, spacing: Spacing.xs) {
+                            Button("\(suggestion.destination.title)에 추가") {
+                                model.applyRuleSuggestion(suggestion)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .tint(.snuBlue)
+                            Button("만들지 않기") { model.dismissRuleSuggestion(suggestion) }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                        }
+                    }
+                    if suggestion.id != suggestions.last?.id { Divider() }
+                }
+                Text("규칙은 본문을 읽지 않고 발신자·제목에 그 말이 있는지만 봅니다. 언제든 설정 › 분류 기준에서 지울 수 있고, 지우면 다시 모델이 판단합니다.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(Spacing.l)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .glassPanel(Radius.card)
+            .transition(.appCard)
+        }
+    }
+
     @ViewBuilder
     private var collectionFootnote: some View {
         if let day = model.selectedDay {
@@ -286,6 +340,9 @@ struct BriefingArchiveView: View {
                 if !counts.isEmpty { Text("소스별 · \(counts.joined(separator: ", "))") }
                 if let expired = day.expiredCarryOverCount, expired > 0 {
                     Text("마감이 지나 이월하지 않은 항목 \(expired)개")
+                }
+                if let stale = day.staleCarryOverCount, stale > 0 {
+                    Text("마감 없이 \(CarryForwardPolicy.staleAfterDays)일을 넘겨 이월하지 않은 항목 \(stale)개 · 그날을 펼치면 그대로 있습니다")
                 }
                 ForEach(day.failures, id: \.self) { failure in
                     Label(failure, systemImage: "exclamationmark.triangle")
@@ -395,7 +452,13 @@ private struct BriefingEntryRow: View {
                 Badge(text: BriefingArchiveModel.dayTitle(entry.dateKey), symbol: "calendar.day.timeline.left")
             }
             if let deadline = entry.deadlineText {
-                Badge(text: "마감 \(deadline)", symbol: "clock", tint: .orange)
+                // 지난 마감은 다른 말로 적는다. 같은 `마감 9월 1일`이 오늘의 일과 3주 전에
+                // 지나간 일에 똑같이 붙어 있으면, 그 배지는 아무것도 말하지 않는 것과 같다.
+                if entry.isOverdue() && !entry.mark.isDone {
+                    Badge(text: "마감 지남 · \(deadline)", symbol: "clock.badge.exclamationmark", tint: .red)
+                } else {
+                    Badge(text: "마감 \(deadline)", symbol: "clock", tint: .orange)
+                }
             }
             if let placement = entry.placement {
                 Badge(
@@ -538,6 +601,20 @@ private struct BriefingEntryRow: View {
 
     @ViewBuilder
     private func field(_ label: String, _ value: String) -> some View {
+        BriefingField(label: label, value: value)
+    }
+}
+
+/// 항목을 펼쳤을 때 나오는 `맥락`·`요청`·`도착` 같은 한 줄.
+///
+/// 보관함과 일정 달력이 같은 항목을 서로 다른 축으로 보여 주지만, **펼쳤을 때 읽는
+/// 것은 같아야 한다.** 라벨 너비 하나가 두 화면에서 다르면 같은 메일이 두 모양으로
+/// 보이고, 그때부터 둘 중 어느 쪽이 맞는지 확인하게 된다.
+struct BriefingField: View {
+    let label: String
+    let value: String
+
+    var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
             Text(label)
                 .font(.caption.weight(.semibold))
@@ -561,7 +638,7 @@ enum ArchiveClipboard {
     }
 }
 
-private struct Badge: View {
+struct Badge: View {
     let text: String
     let symbol: String
     var tint: Color = .secondary
@@ -581,7 +658,7 @@ private struct Badge: View {
 /// Shown when the deadline was written in a way that could mean more than one
 /// day — or was not written at all. Pre-filled with the best reading of it, so
 /// confirming is one click and correcting is two.
-private struct ScheduleSheet: View {
+struct ScheduleSheet: View {
     let entry: BriefingArchiveModel.Entry
     @ObservedObject var model: BriefingArchiveModel
 

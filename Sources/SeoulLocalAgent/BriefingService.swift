@@ -123,6 +123,7 @@ struct NotionWriter {
 - 자동 제외/낮은 우선순위: \(excluded.count)개
 - 화면에서 생략한 확인 항목: \(max(0, references.count - AppConfig.briefingMaxReferences))개
 - 마감이 지나 이월하지 않은 미완료 항목: \(briefing.expiredCarryOverCount ?? 0)개
+- 마감 없이 \(CarryForwardPolicy.staleAfterDays)일을 넘겨 이월하지 않은 항목: \(briefing.staleCarryOverCount ?? 0)개
 
 # 수집 상태
 
@@ -245,8 +246,18 @@ struct BriefingService {
             // open and unchanged keeps its earlier result instead of being sent to
             // the model again, which is what makes incremental collection cheap.
             let dateKey = Self.dateKey(now)
+            // 표는 한 번만 읽는다. 이월 판단(끝냈는가·옮겼는가)과 분류 프롬프트에 실을
+            // 교정 예시가 모두 같은 파일에서 나온다.
+            let archived = archiveStore.load()
+            // 사람이 같은 것을 반복해서 옮겼다면 그 사실을 분류에 함께 보낸다. 그러지
+            // 않으면 모델은 매일 같은 자리에 같은 메일을 놓고, 사람은 매일 같은 것을
+            // 다시 내린다.
+            let correctionBlock = ClassificationLearning.promptBlock(
+                from: ClassificationLearning.corrections(days: Array(state.dailyBriefings.values), marks: archived.marks)
+            ) ?? ""
             var carried: [ClassifiedItem] = []
             var expiredCarryOverCount = 0
+            var staleCarryOverCount = 0
             if let previous = state.dailyBriefings.values
                 .filter({ $0.dateKey != dateKey && $0.updatedAt < now })
                 .sorted(by: { $0.updatedAt > $1.updatedAt })
@@ -256,11 +267,13 @@ struct BriefingService {
                 // the reader ticked off in 브리핑 보관함.
                 let outcome = CarryForwardPolicy.evaluate(
                     previousItems: previous.items,
-                    completedIDs: archiveStore.load().completedIDs,
+                    completedIDs: archived.completedIDs,
+                    overrides: archived.categoryOverrides,
                     now: now
                 )
                 carried = outcome.carried
                 expiredCarryOverCount = outcome.expired.count
+                staleCarryOverCount = outcome.stale.count
             }
             try Task.checkCancellation()
             // A second run on the same day must not re-analyse what the first run
@@ -285,7 +298,7 @@ struct BriefingService {
                 let items = sourceGroups[source] ?? []
                 await progress(.classifying, "2/4 · \(source) \(items.count)개를 분류하고 한국어 브리핑 문장까지 한 번에 만들고 있습니다.", nil)
                 do {
-                    var sourceClassified = try await classifier.classify(items, userInstructions: preferences.userInstructions)
+                    var sourceClassified = try await classifier.classify(items, userInstructions: preferences.userInstructions, corrections: correctionBlock)
                     sourceClassified = sourceClassified.map { item in
                         guard preferenceResult.importantIDs.contains(item.id) else { return item }
                         var important = item
@@ -324,6 +337,7 @@ struct BriefingService {
             let effectiveSince = min(gmailSince, slackSince, iMessageSince)
             daily.collectionRange = "\(range.rawValue) · \(effectiveSince.formatted(date: .abbreviated, time: .shortened)) 이후"
             daily.expiredCarryOverCount = expiredCarryOverCount
+            daily.staleCarryOverCount = staleCarryOverCount
             daily.failures = collections.compactMap(\.errorMessage) + collections.flatMap(\.warnings) + analysisFailures
             if !persists {
                 await classifier.unload()

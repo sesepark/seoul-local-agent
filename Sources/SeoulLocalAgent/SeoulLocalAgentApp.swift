@@ -54,6 +54,29 @@ struct SeoulLocalAgentApp: App {
         // read the console's status, pull one frame from each camera and report
         // whether anything was left running. Useful when the arms will not start
         // and the question is whether this Mac can reach the server at all.
+        // 분류 프롬프트에 실려 가는 교정 예시를 파일로 꺼낸다. 창을 열지 않는다.
+        //
+        // `scripts/eval/briefing-eval.py`가 이것을 읽어 **넣은 쪽과 뺀 쪽을 나란히**
+        // 재기 위한 것이다. 예시를 파이썬에서 다시 만들면 앱이 실제로 보내는 것과
+        // 조용히 달라지므로, 만드는 곳은 이 한 군데로 둔다.
+        if let index = CommandLine.arguments.firstIndex(of: "--export-corrections"),
+           index + 1 < CommandLine.arguments.count {
+            let path = CommandLine.arguments[index + 1]
+            Task { @MainActor in
+                let model = BriefingArchiveModel()
+                let corrections = model.corrections
+                let block = ClassificationLearning.promptBlock(from: corrections) ?? ""
+                do {
+                    try block.write(toFile: path, atomically: true, encoding: .utf8)
+                    let lines = block.isEmpty ? 0 : block.split(separator: "\n").filter { $0.hasPrefix("- ") }.count
+                    print("✅ 교정 \(corrections.count)건 중 \(lines)줄을 \(path)에 적었습니다 (\(block.count)자)")
+                    exit(EXIT_SUCCESS)
+                } catch {
+                    print("❌ 쓰지 못했습니다: \(error.localizedDescription)")
+                    exit(EXIT_FAILURE)
+                }
+            }
+        }
         // 음악 탭이 닿는 곳을 한 번씩 두드려 본다. 창을 열지 않고도 무엇이 되고
         // 무엇이 안 되는지 알 수 있어야 한다.
         if CommandLine.arguments.contains("--music-check") {
@@ -653,6 +676,16 @@ final class AutomationController: ObservableObject {
         briefingArchive.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        // 보관함에서 규칙 제안을 받아들이면 분류 기준 파일이 바뀐다. 설정 창이 들고 있는
+        // 사본을 다시 읽지 않으면, 거기서 다음에 `저장`을 누르는 순간 방금 굳힌 규칙이
+        // 낡은 사본에 덮여 사라진다.
+        briefingArchive.didChangePreferences = { [weak self] in self?.reloadBriefingPreferences() }
+        startAutopilot()
+        // 뚜껑을 닫거나 마이크가 사라져서 녹음이 스스로 끝났을 때. 녹음기는 파일을 닫는
+        // 데까지가 자기 일이고, 보관함에 넣고 화면에 적는 것은 이쪽 일이다.
+        audioRecorder.onUnattendedStop = { [weak self] url, message in
+            self?.recordingEndedOnItsOwn(url, message)
+        }
         // Same for the recorder: without this the elapsed time published every
         // quarter second never reaches the views, so the counter sits at 0:00.
         audioRecorder.objectWillChange
@@ -2409,6 +2442,7 @@ private struct MainWorkspaceView: View {
                 case .convert: FileConversionView(controller: controller)
                 case .briefing: BriefingStatusWorkspaceView(controller: controller)
                 case .archive: BriefingArchiveView(controller: controller)
+                case .briefingCalendar: BriefingCalendarView(controller: controller)
                 case .soarm: SOArmView(controller: controller)
                 case .soarmTeleop: SOArmTeleopView(controller: controller)
                 case .soarmData: SOArmDatasetsView(controller: controller)
@@ -2718,7 +2752,7 @@ private struct OverviewView: View {
     private var tools: some View {
         GroupBox {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 215), spacing: Spacing.m)], spacing: Spacing.m) {
-                ForEach(AppSection.allCases.filter { $0 != .overview && $0 != .briefing && $0 != .archive && $0 != .soarm }) { section in
+                ForEach(AppSection.allCases.filter { $0 != .overview && $0 != .briefing && $0 != .archive && $0 != .briefingCalendar && $0 != .soarm }) { section in
                     ToolShortcut(section: section) { controller.section = section }
                 }
             }

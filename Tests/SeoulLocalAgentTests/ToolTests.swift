@@ -668,7 +668,7 @@ struct ToolTests {
     @Test("Every screen has a shortcut, a group and a symbol of its own")
     func sections() {
         let all = AppSection.allCases
-        #expect(all.count == 16)
+        #expect(all.count == 17)
         // No two screens may claim the same key *and* the same modifiers, or the
         // menu silently wins one. 자동 브리핑 and 브리핑 보관함 deliberately share
         // the letter and differ by ⇧.

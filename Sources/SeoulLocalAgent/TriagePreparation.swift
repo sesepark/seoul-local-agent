@@ -412,7 +412,22 @@ enum CarryForwardPolicy {
         var carried: [ClassifiedItem] = []
         /// Unfinished, but past its stated deadline. Counted rather than carried.
         var expired: [ClassifiedItem] = []
+        /// Unfinished, no deadline to expire, and old enough that carrying it
+        /// again would be noise. Counted the same way.
+        var stale: [ClassifiedItem] = []
     }
+
+    /// 마감이 없는 할 일을 이만큼 지나면 더 이월하지 않는다.
+    ///
+    /// 마감이 **적힌** 항목은 그 날짜가 지나면 알아서 빠지지만, 마감이 없는 항목에는 빠질
+    /// 날이 없어서 체크할 때까지 영원히 따라온다. 그렇게 쌓인 더미는 `오늘 꼭 할 일`이라는
+    /// 이름을 못 쓰게 만든다 — 오늘 해야 하는 것과 3주 전에 지나간 것이 같은 자리에 서면,
+    /// 사람은 그 자리를 아예 안 읽게 된다.
+    ///
+    /// 14일인 이유는 학사 일정의 리듬이다. 한 주를 넘겨 다음 주까지 밀린 일은 아직 살아
+    /// 있을 수 있지만, 두 주를 넘도록 손대지 않은 요청은 이미 끝났거나 잊힌 것이다.
+    /// 세어서 화면에 적으므로 조용히 사라지지는 않고, 보관함에서 그날을 펼치면 그대로 있다.
+    static let staleAfterDays = 14
 
     /// `completedIDs` are the `trackingID`s the reader has ticked off in the
     /// 브리핑 보관함. Everything else that was an action yesterday is still an
@@ -425,21 +440,40 @@ enum CarryForwardPolicy {
     /// as a to_do at all and so could never be carried. Keying on the tracking
     /// ID and inverting the test — carry unless explicitly finished — fixes
     /// both.
-    static func evaluate(previousItems: [ClassifiedItem], completedIDs: Set<String>, now: Date) -> Outcome {
+    /// - Parameter overrides: 사람이 보관함에서 직접 옮긴 분류. **모델의 분류보다 우선한다.**
+    ///
+    ///   이것을 읽지 않던 동안, `기타`로 내린 항목도 모델이 매긴 `action` 그대로 매일
+    ///   이월되어 다음 날 `오늘 꼭 할 일`에 다시 섰다. 옮기기는 화면에만 남고 파이프라인은
+    ///   그것을 본 적이 없었던 셈이라, 같은 항목을 며칠이고 다시 내려야 했다.
+    static func evaluate(previousItems: [ClassifiedItem], completedIDs: Set<String>, overrides: [String: BriefCategory] = [:], now: Date) -> Outcome {
         var outcome = Outcome()
         for item in previousItems {
+            let effective = overrides[item.trackingID] ?? item.category
             if isUpcomingCalendarEntry(item, now: now) {
-                outcome.carried.append(item)
+                // 앞으로 있을 일정은 분류와 상관없이 이월하지만, 사람이 `기타`로 내린
+                // 것은 예외다. 그것은 "이 일정은 나와 상관없다"는 분명한 말이다.
+                if effective != .excluded { outcome.carried.append(item) }
                 continue
             }
-            guard item.category == .action, !completedIDs.contains(item.trackingID) else { continue }
-            if let expiry = BriefPresentation.deadlineExpiry(item.deadline), expiry <= now {
-                outcome.expired.append(item)
+            guard effective == .action, !completedIDs.contains(item.trackingID) else { continue }
+            if let expiry = BriefPresentation.deadlineExpiry(item.deadline) {
+                if expiry <= now { outcome.expired.append(item) } else { outcome.carried.append(item) }
+            } else if isStale(item, now: now) {
+                // 마감이 없어서 만료될 날이 없는 항목. 여기서 끊지 않으면 무한히 쌓인다.
+                outcome.stale.append(item)
             } else {
                 outcome.carried.append(item)
             }
         }
         return outcome
+    }
+
+    /// 마감이 없는 채로 너무 오래된 항목인가. 나이는 **메일이 도착한 시각**으로 잰다 —
+    /// 이월 횟수를 따로 세는 값이 없고, 도착 시각은 이미 항목에 실려 있어서 새 필드를
+    /// 만들지 않고도 같은 것을 말해 준다.
+    static func isStale(_ item: ClassifiedItem, now: Date) -> Bool {
+        guard let cutoff = KoreanDeadline.calendar.date(byAdding: .day, value: -staleAfterDays, to: now) else { return false }
+        return item.sourceItem.timestamp < cutoff
     }
 
     static func isUpcomingCalendarEntry(_ item: ClassifiedItem, now: Date) -> Bool {

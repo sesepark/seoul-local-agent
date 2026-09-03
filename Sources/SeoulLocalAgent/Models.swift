@@ -91,6 +91,9 @@ struct DailyBriefing: Codable {
     /// Unfinished items from an earlier day whose deadline has already passed, so
     /// the report can say they were dropped instead of losing them silently.
     var expiredCarryOverCount: Int?
+    /// 마감이 없는 채로 2주를 넘겨 이월을 그만둔 항목의 수. 만료와 같은 이유로 세어 둔다 —
+    /// 조용히 사라지면 사람은 자기가 지운 줄 알거나, 아예 있었다는 것을 모른다.
+    var staleCarryOverCount: Int?
 }
 
 /// The source labels the pipeline groups and routes by.
@@ -326,7 +329,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case transcription, audioCleanup, cutout, upscale
     case music
     case compression, convert
-    case briefing, archive
+    case briefing, archive, briefingCalendar
     case soarm, soarmTeleop, soarmData
 
     var id: String { rawValue }
@@ -350,6 +353,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "형식 변환"
         case .briefing: "자동 브리핑"
         case .archive: "브리핑 보관함"
+        case .briefingCalendar: "일정 달력"
         case .soarm: "SO-ARM 101"
         case .soarmTeleop: "원격 텔레옵"
         case .soarmData: "수집 데이터"
@@ -371,6 +375,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "사진·오디오·영상·문서를 다른 형식으로 바꿉니다. 필요한 것은 전부 이 Mac 안에서 처리합니다."
         case .briefing: "메일·메시지·웹 공지를 모아 이 Mac의 모델로 정리합니다. 수집부터 저장까지의 상태를 여기서 봅니다."
         case .archive: "정리된 결과가 날짜별로 쌓입니다. 끝낸 일을 체크하고, 남은 일은 Mac 캘린더나 미리 알림으로 바로 넘깁니다."
+        case .briefingCalendar: "브리핑에서 나온 마감과, 캘린더·미리 알림으로 넘긴 일정을 한 달치 달력에 모아 놓습니다. 날짜를 읽지 못한 것은 아래에 따로 셉니다."
         case .soarm: "집 서버에 붙은 SO-ARM101 팔을 여기서 조작합니다. 팔과 카메라는 서버가 쥐고 있고, 이 Mac은 SSH 터널 너머로 시작과 중지만 지시합니다."
         case .soarmTeleop: "3D로 그린 팔을 만지면 집에 있는 진짜 팔이 따라옵니다. 물리 리더 팔이 없어도 되고, 같은 화면을 아이폰에서도 씁니다. 멈춰야 할 일이 생기면 서버가 먼저 멈추고 왜 멈췄는지 알려 줍니다."
         case .soarmData: "서버에 쌓인 시연 데이터를 에피소드 단위로 되돌려 봅니다. 영상은 서버에 그대로 두고 필요한 구간만 받아 재생합니다."
@@ -394,6 +399,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "다른 형식으로 바꾸기"
         case .briefing: "메일·공지 모아 정리하기"
         case .archive: "정리된 할 일과 캘린더 연동"
+        case .briefingCalendar: "마감과 일정을 달력으로"
         case .soarm: "로봇 팔 상태와 카메라"
         case .soarmTeleop: "3D로 팔을 직접 움직이기"
         case .soarmData: "찍어 둔 시연 다시 보기"
@@ -418,6 +424,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .convert: "arrow.triangle.2.circlepath"
         case .briefing: "tray.full"
         case .archive: "checklist"
+        case .briefingCalendar: "calendar"
         // The arm itself, not a generic robot face: this screen is about a
         // manipulator that moves, and the sidebar should say which one.
         case .soarm: "arrow.up.and.down.and.arrow.left.and.right"
@@ -445,7 +452,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .compression: "9"
         case .convert: "0"
         case .music: "m"
-        case .briefing, .archive: "b"
+        case .briefing, .archive, .briefingCalendar: "b"
         case .soarm, .soarmTeleop, .soarmData: "r"
         }
     }
@@ -455,6 +462,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var shortcutModifiers: EventModifiers {
         switch self {
         case .archive, .soarm, .music: [.command, .shift]
+        case .briefingCalendar: [.command, .option]
         case .soarmTeleop: [.command, .control]
         case .soarmData: [.command, .option]
         default: .command
@@ -482,7 +490,7 @@ enum AppSection: String, CaseIterable, Identifiable {
             case .media: [.transcription, .audioCleanup, .cutout, .upscale]
             case .music: [.music]
             case .files: [.compression, .convert]
-            case .automation: [.briefing, .archive]
+            case .automation: [.briefing, .archive, .briefingCalendar]
             case .robot: [.soarm, .soarmTeleop, .soarmData]
             }
         }
