@@ -89,6 +89,34 @@ struct RecordingRepairTests {
         #expect(abs(kept.timeIntervalSince(recorded)) < 1)
     }
 
+    @Test("마이크가 쓰고 있는 녹음은 복구가 손대지 않는다")
+    func leavesTheLiveTakeAlone() throws {
+        let original = try Self.makeRecording(seconds: 1)
+        defer { try? FileManager.default.removeItem(at: original) }
+        let live = try Self.cutOff(original)
+        defer { try? FileManager.default.removeItem(at: live) }
+
+        // 지금 녹음 중인 파일은 색인이 없는 것이 **정상**이다. 모양만 보면 복구 대상과
+        // 구별되지 않으므로, 복구를 막는 것은 모양이 아니라 이 등록이어야 한다.
+        #expect(RecordingRepair.isUnfinished(live))
+        let before = try Data(contentsOf: live)
+
+        LiveTakes.shared.insert(live)
+        #expect(!RecordingRepair.repairIfUnfinished(live))
+        // 한 바이트도 바뀌지 않아야 한다. 복구는 원본 자리에 새 파일을 놓는 일이라,
+        // 자라고 있는 녹음에 그 일을 하면 강의가 통째로 사라진다.
+        #expect(try Data(contentsOf: live) == before)
+
+        // 경로는 표준화해서 견준다. 같은 파일이 `/private/var`와 `/var`로 들어와도
+        // 같은 것으로 알아봐야 한다.
+        #expect(LiveTakes.shared.contains(live.resolvingSymlinksInPath()) || LiveTakes.shared.contains(live))
+
+        // 녹음이 끝나 등록에서 빠지면 같은 파일이 정상적으로 복구된다.
+        LiveTakes.shared.remove(live)
+        #expect(RecordingRepair.repairIfUnfinished(live))
+        #expect(!RecordingRepair.isUnfinished(live))
+    }
+
     @Test("멀쩡한 녹음은 건드리지 않는다")
     func leavesAFinishedTakeAlone() throws {
         let url = try Self.makeRecording(seconds: 1)

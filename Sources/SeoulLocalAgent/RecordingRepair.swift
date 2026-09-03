@@ -32,6 +32,12 @@ enum RecordingRepair {
     /// Returns true when a take was actually rebuilt, so the caller can say so.
     @discardableResult
     static func repairIfUnfinished(_ url: URL) -> Bool {
+        // 마이크가 지금 쓰고 있는 파일은 손대지 않는다. **이 검사가 여기 있는 이유가
+        // 따로 있다.** 부르는 쪽에도 같은 뜻의 가드가 있지만 그것은 폴더를 훑기 전에 찍은
+        // 사진이고, 사진과 훑기 사이에 시작된 녹음은 거기에 없다. 덮어쓰기 직전인 이
+        // 자리에서 읽으면 그 틈이 사라진다 — 아래 `repair`는 원본 자리에 새 파일을 놓으므로,
+        // 자라고 있는 녹음에 그 일을 하면 강의가 통째로 사라진다.
+        guard !LiveTakes.shared.contains(url) else { return false }
         guard isUnfinished(url), attempted.claim(url) else { return false }
         do {
             try repair(url)

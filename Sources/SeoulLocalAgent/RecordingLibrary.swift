@@ -195,7 +195,11 @@ enum RecordingLibrary {
 
     private static func appRecordings(skipping recording: URL?, status: (@Sendable (String) -> Void)?) -> [RecordingItem] {
         guard let directory = try? AudioRecorder.recordingsDirectory(), let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
-        let takes = urls.filter { $0.pathExtension.lowercased() == "m4a" }
+        // 마이크가 지금 쓰고 있는 파일은 아예 목록에 넣지 않는다. 아래의 `recording`은
+        // 훑기를 시작하기 전에 찍은 사진이라 그 사이에 시작된 녹음을 모르지만, 이 등록은
+        // 지금을 말한다. 자라고 있는 녹음은 아직 재생할 수 없으므로, 보관함에 들어가면
+        // 열 때마다 실패하는 0초짜리 한 줄이 된다.
+        let takes = urls.filter { $0.pathExtension.lowercased() == "m4a" && !LiveTakes.shared.contains($0) }
         // A take left unfinished by a quit or a crash is rebuilt here, before anything
         // measures it, so it enters the library with its real length instead of as a
         // 0초 entry that only ever produces an error when played.

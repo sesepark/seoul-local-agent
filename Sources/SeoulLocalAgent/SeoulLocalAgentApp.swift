@@ -342,6 +342,13 @@ final class AutomationController: ObservableObject {
         didSet { UserDefaults.standard.set(transcriptionLanguage.rawValue, forKey: "transcriptionLanguage") }
     }
     @Published var transcriptionDetail = "녹음 파일을 선택하면 설정한 음성 인식과 화자 구분을 시작합니다."
+    /// 녹음이 어떻게 끝났는지. **전사 진행 줄과 따로 있어야 한다.**
+    ///
+    /// 예전에는 이 말도 `transcriptionDetail`에 적었는데, 그 줄은 전사가 도는 동안에만
+    /// 화면에 나오고 그때는 진행률에 밀리지 않으려고 적기를 건너뛰었다. 그래서 녹음을
+    /// 멈춰도 어디에도 아무 말이 나오지 않았다 — 전사 중이든 아니든. 녹음과 전사는 같이
+    /// 도는 일이므로 말할 자리도 둘이어야 한다.
+    @Published var recordingStatus: String?
     @Published var transcriptionStep = 0
     @Published var transcriptionETA: TimeInterval?
     @Published var transcriptionText = ""
@@ -1926,18 +1933,28 @@ final class AutomationController: ObservableObject {
             reportRecordingStatus(mostRecentRecording == nil ? "녹음을 저장하지 못했습니다." : "녹음이 저장되었습니다. 전사 버튼으로 바로 전사할 수 있습니다.")
             return
         }
+        // 앞 녹음이 어떻게 끝났다는 말은 새 녹음이 시작되는 순간 사실이 아니게 된다.
+        reportRecordingStatus(nil)
         Task {
             if await audioRecorder.start() {
-                reportRecordingStatus("녹음 중입니다. 중지하면 전사할 수 있습니다.")
+                reportRecordingStatus("녹음 중입니다. 전사는 녹음과 같이 돌릴 수 있습니다.")
             }
         }
     }
 
-    /// `transcriptionDetail` doubles as the running job's progress line, so a
-    /// recording started mid-transcription must not overwrite it.
-    private func reportRecordingStatus(_ status: String) {
-        guard !isTranscribing else { return }
-        transcriptionDetail = status
+    /// 사람이 누르지 않았는데 녹음이 끝났다 — 뚜껑을 닫았거나, Mac이 잠들었거나, 마이크가
+    /// 사라졌거나. 끝난 자리에 사람이 없었을 수 있으므로, 보관함에 넣어 고르고 왜 끝났는지
+    /// 화면에 남긴다.
+    private func recordingEndedOnItsOwn(_ url: URL?, _ message: String) {
+        mostRecentRecording = url
+        refreshRecordings(selecting: url)
+        reportRecordingStatus(message)
+    }
+
+    /// 녹음에 대한 말은 녹음의 줄에 적는다. 전사가 도는 중에도 지워지지 않고, 전사가
+    /// 돌지 않을 때에도 보인다.
+    private func reportRecordingStatus(_ status: String?) {
+        recordingStatus = status
     }
 
     /// Scanning the Voice Memos database and probing durations is file I/O, so it
@@ -3324,6 +3341,11 @@ private struct TranscriptionView: View {
             if let error = controller.audioRecorder.errorMessage {
                 DismissibleError(message: error) { controller.audioRecorder.dismissError() }
             }
+            // 녹음이 어떻게 끝났는지. 전사가 도는 중에도 이 자리는 전사 카드와 겹치지
+            // 않으므로, 강의 중에 뚜껑을 닫아 끝난 녹음도 돌아와서 읽을 수 있다.
+            if let status = controller.recordingStatus, !controller.audioRecorder.isRecording {
+                DismissibleNote(message: status, symbol: "waveform.circle.fill") { controller.recordingStatus = nil }
+            }
 
             dropWell
 
@@ -3366,6 +3388,7 @@ private struct TranscriptionView: View {
         .animation(.appContent, value: controller.isTranscribing)
         .animation(.appContent, value: controller.processingQueue.map(\.id))
         .animation(.appContent, value: controller.audioRecorder.isRecording)
+        .animation(.appContent, value: controller.recordingStatus)
         .animation(.appContent, value: controller.transcriptionError)
         .toolbar {
             ToolbarItem {

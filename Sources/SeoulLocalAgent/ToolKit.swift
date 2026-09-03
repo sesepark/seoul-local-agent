@@ -153,6 +153,46 @@ struct DismissibleError: View {
     }
 }
 
+/// 오류가 아닌 소식 한 줄. `DismissibleError`와 같은 모양이되 빨갛지 않다.
+///
+/// 뚜껑을 닫아 녹음이 끝났다는 말이 갈 자리가 필요해서 생겼다. 그것은 잘못된 일이 아니라
+/// 사람이 자리에 없는 동안 일어난 일이고, 빨간 띠로 적으면 무언가 고장 난 것으로 읽힌다.
+struct DismissibleNote: View {
+    let message: String
+    var symbol = "info.circle.fill"
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Spacing.s) {
+            Image(systemName: symbol)
+                .foregroundStyle(Color.snuBlueLabel)
+                .font(.caption)
+            Text(message)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            Spacer(minLength: Spacing.xs)
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark").font(.caption2)
+            }
+            .buttonStyle(.borderless)
+            .help("메시지 닫기")
+            .accessibilityLabel("알림 닫기")
+        }
+        .padding(.horizontal, Spacing.m)
+        .padding(.vertical, Spacing.s)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.snuBlue.opacity(0.10), in: RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Radius.small, style: .continuous)
+                .strokeBorder(Color.snuBlue.opacity(0.25))
+        )
+        .transition(.appBanner)
+    }
+}
+
 /// The first thing in the body of every file tool.
 ///
 /// 용량 줄이기 and 누끼 따기 each grew their own copy of this, and the two had
