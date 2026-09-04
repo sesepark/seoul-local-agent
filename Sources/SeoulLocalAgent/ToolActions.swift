@@ -146,6 +146,21 @@ extension AutomationController {
         chooseFiles(title: "바꿀 파일 선택", startingAt: directory) { convertFiles($0) }
     }
 
+    // MARK: - 프린트
+
+    func chooseFilesToPrint(startingAt directory: URL?) {
+        chooseFiles(title: "인쇄할 파일 선택", startingAt: directory) { printing.add($0) }
+    }
+
+    /// 다른 화면의 결과를 프린터로 넘긴다. 화면도 함께 옮기는 이유는, 넘긴 뒤에 무엇이
+    /// 몇 장 나갈지 보고 인쇄를 누르는 자리가 거기이기 때문이다. 여기서 저절로 인쇄하지는
+    /// 않는다 — 종이가 나가는 일은 사람이 누른 뒤에 일어난다.
+    func sendToPrinter(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        section = .print
+        printing.add(urls)
+    }
+
     // MARK: - 개발용 실행 인자
 
     /// `--open <path>…` hands files straight to whichever screen `--section`
@@ -169,6 +184,7 @@ extension AutomationController {
         case .compression: compress(fileURLs: urls)
         case .cutout: removeBackground(fileURLs: urls)
         case .pdf: pdfEditor.open(urls)
+        case .print: printing.add(urls)
         default: break
         }
     }

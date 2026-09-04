@@ -381,6 +381,7 @@ struct ToolResultCard: View {
 
     @State private var preview: CGImage?
     @State private var isHovering = false
+    @Environment(\.sendToPrinter) private var sendToPrinter
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
@@ -428,6 +429,12 @@ struct ToolResultCard: View {
                     Button("저장…", systemImage: "square.and.arrow.down") { model.save(job) }
                     Button("복사", systemImage: "doc.on.doc") { model.copy(job) }
                     Button("Finder에서 보기", systemImage: "folder") { model.reveal(job) }
+                    // 보정한 유인물이나 합친 PDF를 곧바로 집 프린터로. 프린터가 받을 수
+                    // 있는 결과일 때만 나온다.
+                    if let output = job.output, PrintPreparation.accepts(output) {
+                        Divider()
+                        Button("프린트로 보내기", systemImage: "printer") { sendToPrinter([output]) }
+                    }
                 } label: {
                     Image(systemName: "ellipsis")
                 }

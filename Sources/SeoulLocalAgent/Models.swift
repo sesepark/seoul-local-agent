@@ -325,7 +325,7 @@ enum DocumentRecognitionMode: String, CaseIterable, Identifiable, Sendable {
 /// a case moved here moves on screen and under the user's fingers together.
 enum AppSection: String, CaseIterable, Identifiable {
     case overview
-    case documents, scan, pdf
+    case documents, scan, pdf, print
     case transcription, audioCleanup, cutout, upscale
     case music
     case compression, convert
@@ -344,6 +344,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .documents: "문서 인식"
         case .scan: "스캔 보정"
         case .pdf: "PDF 편집"
+        case .print: "프린트"
         case .transcription: "녹음·전사"
         case .audioCleanup: "소리 다듬기"
         case .cutout: "누끼 따기"
@@ -366,6 +367,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .documents: "강의 슬라이드 사진, 스캔한 유인물 PDF, 화면의 일부를 텍스트로 바꿉니다. 어느 쪽을 고르든 이미지가 이 Mac을 벗어나지 않습니다."
         case .scan: "비스듬히 찍은 유인물 사진을 반듯하게 펴고 그늘을 지워 스캔한 것처럼 만듭니다. 여러 장을 한 PDF로 묶을 수 있습니다."
         case .pdf: "PDF를 합치고 나누고 쪽을 정리합니다. 암호를 걸거나 풀고, 서명 이미지와 워터마크를 얹습니다."
+        case .print: "PDF·사진·문서를 여기 던지면 집 서버에 붙은 프린터로 보냅니다. 집에서도 밖에서도 같은 길로 닿고, 종이가 몇 장 나갈지 보내기 전에 셉니다."
         case .transcription: "앱에서 바로 녹음하거나 파일을 드롭해 한국어 전사를 만듭니다. 여러 전사와 AI 자동요약은 대기열에 추가한 순서대로 하나씩 처리됩니다."
         case .audioCleanup: "강의·회의 녹음에서 에어컨 소리와 웅성거림을 걷어내고 음량을 고르게 맞춥니다. 영상을 넣으면 소리만 꺼내 다듬습니다."
         case .cutout: "사진을 드롭하면 배경을 지운 투명 PNG를 만듭니다. 모델은 이 Mac에서만 실행되고 사진은 기기를 벗어나지 않습니다."
@@ -390,6 +392,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .documents: "사진·PDF에서 글자 뽑기"
         case .scan: "찍은 유인물을 반듯한 스캔으로"
         case .pdf: "합치기·나누기·서명·암호"
+        case .print: "집 프린터로 던져 보내기"
         case .transcription: "녹음하고 한국어로 받아쓰기"
         case .audioCleanup: "잡음 빼고 음량 고르게"
         case .cutout: "배경 지운 투명 PNG"
@@ -412,6 +415,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .documents: "text.viewfinder"
         case .scan: "doc.viewfinder"
         case .pdf: "doc.on.doc"
+        case .print: "printer"
         case .transcription: "waveform"
         case .audioCleanup: "waveform.path.badge.minus"
         case .cutout: "person.and.background.dotted"
@@ -452,6 +456,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .compression: "9"
         case .convert: "0"
         case .music: "m"
+        case .print: "p"
         case .briefing, .archive, .briefingCalendar: "b"
         case .soarm, .soarmTeleop, .soarmData: "r"
         }
@@ -486,7 +491,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         var members: [AppSection] {
             switch self {
             case .start: [.overview]
-            case .documents: [.documents, .scan, .pdf]
+            case .documents: [.documents, .scan, .pdf, .print]
             case .media: [.transcription, .audioCleanup, .cutout, .upscale]
             case .music: [.music]
             case .files: [.compression, .convert]

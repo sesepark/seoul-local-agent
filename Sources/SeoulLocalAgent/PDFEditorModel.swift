@@ -282,6 +282,29 @@ final class PDFEditorModel: ObservableObject {
         }
     }
 
+    /// 지금 편집한 것을 프린트 탭에 넘길 수 있는 파일 하나로 꺼낸다.
+    ///
+    /// 저장 창을 띄우지 않는다. 인쇄하려고 저장 위치를 정하게 하는 것은 한 단계를 더
+    /// 시키는 일이고, 인쇄한 뒤에 그 파일이 남기를 바라는 사람도 별로 없다. 고른 쪽이
+    /// 있으면 그 쪽만 나간다 — 화면에서 고른 것이 곧 인쇄할 것이라는 뜻이다.
+    func fileForPrinting() -> URL? {
+        guard let current = document else { return nil }
+        let source = selection.isEmpty ? current : PDFToolbox.extracting(selection.sorted(), from: current)
+        do {
+            let directory = try ToolWorkspace.directory("Print")
+            let stem = Self.saveName(sourceName, suffix: selection.isEmpty ? "인쇄" : "발췌")
+            let url = directory.appending(path: stem.hasSuffix(".pdf") ? stem : "\(stem).pdf")
+            try PDFToolbox.write(source, to: url)
+            status = selection.isEmpty
+                ? "\(current.pageCount)쪽을 프린트로 보냈습니다."
+                : "고른 \(selection.count)쪽을 프린트로 보냈습니다."
+            return url
+        } catch {
+            self.error = Self.message(for: error)
+            return nil
+        }
+    }
+
     func saveSelected() {
         guard let current = document, !selection.isEmpty else { return }
         let extracted = PDFToolbox.extracting(selection.sorted(), from: current)

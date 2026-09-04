@@ -90,6 +90,14 @@ struct PDFEditorView: View {
             .help("고른 쪽에 서명 이미지나 워터마크를 얹습니다")
         }
         ToolbarItem {
+            // 편집을 끝낸 뒤 가장 흔히 이어지는 일이 인쇄다. 고른 쪽이 있으면 그 쪽만 간다.
+            Button("프린트로 보내기", systemImage: "printer") {
+                if let url = model.fileForPrinting() { controller.sendToPrinter([url]) }
+            }
+            .disabled(model.isEmpty)
+            .help("편집한 PDF를 프린트 탭으로 넘깁니다. 고른 쪽이 있으면 그 쪽만 넘어갑니다")
+        }
+        ToolbarItem {
             Menu("저장", systemImage: "square.and.arrow.down") {
                 Button("고른 쪽만 저장…", systemImage: "doc.badge.plus") { model.saveSelected() }
                     .disabled(!model.hasSelection)

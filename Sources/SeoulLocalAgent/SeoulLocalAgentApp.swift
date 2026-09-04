@@ -89,6 +89,13 @@ struct SeoulLocalAgentApp: App {
                 exit(await SOArmConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
             }
         }
+        // 프린터까지 가는 길을 창 없이 확인한다. 집 주소와 밖에서 쓸 주소를 따로 두드리므로,
+        // "지금 있는 곳에서만 되는" 상태를 여기서 잡을 수 있다.
+        if CommandLine.arguments.contains("--printer-check") {
+            Task { @MainActor in
+                exit(await PrintConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
+            }
+        }
         // `--briefing-shadow` runs the whole pipeline and prints the report
         // without touching stored state; `--briefing-write` also saves it and
         // exports it to Notion, which is now an explicit extra step rather than
@@ -273,6 +280,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // that path is for a force-quit; a clean quit should not leave the app's
         // last act to the kernel.
         SOArmTunnel.shared.shutdownNow()
+        // 프린트 탭이 만든 임시 PDF. 보낸 뒤에도 목록에 남아 있으므로 앱이 끝날 때 치운다 —
+        // 원본은 여기서 지우는 대상이 아니고, 지워지지도 않는다.
+        PrintModel.cleanUpOnQuit()
         // Tree, not just the direct child: the 정밀 문서 인식 helper starts a
         // local service of its own that would otherwise be left behind.
         ActiveProcessRegistry.shared.terminateAllTrees()
@@ -324,6 +334,9 @@ final class AutomationController: ObservableObject {
     /// 음악 탭. 재생·대기열·플레이리스트를 모두 쥐고 있고, 화면을 떠나도 소리가
     /// 이어져야 하므로 화면이 아니라 여기 산다.
     let music = MusicPlayerModel()
+    /// 프린트 탭. 프린터는 집 서버에 USB로 붙어 있고, 이 Mac은 SSH 너머로 문서만 흘려보낸다.
+    /// 로봇과 같은 서버라 주소도 같은 것을 읽는다 — 한 서버에 설정 두 벌을 두지 않는다.
+    let printing = PrintModel()
     /// The SO-ARM 101 console on the home server. Nothing here touches hardware:
     /// the arms and cameras stay owned by that server, and this side only opens
     /// an SSH tunnel and asks it to start and stop.
@@ -2433,6 +2446,7 @@ private struct MainWorkspaceView: View {
                 case .documents: DocumentRecognitionView(controller: controller)
                 case .scan: ScanCorrectionView(controller: controller)
                 case .pdf: PDFEditorView(controller: controller)
+                case .print: PrintView(controller: controller)
                 case .transcription: TranscriptionView(controller: controller)
                 case .audioCleanup: AudioCleanupView(controller: controller)
                 case .cutout: CutoutView(controller: controller)
@@ -2451,6 +2465,9 @@ private struct MainWorkspaceView: View {
             // Screens now carry their own name into the title bar, so switching
             // sections crossfades the body rather than swapping it instantly.
             .animation(.appContent, value: controller.section)
+            // 어느 화면에서 나온 결과든 프린터로 넘길 수 있게 하는 한 줄. 결과 카드는
+            // 자기 도구의 모델만 알고 컨트롤러를 모르므로, 길을 환경으로 내려 준다.
+            .environment(\.sendToPrinter) { controller.sendToPrinter($0) }
         }
         .task { controller.openLaunchFiles() }
         .navigationSplitViewStyle(.balanced)
@@ -2504,6 +2521,8 @@ private struct OverviewView: View {
                 ) { openSettings() }
 
                 MusicOverviewTile(model: controller.music) { controller.section = .music }
+
+                PrintOverviewTile(model: controller.printing) { controller.section = .print }
 
                 SOArmOverviewTile(model: controller.soarm) { controller.section = .soarm }
 
@@ -3090,7 +3109,7 @@ private struct BriefingStatusRow: View {
 /// Which pane ⌘, opens on, so a button elsewhere can send the reader somewhere
 /// specific rather than to wherever they were last.
 enum SettingsTab: String, Hashable {
-    case briefing, connections, classification, transcription, dictation, tools, robot, music
+    case briefing, connections, classification, transcription, dictation, tools, robot, music, printer
 }
 
 /// The ⌘, window. These nine sections used to be one `Form` inside a sidebar
@@ -3129,6 +3148,9 @@ private struct SettingsWindow: View {
             }
             Tab("로봇", systemImage: "arrow.up.and.down.and.arrow.left.and.right", value: SettingsTab.robot) {
                 SOArmSettingsTab(model: controller.soarm)
+            }
+            Tab("프린터", systemImage: "printer", value: SettingsTab.printer) {
+                PrintSettingsTab(model: controller.printing)
             }
         }
         .frame(width: 620, height: 520)
