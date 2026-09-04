@@ -96,6 +96,26 @@ struct SeoulLocalAgentApp: App {
                 exit(await PrintConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
             }
         }
+        // 터미널에서 바로 인쇄한다. 화면이 쓰는 것과 **같은** 준비·조판·명령·지켜보기를
+        // 그대로 쓴다. `--print-hold`를 함께 주면 큐에 잡아 둔 채 넣어, 종이를 쓰지 않고
+        // 이 길 전체를 확인할 수 있다.
+        // 화면을 열지 않고 미리보기를 파일로 꺼낸다. 미리보기와 실제가 같은지 대조하는
+        // 자리이기도 하다 — 함께 남기는 PDF가 서버로 갈 바로 그 파일이다.
+        if let index = CommandLine.arguments.firstIndex(of: "--print-preview"), index + 2 < CommandLine.arguments.count {
+            let input = CommandLine.arguments[index + 1]
+            let output = CommandLine.arguments[index + 2]
+            let sheet = CommandLine.arguments.count > index + 3
+                ? (Int(CommandLine.arguments[index + 3]) ?? 1) - 1 : 0
+            Task { @MainActor in
+                exit(await PrintPreviewCommandLine.run(input: input, output: output, sheet: max(0, sheet)) ? EXIT_SUCCESS : EXIT_FAILURE)
+            }
+        } else if let index = CommandLine.arguments.firstIndex(of: "--print") {
+            let paths = CommandLine.arguments[(index + 1)...].prefix { !$0.hasPrefix("--") }
+            let holding = CommandLine.arguments.contains("--print-hold")
+            Task { @MainActor in
+                exit(await PrintCommandLine.run(paths: Array(paths), holding: holding) ? EXIT_SUCCESS : EXIT_FAILURE)
+            }
+        }
         // `--briefing-shadow` runs the whole pipeline and prints the report
         // without touching stored state; `--briefing-write` also saves it and
         // exports it to Notion, which is now an explicit extra step rather than

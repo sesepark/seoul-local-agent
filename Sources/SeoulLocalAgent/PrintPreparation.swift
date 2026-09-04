@@ -57,7 +57,32 @@ struct PreparedPrintDocument: Sendable {
 /// 바꿀 수 있지만, 그쪽 필터는 한글 글꼴을 모르고 HEIC를 열지 못한다. 여기서 만들면 화면에
 /// 미리 쪽수를 셀 수 있고, 무엇이 몇 장 나올지 **보내기 전에** 말할 수 있다.
 enum PrintPreparation {
-    static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "tiff", "tif", "heic", "heif", "bmp", "gif", "webp", "jp2"]
+    /// 흔한 사진 형식. 여기 없는 것도 내용을 보고 받아 주므로(`prepare` 아래쪽) 이 목록이
+    /// 곧 한계는 아니다.
+    ///
+    /// **이 목록은 상수여야 한다.** 한때 `CGImageSourceCopyTypeIdentifiers()`와 `UTType`으로
+    /// 시스템에 직접 물어 만들었는데, 그러면 이 값을 처음 읽는 순간 LaunchServices를 부른다.
+    /// 앱이 막 뜨는 중에 그 호출은 돌아오지 않을 수 있고, 실제로 `--print`가 아무것도 찍지
+    /// 못한 채 멈춰 있던 이유가 그것이었다. 목록이 조금 낡는 것보다 앱이 멈추지 않는 것이 중요하다.
+    static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "tiff", "tif", "heic", "heif", "avif", "bmp", "gif",
+        "webp", "jp2", "j2k", "pict", "ico", "icns", "psd", "exr", "hdr",
+        // 흔한 카메라 RAW. ImageIO가 열어 준다.
+        "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw",
+    ]
+
+    /// 폴더를 훑을 때만 쓰는, 시스템에 물어 만든 더 넓은 목록.
+    ///
+    /// 사람이 파일을 드롭한 **뒤에** 처음 읽히므로 LaunchServices를 불러도 안전하다.
+    /// 앱이 뜨는 경로에서는 절대 건드리지 않는다.
+    static var systemImageExtensions: Set<String> {
+        var found = imageExtensions
+        for identifier in (CGImageSourceCopyTypeIdentifiers() as? [String]) ?? [] {
+            guard let type = UTType(identifier) else { continue }
+            found.formUnion(type.tags[.filenameExtension]?.map { $0.lowercased() } ?? [])
+        }
+        return found
+    }
 
     /// 글로 읽어 그대로 앉히는 것들. LibreOffice 없이 동작한다.
     static let textExtensions: Set<String> = [
@@ -70,25 +95,80 @@ enum PrintPreparation {
     static let officeExtensions: Set<String> = ["docx", "doc", "pptx", "ppt", "xlsx", "xls", "odt", "odp", "ods", "hwp", "hwpx"]
 
     static var acceptedExtensions: Set<String> {
-        imageExtensions.union(textExtensions).union(officeExtensions).union(["pdf"])
+        systemImageExtensions.union(textExtensions).union(officeExtensions).union(["pdf"])
     }
 
     static func accepts(_ url: URL) -> Bool {
         acceptedExtensions.contains(url.pathExtension.lowercased())
     }
 
+    /// 한 파일이 감당할 수 있는 상한. 이보다 큰 것은 준비 단계에서 몇 분을 쓰거나 메모리를
+    /// 다 먹는다. 인쇄할 문서가 이만큼 크면 대개 잘못 넣은 파일이다.
+    static let sizeLimit = 500 * 1024 * 1024
+
     /// 화면의 드롭 안내에 적는 줄. 목록이 코드와 어긋나지 않도록 여기서 만든다.
     static let dropHint = "여기로 인쇄할 파일을 드롭하세요 · PDF · 사진(HEIC 포함) · TXT·MD·CSV · DOCX·PPTX·XLSX·HWP"
 
     static func directory() throws -> URL { try ToolWorkspace.directory("Print") }
 
-    static func prepare(_ source: URL, paper: String) async throws -> PreparedPrintDocument {
+    /// 사진과 글을 앉힐 쪽의 크기.
+    ///
+    /// 회전을 골랐으면 **가로세로를 바꾼 쪽에** 앉힌다. 세로 A4에 앉혀 놓고 나중에 90°
+    /// 돌리면, 돌린 세로 쪽이 세로 종이에 들어가느라 0.707배로 작아진다 — 가로로 긴
+    /// 슬라이드를 눕혀 크게 뽑으려던 것이 오히려 작아지는 것이다. 처음부터 가로 쪽에
+    /// 앉혀 두면 그것을 돌렸을 때 종이에 꼭 맞는다.
+    static func pageSize(paper: String, rotation: PrintOptions.Rotation) -> CGSize {
+        let size = PaperGeometry.size(for: paper)
+        return rotation.swapsAxes ? CGSize(width: size.height, height: size.width) : size
+    }
+
+    static func prepare(
+        _ source: URL, paper: String, rotation: PrintOptions.Rotation = .none
+    ) async throws -> PreparedPrintDocument {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw AgentError.processFailed("파일을 찾지 못했습니다: \(source.lastPathComponent)")
+        }
+        let size = fileSize(source)
+        guard size > 0 else {
+            throw AgentError.processFailed("빈 파일입니다: \(source.lastPathComponent)")
+        }
+        guard size <= sizeLimit else {
+            throw AgentError.processFailed("\(byteText(size))로 너무 큽니다(상한 \(byteText(sizeLimit))): \(source.lastPathComponent)")
+        }
+
         let ext = source.pathExtension.lowercased()
         if ext == "pdf" { return try passthrough(source) }
-        if imageExtensions.contains(ext) { return try imageDocument(source, paper: paper) }
-        if textExtensions.contains(ext) { return try textDocument(source, paper: paper) }
+        if imageExtensions.contains(ext) { return try imageDocument(source, paper: paper, rotation: rotation) }
+        if textExtensions.contains(ext) { return try textDocument(source, paper: paper, rotation: rotation) }
         if officeExtensions.contains(ext) { return try await officeDocument(source) }
-        throw AgentError.processFailed("\(ext.uppercased()) 파일은 아직 보낼 수 없습니다. PDF로 바꾼 뒤 넣어 주세요.")
+
+        // 확장자를 모른다고 곧바로 거절하지 않는다. 확장자가 없는 파일도 있고, 낯선
+        // 확장자를 단 평범한 텍스트도 있다. 내용을 보고 정한다.
+        if PDFDocument(url: source) != nil { return try passthrough(source) }
+        if CGImageSourceCreateWithURL(source as CFURL, nil).map({ CGImageSourceGetCount($0) > 0 }) == true {
+            return try imageDocument(source, paper: paper, rotation: rotation)
+        }
+        if looksLikeText(source) { return try textDocument(source, paper: paper, rotation: rotation) }
+        if FileConverter.sofficePath != nil, let converted = try? await officeDocument(source) { return converted }
+        let name = ext.isEmpty ? source.lastPathComponent : "\(ext.uppercased()) 파일"
+        throw AgentError.processFailed("\(name)은 아직 보낼 수 없습니다. PDF로 바꾼 뒤 넣어 주세요.")
+    }
+
+    /// 앞부분을 읽어 글로 볼 수 있는지 본다.
+    ///
+    /// 0바이트가 섞여 있거나 어느 인코딩으로도 읽히지 않으면 글이 아니다. 그런 것을 글로
+    /// 앉히면 종이 몇 십 장에 깨진 기호가 찍힌다.
+    static func looksLikeText(_ source: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: source) else { return false }
+        defer { try? handle.close() }
+        guard let sample = try? handle.read(upToCount: 8192), !sample.isEmpty else { return false }
+        if sample.contains(0) { return false }
+        if String(data: sample, encoding: .utf8) != nil { return true }
+        let korean = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.EUC_KR.rawValue)
+        ))
+        return String(data: sample, encoding: korean) != nil
     }
 
     // MARK: PDF
@@ -103,9 +183,14 @@ enum PrintPreparation {
         guard document.pageCount > 0 else {
             throw AgentError.processFailed("쪽이 하나도 없는 PDF입니다: \(source.lastPathComponent)")
         }
+        // 인쇄를 금지한 PDF라도 CUPS는 찍는다. 막지는 않되 말은 해 둔다 — 나온 종이를
+        // 보고 "왜 되지?" 하는 것보다 낫다.
+        let note = document.allowsPrinting
+            ? "PDF · \(document.pageCount)쪽"
+            : "PDF · \(document.pageCount)쪽 · 원본이 인쇄를 제한하고 있습니다"
         return PreparedPrintDocument(
             source: source, pdf: source, pageCount: document.pageCount,
-            bytes: fileSize(source), note: "PDF · \(document.pageCount)쪽", isTemporary: false
+            bytes: fileSize(source), note: note, isTemporary: false
         )
     }
 
@@ -116,7 +201,9 @@ enum PrintPreparation {
     /// 픽셀 크기 그대로의 PDF를 만들지 않는 이유: 그렇게 만들면 종이보다 크거나 작은 쪽이
     /// 생기고, 무엇이 어떻게 잘릴지는 프린터 드라이버가 정하게 된다. 여기서 여백을 두고
     /// 비율을 지켜 앉히면 결과가 화면에서 예측한 것과 같아진다.
-    private static func imageDocument(_ source: URL, paper: String) throws -> PreparedPrintDocument {
+    private static func imageDocument(
+        _ source: URL, paper: String, rotation: PrintOptions.Rotation
+    ) throws -> PreparedPrintDocument {
         guard let imageSource = CGImageSourceCreateWithURL(source as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
         else { throw AgentError.processFailed("사진을 읽지 못했습니다: \(source.lastPathComponent)") }
@@ -124,7 +211,7 @@ enum PrintPreparation {
         let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any]
         let orientation = (properties?[kCGImagePropertyOrientation] as? UInt32) ?? 1
 
-        let page = PaperGeometry.size(for: paper)
+        let page = pageSize(paper: paper, rotation: rotation)
         let destination = try output(for: source)
         var mediaBox = CGRect(origin: .zero, size: page)
         guard let context = CGContext(destination as CFURL, mediaBox: &mediaBox, nil) else {
@@ -181,12 +268,14 @@ enum PrintPreparation {
 
     // MARK: 글
 
-    private static func textDocument(_ source: URL, paper: String) throws -> PreparedPrintDocument {
+    private static func textDocument(
+        _ source: URL, paper: String, rotation: PrintOptions.Rotation = .none
+    ) throws -> PreparedPrintDocument {
         let attributed = try attributedString(from: source)
         guard attributed.length > 0 else {
             throw AgentError.processFailed("빈 파일입니다: \(source.lastPathComponent)")
         }
-        let page = PaperGeometry.size(for: paper)
+        let page = pageSize(paper: paper, rotation: rotation)
         let destination = try output(for: source)
         var mediaBox = CGRect(origin: .zero, size: page)
         guard let context = CGContext(destination as CFURL, mediaBox: &mediaBox, nil) else {
