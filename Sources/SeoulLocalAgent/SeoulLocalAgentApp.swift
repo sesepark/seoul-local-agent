@@ -231,6 +231,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated { Self.openSettingsWindow() }
             }
         }
+        // 화면을 **가져가지 않고** 보기 위한 자리.
+        //
+        // 이 Mac에서는 사람이 일하는 중에 앱을 확인해야 할 때가 있다. `open -g`로 뒤에서
+        // 띄우면 SwiftUI는 창을 아예 만들지 않아(레이아웃 패스가 없어) 화면 캡처에 잡히지
+        // 않는다. 그렇다고 앞으로 끌어오면 쓰던 앱에서 포커스를 빼앗는다.
+        //
+        // 그래서 창을 만들되 **맨 뒤로 보낸다.** `orderFrontRegardless`는 앱을 활성화하지
+        // 않고 창만 화면에 올리고, 바로 뒤이은 `orderBack`이 그것을 다른 창들 밑으로
+        // 내린다. 사람이 보는 화면은 그대로이고, ScreenCaptureKit은 가려진 창도 자기
+        // 내용 그대로 찍는다.
         // Process discovery performs blocking system I/O and must never hold
         // SwiftUI's main thread during launch.
         DispatchQueue.global(qos: .utility).async {

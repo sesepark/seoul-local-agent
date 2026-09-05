@@ -118,11 +118,15 @@ final class PrintModel: ObservableObject {
             guard !isApplying else { return }
             // 용지와 회전은 **쪽을 만드는 단계**에 걸린다. 사진과 글은 고른 종이·방향에
             // 맞춰 앉힌 것이므로, 그 둘이 바뀌면 다시 앉혀야 화면이 말한 대로 나온다.
+            guard options.previewSignature != oldValue.previewSignature else { return }
+            // 용지와 회전은 쪽을 만드는 단계에 걸리므로 변환본은 다시 앉혀야 한다. 원본
+            // PDF는 다시 앉힐 것이 없지만 **조판은 다시 해야 한다** — 그래서 아래 줄은
+            // 어느 경우에도 부른다. 예전에는 변환본이 하나도 없으면(PDF만 있는 목록)
+            // 아무것도 다시 만들지 않아 미리보기가 낡은 채로 남았다.
             if options.paper != oldValue.paper || options.rotation != oldValue.rotation {
                 reprepareConvertedDocuments()
-            } else if options.previewSignature != oldValue.previewSignature {
-                refreshPreviews()
             }
+            refreshPreviews(restart: true)
         }
     }
 
@@ -382,17 +386,30 @@ final class PrintModel: ObservableObject {
     ///
     /// 여기서 만든 파일이 **그대로 서버로 간다.** 화면이 보여 주는 것과 종이에 나오는 것을
     /// 같게 하는 방법은 그 둘을 같은 파일로 두는 것뿐이다.
-    private func refreshPreviews() {
-        let signature = options.previewSignature
-        let targets = documents.filter { $0.pdf != nil && $0.previewSignature != signature }.map(\.id)
-        guard !targets.isEmpty else { return }
-        previewTask?.cancel()
-        let options = options
+    /// 설정과 어긋난 문서가 없어질 때까지 하나씩 다시 만든다.
+    ///
+    /// 대상을 미리 목록으로 굳히지 않고 매번 다시 찾는 이유가 있다. 파일 여러 개를 한꺼번에
+    /// 넣으면 준비가 하나씩 끝나면서 이 함수도 그때마다 불리는데, 그때 돌던 작업을 취소하고
+    /// 새 목록으로 다시 시작하면 앞의 것이 끝나기 전에 계속 엎어진다. 고리 하나가 남은 것을
+    /// 마저 처리하게 두고, **설정이 바뀐 경우에만** 끊고 새로 시작한다.
+    ///
+    /// - Parameter restart: 사람이 설정을 바꿨다. 지금 만들던 것은 이미 낡았으므로 끊는다.
+    private func refreshPreviews(restart: Bool = false) {
+        if restart {
+            previewTask?.cancel()
+            previewTask = nil
+        }
+        guard previewTask == nil else { return }
         previewTask = Task { [weak self] in
             guard let model = self else { return }
-            for id in targets {
-                guard !Task.isCancelled else { return }
-                guard let pdf = model.documents.first(where: { $0.id == id })?.pdf else { continue }
+            while !Task.isCancelled {
+                let signature = model.options.previewSignature
+                let options = model.options
+                guard let stale = model.documents.first(where: {
+                    $0.pdf != nil && $0.previewSignature != signature
+                }) else { break }
+                let id = stale.id
+                guard let pdf = stale.pdf else { break }
                 model.discardComposed(id)
                 let composed: PrintComposition.Composed
                 do {
@@ -400,18 +417,22 @@ final class PrintModel: ObservableObject {
                         try PrintComposition.compose(pdf, options: options)
                     }.value
                 } catch {
+                    // 실패한 문서에도 표를 남긴다. 남기지 않으면 이 고리가 같은 문서를
+                    // 영원히 다시 시도한다.
+                    model.finishPreview(id, composed: nil, signature: signature, thumbnail: nil)
                     model.failPreparing(id, message: error.localizedDescription)
                     continue
                 }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else { break }
                 let url = composed.url
                 let grayscale = options.grayscale
                 let thumbnail = await Task.detached(priority: .utility) {
                     PrintPreviewRenderer.render(url, sheet: 0, grayscale: grayscale, maxPixel: 240)
                 }.value
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else { break }
                 model.finishPreview(id, composed: composed, signature: signature, thumbnail: thumbnail)
             }
+            model.previewTask = nil
         }
     }
 
@@ -422,14 +443,22 @@ final class PrintModel: ObservableObject {
         documents[index].composed = nil
     }
 
-    private func finishPreview(_ id: UUID, composed: PrintComposition.Composed, signature: String, thumbnail: CGImage?) {
+    /// 미리보기 시트를 눌러야만 볼 수 있는 상태로 두지 않기 위한 실행 인자.
+    ///
+    /// `--soarm-preview`·`--calendar-expand`와 같은 자리다. 화면을 확인할 때 창을 앞으로
+    /// 끌어와 마우스로 누르는 대신, 처음부터 그 상태로 뜨게 한다.
+    private static let opensPreviewOnLaunch = CommandLine.arguments.contains("--print-open-preview")
+
+    private func finishPreview(_ id: UUID, composed: PrintComposition.Composed?, signature: String, thumbnail: CGImage?) {
         guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
         documents[index].composed = composed
         documents[index].previewSignature = signature
         documents[index].thumbnail = thumbnail
-        documents[index].imposedSides = composed.sheets
+        documents[index].imposedSides = composed?.sheets
+        guard composed != nil else { return }
         // 범위를 잘못 적어 실패했던 문서도 범위를 고치면 다시 보낼 수 있어야 한다.
         if case .failed = documents[index].state { documents[index].state = .ready }
+        if Self.opensPreviewOnLaunch, previewing == nil { previewing = .init(id: id) }
     }
 
     /// 미리보기 시트가 그릴 한 장. 시트에서만 부르므로 캐시하지 않는다 — 넘길 때마다
@@ -758,7 +787,10 @@ private struct PrintWorkspace: View {
             )
             QuickFolderBar(disabled: model.isSending, choose: choose)
             PrinterStatusPanel(model: model, openSettings: openSettings)
-            if model.status == .ready { PrintOptionsPanel(model: model) }
+            // 한 번 알아낸 뒤에는 계속 보여 준다. `status == .ready`로 걸어 두었더니
+            // 새로고침할 때마다(`.checking`) 설정 패널이 통째로 사라졌다 — 보낸 뒤
+            // 지켜보는 30초 동안 다섯 번 그런다.
+            if !model.printers.isEmpty { PrintOptionsPanel(model: model) }
             PrintDocumentList(model: model)
             PrintQueuePanel(model: model)
         }
@@ -1051,7 +1083,10 @@ private struct PrintOptionsPanel: View {
         if model.isPreparingPreviews {
             lines.append("미리보기를 다시 만드는 중입니다.")
         } else if model.totalPages > 0 {
-            lines.append("문서 \(model.readyDocuments.count)개 · \(model.totalPages)쪽 → **종이 \(model.totalSheets)장** · 보낼 용량 \(PrintPreparation.byteText(model.totalBytes))")
+            // `Text(변수)`는 `**`를 굵게 만들지 않는다 — 문자열 리터럴일 때만 마크다운으로
+            // 읽힌다. 화면에 별표가 그대로 찍혀 있었다. 각 줄은 마침표로 끝난다. 끝맺지
+            // 않으면 다음 문장과 이어 붙어 한 문장처럼 읽힌다.
+            lines.append("문서 \(model.readyDocuments.count)개 · \(model.totalPages)쪽 → 종이 \(model.totalSheets)장 · 보낼 용량 \(PrintPreparation.byteText(model.totalBytes))입니다.")
         }
         if model.totalSheets > 30 {
             lines.append("종이가 \(model.totalSheets)장 나갑니다. 트레이에 그만큼 들어 있는지 보고 누르세요.")
@@ -1140,7 +1175,9 @@ private struct PrintDocumentRow: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                     Button("미리보기") { model.previewing = .init(id: document.id) }
-                        .buttonStyle(.borderless)
+                        // `.borderless`는 회색 글씨로 그려져 옆의 `종이 3장`과 구별되지
+                        // 않는다. 빠른 폴더 줄이 쓰는 것과 같은 링크 모양으로 둔다.
+                        .buttonStyle(.link)
                         .font(.caption)
                         .disabled(document.composed == nil)
                 }
