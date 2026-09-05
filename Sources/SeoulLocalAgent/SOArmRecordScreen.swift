@@ -244,6 +244,7 @@ struct SOArmRecordScreen: View {
             .foregroundStyle(.orange)
             .fixedSize(horizontal: false, vertical: true)
         }
+        cameraFreshness
         if let hz = runtime?.loopHz, hz > 0 {
             let target = Double(model.status?.recordingProfile.fps ?? 30)
             let slow = hz < target - 2
@@ -253,6 +254,32 @@ struct SOArmRecordScreen: View {
                 : "루프 \(String(format: "%.1f", hz))Hz",
                 systemImage: slow ? "exclamationmark.triangle.fill" : "metronome"
             )
+            .font(.caption)
+            .foregroundStyle(slow ? Color.orange : Color.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// 카메라가 실제로 새 프레임을 몇 장 주고 있는가.
+    ///
+    /// 루프가 30Hz를 지켜도 카메라가 못 따라오면 같은 사진이 겹쳐 들어간다. 그 둘은 다른
+    /// 고장이고 화면도 따로 말해야 한다 — 루프가 느린 것은 CPU 문제이고, 카메라가 느린
+    /// 것은 조명이나 USB 문제다.
+    @ViewBuilder
+    private var cameraFreshness: some View {
+        let fresh = runtime?.cameraFreshHz ?? [:]
+        if !fresh.isEmpty {
+            let target = Double(model.status?.recordingProfile.fps ?? 30)
+            let worst = fresh.values.min() ?? target
+            let slow = worst < target - 3
+            Label {
+                Text(fresh.keys.sorted().map { name in
+                    "\(SOArmCameraName.display(name)) \(String(format: "%.1f", fresh[name] ?? 0))장/초"
+                }.joined(separator: " · ")
+                + (slow ? " — 카메라가 루프를 못 따라옵니다. 같은 사진이 겹쳐 들어갑니다." : ""))
+            } icon: {
+                Image(systemName: slow ? "exclamationmark.triangle.fill" : "camera")
+            }
             .font(.caption)
             .foregroundStyle(slow ? Color.orange : Color.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -412,7 +439,12 @@ struct SOArmEpisodeClock: View {
                     Spacer()
                     episodeCounter
                 }
-                Text("남은 시간은 서버가 회의 시작 시각을 알려 줄 때 셉니다. 앱이 혼자 세면 회 사이 정리 시간만큼 조용히 어긋나고, 그 시계를 보고 손을 떼면 틀립니다.")
+                // 회 사이 정리 구간에서는 시작 시각이 없는 것이 정상이다. 그때까지
+                // "서버가 알려 주지 않아서 못 센다"고 적으면, 정상 동작을 한계처럼
+                // 읽게 된다 — 실제로 수집을 돌려 보다가 이 문구가 걸렸다.
+                Text(runtime?.phase == "resetting"
+                     ? "다음 회를 준비하는 동안입니다. 팔을 시작 자세로 되돌려 두세요 — 준비가 끝나면 다시 셉니다."
+                     : "남은 시간은 서버가 회의 시작 시각을 알려 줄 때 셉니다. 앱이 혼자 세면 회 사이 정리 시간만큼 조용히 어긋나고, 그 시계를 보고 손을 떼면 틀립니다.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -703,7 +703,9 @@ struct SOArmLiveConsoleTests {
          "recording": {"running": true, "slow_loop_warnings": 3,
            "runtime": {"phase": "recording", "dataset_name": "soarm101_x", "task": "블록 집기",
                        "episode_started_at": 1788592998.5, "episode_seconds": 30,
-                       "episode_index": 2, "loop_hz": 24.5}},
+                       "episode_index": 2, "loop_hz": 24.5,
+                       "camera_fresh_hz": {"scene": 29.2, "wrist": 14.7},
+                       "camera_stale_pct": {"scene": 0.0, "wrist": 50.0}}},
          "cameras": {"scene": {"active": true,
            "recording_controls": {"values": {"power_line_frequency": 2,
              "exposure_dynamic_framerate": 0, "white_balance_automatic": 0,
@@ -714,6 +716,11 @@ struct SOArmLiveConsoleTests {
         #expect(runtime.episodeIndex == 2)
         #expect(runtime.episodeSeconds == 30)
         #expect(runtime.loopHz == 24.5)
+        // 카메라가 원천에서 센 값. 루프가 30을 지켜도 카메라가 못 따라오면 같은 사진이
+        // 겹쳐 들어가는데, 그 둘은 다른 고장이라 따로 읽어야 한다.
+        #expect(runtime.cameraFreshHz["scene"] == 29.2)
+        #expect(runtime.cameraFreshHz["wrist"] == 14.7)
+        #expect(runtime.cameraStalePct["wrist"] == 50.0)
         #expect(runtime.episodeStartedAt?.timeIntervalSince1970 == 1788592998.5)
         #expect(status.recording.slowLoopWarnings == 3)
         #expect(status.sceneCamera.recordingControls["white_balance_temperature"] == 4600)
@@ -726,6 +733,12 @@ struct SOArmLiveConsoleTests {
             .replacingOccurrences(of: "\"episode_started_at\": 1788592998.5", with: "\"episode_started_at\": null").utf8))
         #expect(resetting.recordingRuntime?.episodeStartedAt == nil)
         #expect(resetting.recordingRuntime?.phaseTitle == "다음 회 준비 중")
+        // 멈춘 구간에서 서버는 카메라 값을 비운다. 지난 회차 숫자가 남아 있으면 멈춰
+        // 있는 수집이 계속 돌고 있는 것처럼 보인다.
+        let idle = try SOArmStatus.parse(Data(json
+            .replacingOccurrences(of: "\"camera_fresh_hz\": {\"scene\": 29.2, \"wrist\": 14.7}",
+                                  with: "\"camera_fresh_hz\": {}").utf8))
+        #expect(idle.recordingRuntime?.cameraFreshHz.isEmpty == true)
 
         // 아직 한 번도 수집을 시작하지 않았으면 서버가 `null`을 준다. 그때 화면은
         // 되읽은 값이 없다고 말해야지, 빈 값을 사실로 적으면 안 된다.

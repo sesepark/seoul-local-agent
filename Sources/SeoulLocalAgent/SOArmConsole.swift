@@ -441,6 +441,14 @@ struct SOArmRecordingRuntime: Sendable, Equatable {
     /// 수집 루프가 실제로 도는 속도. 30을 목표로 도는데 못 지키면 이미지가 중복되고,
     /// 그것은 로그에만 남아 조용히 데이터가 나빠지는 유일한 경로다.
     var loopHz: Double?
+    /// 카메라별로 **새 프레임**을 초당 몇 장 받았는가. 서버가 원천에서 센 값이다.
+    ///
+    /// 찍힌 영상에서 세면 안 된다 — AV1 인코더가 움직임 없는 두 장을 하나로 합치므로,
+    /// 카메라가 같은 프레임을 두 번 준 것과 구별되지 않는다. 실제로 그 둘을 혼동해
+    /// 없는 문제를 쫓은 적이 있다. 이 숫자만이 카메라가 흘리는지를 말해 준다.
+    var cameraFreshHz: [String: Double] = [:]
+    /// 그중 직전과 같은 프레임이었던 비율(%).
+    var cameraStalePct: [String: Double] = [:]
 
     init(_ json: [String: Any]) {
         phase = json.soarmString("phase")
@@ -453,6 +461,8 @@ struct SOArmRecordingRuntime: Sendable, Equatable {
         episodeSeconds = json.soarmInt("episode_seconds")
         episodeIndex = json.soarmInt("episode_index")
         loopHz = (json["loop_hz"] as? NSNumber)?.doubleValue
+        cameraFreshHz = json.soarmDict("camera_fresh_hz").compactMapValues { ($0 as? NSNumber)?.doubleValue }
+        cameraStalePct = json.soarmDict("camera_stale_pct").compactMapValues { ($0 as? NSNumber)?.doubleValue }
     }
 
     var phaseTitle: String {
