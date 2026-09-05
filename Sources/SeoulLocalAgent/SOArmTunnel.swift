@@ -13,16 +13,23 @@ import Foundation
 /// 접근만 따로 회수할 수 있다.
 struct SOArmTunnelKey: Sendable {
     let directory: URL
+    /// 어느 연결의 열쇠인가. 파일 이름의 앞머리가 된다.
+    ///
+    /// 연결마다 열쇠를 나누는 이유는 회수 때문이다. 팔이 붙은 콘솔 서버와 학습 서버는
+    /// 서로 다른 기계이고, 한쪽의 접근만 끊고 싶은 날이 온다. 열쇠가 하나면 그때
+    /// 양쪽이 함께 끊긴다.
+    let name: String
 
-    init(directory: URL? = nil) {
+    init(directory: URL? = nil, name: String = "soarm") {
         self.directory = directory ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appending(path: "Library/Application Support/SeoulLocalAgent", directoryHint: .isDirectory)
+        self.name = name
     }
 
-    var privateKey: URL { directory.appending(path: "soarm-tunnel-key") }
-    var publicKey: URL { directory.appending(path: "soarm-tunnel-key.pub") }
+    var privateKey: URL { directory.appending(path: "\(name)-tunnel-key") }
+    var publicKey: URL { directory.appending(path: "\(name)-tunnel-key.pub") }
     /// `~/.ssh/known_hosts`도 같은 이유로 읽을 수 없으므로 여기에 따로 쌓는다.
-    var knownHosts: URL { directory.appending(path: "soarm-known-hosts") }
+    var knownHosts: URL { directory.appending(path: "\(name)-known-hosts") }
 
     var exists: Bool { FileManager.default.fileExists(atPath: privateKey.path) }
 
@@ -48,7 +55,7 @@ struct SOArmTunnelKey: Sendable {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
         process.arguments = [
             "-t", "ed25519", "-N", "", "-q",
-            "-C", "seoul-local-agent-soarm",
+            "-C", "seoul-local-agent-\(name)",
             "-f", privateKey.path,
         ]
         let errors = Pipe()
@@ -87,10 +94,24 @@ struct SOArmTunnelKey: Sendable {
 ///    입양된 터널을 다음 실행이 찾아 죽인다.
 /// 5. **끊긴 링크의 자멸.** `ServerAliveInterval`/`ServerAliveCountMax`.
 final class SOArmTunnel: @unchecked Sendable {
-    static let shared = SOArmTunnel()
+    /// 팔이 붙어 있는 콘솔 서버로 가는 터널.
+    static let shared = SOArmTunnel(marker: marker, key: SOArmTunnelKey(), settingsPath: "설정 › 로봇")
+    /// 학습 서버(Spark)의 작업 큐로 가는 터널.
+    ///
+    /// 콘솔 서버를 거치지 않고 곧장 가는 두 번째 길이다. 큐가 사는 곳이 GPU를 가진
+    /// 기계이므로, 그 기계가 켜져 있으면 콘솔 서버가 꺼져 있어도 밤새 도는 줄을 볼 수 있다.
+    static let spark = SOArmTunnel(
+        marker: sparkMarker, key: SOArmTunnelKey(name: "spark"), settingsPath: "설정 › 학습 서버"
+    )
 
     /// 원격에서는 주석이고, 로컬 `ps` 출력에는 남는다. 남은 터널을 찾는 유일한 표식이다.
     static let marker = "seoul-local-agent-soarm-tunnel"
+    static let sparkMarker = "seoul-local-agent-spark-tunnel"
+
+    /// 이 터널의 표식·열쇠·설정 화면 이름. 두 연결이 서로의 터널을 죽이지 않도록 나눠 둔다.
+    let marker: String
+    let key: SOArmTunnelKey
+    let settingsPath: String
 
     private let lock = NSLock()
     private var process: Process?
@@ -106,7 +127,11 @@ final class SOArmTunnel: @unchecked Sendable {
     /// 설정 파일이 조용히 고쳐지는 것이 사용자가 적어 둔 순서를 흐리기 때문이다.
     private var lastGoodHost: String?
 
-    private init() {}
+    private init(marker: String, key: SOArmTunnelKey, settingsPath: String) {
+        self.marker = marker
+        self.key = key
+        self.settingsPath = settingsPath
+    }
 
     /// 지금 열려 있는 터널을 가리키는 표. 나중에 이 표를 들고 와야만 그 터널을 내릴 수 있다.
     var token: Int {
@@ -143,7 +168,8 @@ final class SOArmTunnel: @unchecked Sendable {
     }
 
     static func arguments(
-        for server: SOArmServer, host: String, key: SOArmTunnelKey = SOArmTunnelKey()
+        for server: SOArmServer, host: String, key: SOArmTunnelKey = SOArmTunnelKey(),
+        marker: String = SOArmTunnel.marker
     ) -> [String] {
         let server = server.sanitised()
         return [
@@ -171,7 +197,7 @@ final class SOArmTunnel: @unchecked Sendable {
             "-p", String(server.sshPort),
             "-L", "127.0.0.1:\(server.localPort):127.0.0.1:\(server.remotePort)",
             server.sshTarget(host: host),
-            "cat > /dev/null # \(marker)",
+            "cat > /dev/null # \(marker)",  // 표식은 로컬 `ps`에만 남는다
         ]
     }
 
@@ -180,7 +206,8 @@ final class SOArmTunnel: @unchecked Sendable {
     /// 먼저 로컬 포트를 찔러 보는 이유: 사용자가 터미널에서 직접 터널을 열어 둔 채 앱을 켰을
     /// 때 두 번째 ssh가 `ExitOnForwardFailure`로 실패하며 "연결 실패"라고 말하게 되는데,
     /// 정작 콘솔은 멀쩡히 닿는 상태다.
-    func ensureConnected(server: SOArmServer, key: SOArmTunnelKey = SOArmTunnelKey()) async throws {
+    func ensureConnected(server: SOArmServer, key: SOArmTunnelKey? = nil) async throws {
+        let key = key ?? self.key
         if await Self.probe(server.baseURL) { return }
         guard server.isConfigured else { throw SOArmError.notConfigured }
         try key.ensureExists()
@@ -209,7 +236,9 @@ final class SOArmTunnel: @unchecked Sendable {
             failures.append((host, detail.isEmpty ? "응답이 없었습니다" : detail))
         }
 
-        throw SOArmError.tunnelFailed(Self.failureText(failures, server: server, key: key))
+        throw SOArmError.tunnelFailed(
+            Self.failureText(failures, server: server, key: key, settingsPath: settingsPath)
+        )
     }
 
     /// `NSLock`은 비동기 문맥에서 직접 잡을 수 없다(중간에 다른 스레드로 넘어갈 수 있어서).
@@ -233,23 +262,24 @@ final class SOArmTunnel: @unchecked Sendable {
     /// 주소가 여럿이면 어느 쪽이 왜 안 됐는지를 각각 적는다. 하나로 뭉뚱그리면 집에서
     /// 안 되는 것인지 밖에서 안 되는 것인지 읽을 수 없다.
     static func failureText(
-        _ failures: [(host: String, reason: String)], server: SOArmServer, key: SOArmTunnelKey
+        _ failures: [(host: String, reason: String)], server: SOArmServer, key: SOArmTunnelKey,
+        settingsPath: String = "설정 › 로봇"
     ) -> String {
         guard let first = failures.first else { return "연결할 주소가 없습니다" }
         if failures.count == 1 {
-            return hint(for: first.reason, server: server, key: key)
+            return hint(for: first.reason, server: server, key: key, settingsPath: settingsPath)
         }
         let lines = failures.map { "· \($0.host): \($0.reason.split(separator: "\n").last.map(String.init) ?? $0.reason)" }
         return "적어 둔 주소 어느 쪽으로도 닿지 못했습니다.\n"
             + lines.joined(separator: "\n")
             + "\n"
-            + hint(for: first.reason, server: server, key: key)
+            + hint(for: first.reason, server: server, key: key, settingsPath: settingsPath)
     }
 
     private func start(server: SOArmServer, host: String, key: SOArmTunnelKey) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = Self.arguments(for: server, host: host, key: key)
+        process.arguments = Self.arguments(for: server, host: host, key: key, marker: marker)
         let input = Pipe()
         let errors = Pipe()
         process.standardInput = input
@@ -334,27 +364,30 @@ final class SOArmTunnel: @unchecked Sendable {
     /// 무엇을 고쳐야 하는지 알 수 없기 때문이다. 특히 `Permission denied (publickey)`는
     /// 이 기능을 처음 켤 때 거의 반드시 한 번 만나는 상태다 — 앱은 암호를 묻지 않으므로
     /// 공개키가 서버에 등록되어 있어야 한다.
-    static func hint(for stderr: String, server: SOArmServer, key: SOArmTunnelKey = SOArmTunnelKey()) -> String {
+    static func hint(
+        for stderr: String, server: SOArmServer, key: SOArmTunnelKey = SOArmTunnelKey(),
+        settingsPath: String = "설정 › 로봇"
+    ) -> String {
         if stderr.contains("Permission denied") {
             // 사용자의 평소 열쇠가 아니라 **이 앱의 열쇠**를 등록해야 한다. 앱은 `~/.ssh`를
             // 읽을 수 없으므로 터미널에서 되는 접속이 여기서는 되지 않는다.
-            return "\(stderr)\n이 앱 전용 공개키가 서버에 등록되어 있지 않습니다. 터미널에서 아래를 한 번 실행하세요 (설정 › 로봇에서 복사할 수 있습니다):\n\(key.authorizationCommand(for: server))"
+            return "\(stderr)\n이 앱 전용 공개키가 서버에 등록되어 있지 않습니다. 터미널에서 아래를 한 번 실행하세요 (\(settingsPath)에서 복사할 수 있습니다):\n\(key.authorizationCommand(for: server))"
         }
         if stderr.contains("Host key verification failed") {
             return "\(stderr)\n서버의 host key가 처음 본 것과 달라졌습니다. 서버를 다시 설치한 것이 맞다면 \(key.knownHosts.lastPathComponent) 파일에서 해당 줄을 지우고 다시 시도하세요."
         }
         if stderr.contains("Could not resolve hostname") {
-            return "\(stderr)\n설정 › 로봇의 주소를 확인하세요."
+            return "\(stderr)\n\(settingsPath)의 주소를 확인하세요."
         }
         if stderr.contains("No route to host") || stderr.contains("Operation timed out") {
             let common = "\(stderr)\n서버가 켜져 있고 같은 네트워크에 있는지 확인하세요. 처음이라면 macOS의 로컬 네트워크 접근 허용을 묻는 창이 떴는지도 보세요."
             if server.candidateHosts.count < 2 {
-                return common + "\n집 밖에서도 쓰려면 설정 › 로봇의 `집 밖에서 쓸 주소`에 Tailscale 주소를 넣으세요."
+                return common + "\n집 밖에서도 쓰려면 \(settingsPath)의 `집 밖에서 쓸 주소`에 Tailscale 주소를 넣으세요."
             }
             return common + "\n집 밖이라면 Tailscale이 이 Mac과 서버 양쪽에서 돌고 있는지도 확인하세요."
         }
         if stderr.contains("Address already in use") || stderr.contains("bind") {
-            return "\(stderr)\n이 Mac의 \(server.localPort) 포트를 이미 다른 것이 쓰고 있습니다. 설정 › 로봇에서 `이 Mac에서 열 포트`를 바꾸세요."
+            return "\(stderr)\n이 Mac의 \(server.localPort) 포트를 이미 다른 것이 쓰고 있습니다. \(settingsPath)에서 `이 Mac에서 열 포트`를 바꾸세요."
         }
         return stderr
     }

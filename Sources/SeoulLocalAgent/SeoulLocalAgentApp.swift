@@ -126,6 +126,13 @@ struct SeoulLocalAgentApp: App {
         }
         // 프린터까지 가는 길을 창 없이 확인한다. 집 주소와 밖에서 쓸 주소를 따로 두드리므로,
         // "지금 있는 곳에서만 되는" 상태를 여기서 잡을 수 있다.
+        // 학습 서버까지 가는 길. 터널이 안 열린 것과, 열렸는데 큐가 죽은 것과, 큐는
+        // 사는데 데이터셋이 없는 것은 화면에서 똑같아 보이지만 고칠 자리가 다르다.
+        if CommandLine.arguments.contains("--spark-check") {
+            Task { @MainActor in
+                exit(await SparkConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
+            }
+        }
         if CommandLine.arguments.contains("--printer-check") {
             Task { @MainActor in
                 exit(await PrintConnectionCheck.run() ? EXIT_SUCCESS : EXIT_FAILURE)
@@ -345,6 +352,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // that path is for a force-quit; a clean quit should not leave the app's
         // last act to the kernel.
         SOArmTunnel.shared.shutdownNow()
+        // 학습 서버로 가는 두 번째 터널. `terminateAllTrees`가 표식으로도 잡지만, 깨끗이
+        // 끝낼 때 앱의 마지막 동작을 커널에 맡기지 않는 것은 이쪽도 마찬가지다. 학습은
+        // 서버의 tmux 안에서 돌고 있으므로 터널이 끊겨도 계속 돈다.
+        SOArmTunnel.spark.shutdownNow()
         // 프린트 탭이 만든 임시 PDF. 보낸 뒤에도 목록에 남아 있으므로 앱이 끝날 때 치운다 —
         // 원본은 여기서 지우는 대상이 아니고, 지워지지도 않는다.
         PrintModel.cleanUpOnQuit()
@@ -406,6 +417,9 @@ final class AutomationController: ObservableObject {
     /// the arms and cameras stay owned by that server, and this side only opens
     /// an SSH tunnel and asks it to start and stop.
     let soarm = SOArmConsoleModel()
+    /// 학습 서버의 작업 큐. 콘솔 서버를 거치지 않고 곧장 붙는다 — 큐가 사는 곳이
+    /// GPU를 가진 기계이므로, 콘솔 서버가 꺼져 있어도 밤새 도는 줄은 보여야 한다.
+    let spark = SparkQueueModel()
     /// 그 콘솔의 가상 리더 — 3D로 그린 팔을 만져 진짜 팔을 움직이는 경로. 콘솔 모델을
     /// 그대로 쓰는 이유는 터널과 서버 설정이 하나뿐이기 때문이다. 두 화면이 각자 터널을
     /// 세우면 같은 포트를 두고 다투게 된다.
@@ -2473,6 +2487,15 @@ struct MenuContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .help("⌘, 로도 열 수 있습니다")
+                // 코드를 고쳐 번들을 다시 만든 뒤 끄고 켜는 일이 잦다. 끄는 것은 정상 종료
+                // 경로 그대로이고, 다시 켜는 것은 떼어 놓은 셸이 한다. 보던 화면으로 돌아온다.
+                Button("앱 재시작", systemImage: "arrow.clockwise") {
+                    let section = controller.section.rawValue
+                    dismiss()
+                    DispatchQueue.main.async { AppRelauncher.relaunch(section: section) }
+                }
+                .buttonStyle(.bordered)
+                .help("앱을 끄고 같은 번들을 다시 켭니다. 번들을 다시 만들었으면 새 코드로 뜹니다")
                 Spacer()
                 Button("종료", role: .destructive) { NSApplication.shared.terminate(nil) }
                     .buttonStyle(.borderless)
@@ -2526,6 +2549,7 @@ private struct MainWorkspaceView: View {
                 case .soarmTeleop: SOArmTeleopView(controller: controller)
                 case .soarmRecord: SOArmRecordView(controller: controller)
                 case .soarmData: SOArmDatasetsView(controller: controller)
+                case .spark: SparkView(controller: controller)
                 }
             }
             // Screens now carry their own name into the title bar, so switching
@@ -3175,7 +3199,7 @@ private struct BriefingStatusRow: View {
 /// Which pane ⌘, opens on, so a button elsewhere can send the reader somewhere
 /// specific rather than to wherever they were last.
 enum SettingsTab: String, Hashable {
-    case briefing, connections, classification, transcription, dictation, tools, robot, music, printer
+    case briefing, connections, classification, transcription, dictation, tools, robot, spark, music, printer
 }
 
 /// The ⌘, window. These nine sections used to be one `Form` inside a sidebar
@@ -3214,6 +3238,9 @@ private struct SettingsWindow: View {
             }
             Tab("로봇", systemImage: "arrow.up.and.down.and.arrow.left.and.right", value: SettingsTab.robot) {
                 SOArmSettingsTab(model: controller.soarm)
+            }
+            Tab("학습 서버", systemImage: "square.stack.3d.up", value: SettingsTab.spark) {
+                SparkSettingsTab(model: controller.spark)
             }
             Tab("프린터", systemImage: "printer", value: SettingsTab.printer) {
                 PrintSettingsTab(model: controller.printing)

@@ -353,7 +353,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case music
     case compression, convert
     case briefing, archive, briefingCalendar
-    case soarm, soarmTeleop, soarmRecord, soarmData
+    case soarm, soarmTeleop, soarmRecord, soarmData, spark
 
     var id: String { rawValue }
 
@@ -382,6 +382,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .soarmTeleop: "원격 텔레옵"
         case .soarmRecord: "데이터 수집"
         case .soarmData: "수집 데이터"
+        case .spark: "학습 서버"
         }
     }
 
@@ -406,6 +407,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .soarmTeleop: "3D로 그린 팔을 만지면 집에 있는 진짜 팔이 따라옵니다. 물리 리더 팔이 없어도 되고, 같은 화면을 아이폰에서도 씁니다. 멈춰야 할 일이 생기면 서버가 먼저 멈추고 왜 멈췄는지 알려 줍니다."
         case .soarmRecord: "VLA 학습용 시연을 찍습니다. 화질은 640×480@30으로 못 박혀 있고 고르는 자리가 없습니다 — 에피소드마다 설정이 달라지면 데이터셋을 못 쓰기 때문입니다."
         case .soarmData: "서버에 쌓인 시연 데이터를 에피소드 단위로 되돌려 봅니다. 영상은 서버에 그대로 두고 필요한 구간만 받아 재생합니다."
+        case .spark: "학습 서버의 GPU 앞에 선 줄입니다. 지금 도는 것과 기다리는 것을 보고, 여러 개를 세워 두면 순서대로 하나씩 돕니다 — 걸어 두고 자러 가도 됩니다."
         }
     }
 
@@ -432,6 +434,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .soarmTeleop: "3D로 팔을 직접 움직이기"
         case .soarmRecord: "시연을 찍어 데이터셋 만들기"
         case .soarmData: "찍어 둔 시연 다시 보기"
+        case .spark: "학습을 줄 세워 두고 자기"
         }
     }
 
@@ -463,6 +466,9 @@ enum AppSection: String, CaseIterable, Identifiable {
         // 찍는 화면과 찍은 것을 보는 화면은 기호부터 달라야 한다.
         case .soarmRecord: "record.circle"
         case .soarmData: "film.stack"
+        // 쌓아 둔 것이 순서대로 하나씩 빠져나가는 화면이다. 기계나 GPU가 아니라 그
+        // 줄이 이 화면의 주제다.
+        case .spark: "square.stack.3d.up"
         }
     }
 
@@ -487,6 +493,9 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .print: "p"
         case .briefing, .archive, .briefingCalendar: "b"
         case .soarm, .soarmTeleop, .soarmRecord, .soarmData: "r"
+        // 로봇 화면들이 나눠 쓰는 `R`에는 조합이 더 남아 있지 않다. 학습 서버는 팔이
+        // 없는 다른 기계이기도 하므로 제 글자를 준다.
+        case .spark: "t"
         }
     }
 
@@ -494,7 +503,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     /// 쓴다. `⌘R`은 이미 인박스 정리 시작이 쓰고 있어 `⇧`부터 시작한다.
     var shortcutModifiers: EventModifiers {
         switch self {
-        case .archive, .soarm, .music: [.command, .shift]
+        case .archive, .soarm, .music, .spark: [.command, .shift]
         case .briefingCalendar: [.command, .option]
         case .soarmTeleop: [.command, .control]
         case .soarmRecord: [.command, .shift, .option]
@@ -525,7 +534,7 @@ enum AppSection: String, CaseIterable, Identifiable {
             case .music: [.music]
             case .files: [.compression, .convert]
             case .automation: [.briefing, .archive, .briefingCalendar]
-            case .robot: [.soarm, .soarmTeleop, .soarmRecord, .soarmData]
+            case .robot: [.soarm, .soarmTeleop, .soarmRecord, .soarmData, .spark]
             }
         }
     }

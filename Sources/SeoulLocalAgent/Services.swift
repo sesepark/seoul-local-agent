@@ -65,6 +65,9 @@ final class ActiveProcessRegistry: @unchecked Sendable {
         // comment in its remote command, which is visible in the local `ps`
         // output and means nothing on the server.
         SOArmTunnel.marker,
+        // 학습 서버로 가는 두 번째 터널. 표식을 나눠 두지 않으면 한쪽을 정리하는 청소가
+        // 다른 쪽까지 끊는다.
+        SOArmTunnel.sparkMarker,
         // 나머지 도구들 — ffmpeg, yt-dlp, soffice, cwebp, screencapture — 은 전부
         // `SeoulLocalAgent-<도구>` 작업 폴더를 인자로 받는다. 강제 종료로 부모를 잃으면
         // 이름만으로는 사용자가 터미널에서 돌리는 같은 도구와 구별할 수 없는데, 이 경로는
