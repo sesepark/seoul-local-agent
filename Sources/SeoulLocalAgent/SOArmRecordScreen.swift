@@ -21,6 +21,12 @@ struct SOArmRecordScreen: View {
     @ObservedObject private var cameraPolicy = SOArmCameraPolicy.shared
     @State private var pending: SOArmStartRequest?
     @State private var cameraRowWidth: CGFloat = 0
+    /// 이 화면에 들어온 뒤로 수집이 한 번이라도 돌았는가.
+    ///
+    /// 서버의 `recording.logs`는 지난 실행의 것을 계속 들고 있다. 그것을 그대로 그리면,
+    /// 앱을 막 켠 화면에 몇 시간 전 인코더 출력이 가득 차 있어 뭔가 돌고 있는 것처럼
+    /// 보인다. 실제로 그 화면을 봤다.
+    @State private var ranThisVisit = false
 
     var body: some View {
         WorkspaceScreen(title: AppSection.soarmRecord.title, subtitle: AppSection.soarmRecord.subtitle) {
@@ -38,8 +44,12 @@ struct SOArmRecordScreen: View {
         .sheet(item: $pending) { request in
             SOArmConfirmationSheet(request: request) { model.startRecording() }
         }
+        .onChange(of: isRecording) { _, running in if running { ranThisVisit = true } }
         .onAppear { model.recordScreenAppeared() }
-        .onDisappear { model.screenDisappeared() }
+        .onDisappear {
+            ranThisVisit = false
+            model.screenDisappeared()
+        }
     }
 
     private var isRecording: Bool { model.status?.recording.running ?? false }
@@ -361,10 +371,13 @@ struct SOArmRecordScreen: View {
 
     // MARK: 로그
 
+    /// 지금 돌고 있거나, 이 화면에서 한 번 돌렸거나, 오류로 끝났을 때만 보여 준다.
+    /// 오류를 남기는 이유는 그때 로그가 유일한 단서이기 때문이다 — 화면에 들어오기 전에
+    /// 실패했더라도 읽을 수 있어야 한다.
     @ViewBuilder
     private var logs: some View {
         let lines = model.status?.recording.logs ?? []
-        if !lines.isEmpty {
+        if (isRecording || ranThisVisit || runtime?.phase == "error") && !lines.isEmpty {
             GroupBox("수집 로그") {
                 ScrollView {
                     Text(lines.suffix(40).joined(separator: "\n"))
