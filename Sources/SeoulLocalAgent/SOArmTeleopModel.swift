@@ -85,8 +85,9 @@ final class SOArmTeleopModel: ObservableObject {
     @Published private(set) var connection: Connection = .idle
     @Published private(set) var status = SOArmVirtualLeaderStatus()
     @Published private(set) var lease: SOArmLease?
-    /// 우리가 보내고 있는 목표. 조작하지 않는 동안에는 계속 실제값을 따라간다 — 그래야
-    /// 리스를 잡은 직후의 첫 명령이 현재 자세에서 시작한다.
+    /// 우리가 보내고 있는 목표. 조작하지 않는 동안에는 **잡아 둔다** — 손을 떼는 순간
+    /// 실제 자세에 한 번 붙이고, 그 뒤로는 팔이 문턱을 넘어 움직였을 때만 다시 붙인다.
+    /// 매 프레임 따라가게 두면 중력 처짐이 그대로 목표가 된다(`holdTargetAgainstDrift`).
     @Published private(set) var target: [String: Double] = [:]
     /// 지금 사람이 무언가를 끌고 있는가. 데드맨의 심장이다: 거짓이 되는 순간 목표가
     /// 실제 자세로 붙고 팔은 그 자리에 선다.
@@ -331,16 +332,71 @@ final class SOArmTeleopModel: ObservableObject {
             endCommanding()
         }
         if !isCommanding {
-            syncTargetToArm()
+            // 서버가 팔을 쥐고 있는 동안(HOLD·RETREATING·FAULT)에는 팔이 우리 명령과
+            // 무관하게 움직인다. 그때는 목표가 따라가야 한다 — 따라가지 않으면 다시
+            // 시작하는 순간 물러나기 전 자리로 도로 밀어 붙인다.
+            if value.telemetry.state.acceptsMotion {
+                holdTargetAgainstDrift()
+            } else {
+                syncTargetToArm()
+            }
         }
     }
 
-    /// 목표를 팔의 지금 자세로 붙인다.
+    /// 목표를 팔의 지금 자세로 붙인다. 손을 떼는 **그 순간** 한 번, 그리고 서버가 팔을
+    /// 옮겼을 때.
     func syncTargetToArm() {
         let present = telemetry.present
         guard !present.isEmpty else { return }
         target = present
     }
+
+    /// 잡아 둔 목표를 지킨다. 팔이 **정말로** 움직였을 때만 다시 붙인다.
+    ///
+    /// 예전에는 조작하지 않는 동안 매 프레임 목표를 실제 자세에 붙였다. 그것이 중력
+    /// 처짐의 원인이었다. STS3215는 위치 P 제어라 중력 부하가 걸리면 목표보다 조금
+    /// 아래에서 멈추는데(정상적인 추종오차), 그 내려간 자리를 30Hz로 새 목표로 삼으면
+    /// 서보가 낼 복원 토크가 매 틱 0이 된다. 중력이 다시 당기고, 목표가 다시 따라
+    /// 내려가고 — 팔이 스스로 걸어 내려간다. 사용자가 "마우스를 떼면 팔이 천천히
+    /// 쳐진다"고 한 것이 이것이다.
+    ///
+    /// 목표를 잡아 두면 처짐이 곧 위치 오차가 되고, 서보가 그것을 밀어 올린다. 실제로
+    /// 서버의 `HOLD`가 정확히 이 방식이고(`_hold_goal`을 한 번만 박아 둔다), 그 상태의
+    /// 팔은 여섯 관절 모두 목표와 실제가 어긋나지 않은 채 서 있다.
+    ///
+    /// 그렇다고 영영 붙잡고 있을 수는 없다. 사람이 팔을 손으로 옮겼거나 토크가 풀려
+    /// 자세가 달라졌다면 목표는 그것을 따라가야 한다 — 그러지 않으면 다음 명령이 팔을
+    /// 옛 자리로 홱 되돌린다. 그래서 문턱을 둔다. 문턱은 추종오차보다 확실히 크고
+    /// (`lead`의 1/4), 사람이 팔을 옮긴 것을 못 알아볼 만큼 크지는 않다.
+    func holdTargetAgainstDrift() {
+        let present = telemetry.present
+        guard !present.isEmpty else { return }
+        target = Self.holding(target, against: present, spec: status.spec, policy: status.policy)
+    }
+
+    /// 위의 결정만 떼어 낸 것. 살아 있는 콘솔 없이 시험할 수 있어야 하는 부분이다.
+    nonisolated static func holding(
+        _ held: [String: Double],
+        against present: [String: Double],
+        spec: [SOArmJointSpec],
+        policy: SOArmSafetyPolicy
+    ) -> [String: Double] {
+        guard !held.isEmpty else { return present }
+        var next = held
+        for (name, value) in present {
+            guard let joint = spec.first(where: { $0.name == name }) else { continue }
+            guard let holding = held[name] else { next[name] = value; continue }
+            if abs(value - holding) > policy.lead(for: joint) * driftShare {
+                next[name] = value
+            }
+        }
+        return next
+    }
+
+    /// 잡아 둔 목표를 놓아 줄 문턱. `lead`에 대한 비율로 적는 이유는 그 값이 곧 이
+    /// 하드웨어에서 "의미 있는 각도 차이"의 단위이기 때문이다 — 조작감 프로필을 바꾸면
+    /// 문턱도 함께 따라와야 한다.
+    nonisolated static let driftShare = 0.25
 
     func connect() {
         guard isVisible, socket == nil, server.isConfigured else { return }
@@ -617,12 +673,26 @@ final class SOArmTeleopModel: ObservableObject {
         // 그것을 그대로 받으면 되돌리기가 한 걸음 나아갈 때마다 도로 실제 자세로 당겨져,
         // 실물에서 초당 0.7%씩밖에 가지 못했다. 지금 목표를 정하는 것은 되돌리기다.
         guard !isHoming else { return }
+        // 손을 떼고 있는 동안 페이지가 올려 보내는 것은 **팔의 실제 자세를 그대로 되비친
+        // 유령**이다(`viewer.js`의 `applyTelemetry`가 `commanding`이 아니면 매 프레임
+        // `target = {...present}`로 붙인다). 그것을 목표로 받으면 되돌리기를 망가뜨린
+        // 것과 똑같은 일이 조작 대기 중에도 일어난다 — 중력 처짐이 그대로 명령이 되어
+        // 목표가 팔을 따라 내려간다. 그래서 값 자체를 듣지 않는다. 손을 떼는 그 순간에만
+        // 한 번 붙이고, 그 뒤로는 잡아 둔다.
+        guard commanding else {
+            if isCommanding {
+                isCommanding = false
+                syncTargetToArm()
+            } else {
+                holdTargetAgainstDrift()
+            }
+            return
+        }
         for (name, value) in values {
             guard let joint = status.spec.first(where: { $0.name == name }) else { continue }
             target[name] = clampToSyncWindow(joint, joint.clamp(value))
         }
-        isCommanding = commanding
-        if !commanding { syncTargetToArm() }
+        isCommanding = true
     }
 
     // MARK: 안전 자세

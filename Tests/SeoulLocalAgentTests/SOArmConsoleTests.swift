@@ -689,6 +689,116 @@ struct SOArmLiveConsoleTests {
         #expect(doctor.arms.count == 2)
         #expect(try await client.status().doctor?.checkedAt == doctor.checkedAt)
     }
+
+    // MARK: 서버가 새로 실어 보내는 값들
+
+    @Test("회 진행 상황과 되읽은 카메라 컨트롤을 서버가 적어 준 이름 그대로 읽는다")
+    func readsEpisodeProgressAndCameraControls() throws {
+        // 서버(`recording.py`의 `_write_status`, `app.py`의 camera_status)가 실제로 쓰는
+        // 키 이름이다. 여기서 이름이 어긋나면 화면은 조용히 빈 칸으로 남는다 — 남은 시간이
+        // 안 보이는 이유를 찾으러 서버 로그부터 뒤지게 되는 자리라, 계약을 시험으로 박아 둔다.
+        let json = """
+        {"motion_enabled": true, "teleop_preflight": [], "record_preflight": [],
+         "teleoperation": {"running": false},
+         "recording": {"running": true, "slow_loop_warnings": 3,
+           "runtime": {"phase": "recording", "dataset_name": "soarm101_x", "task": "블록 집기",
+                       "episode_started_at": 1788592998.5, "episode_seconds": 30,
+                       "episode_index": 2, "loop_hz": 24.5}},
+         "cameras": {"scene": {"active": true,
+           "recording_controls": {"values": {"power_line_frequency": 2,
+             "exposure_dynamic_framerate": 0, "white_balance_automatic": 0,
+             "white_balance_temperature": 4600, "auto_exposure": 3}, "failures": []}}}}
+        """
+        let status = try SOArmStatus.parse(Data(json.utf8))
+        let runtime = try #require(status.recordingRuntime)
+        #expect(runtime.episodeIndex == 2)
+        #expect(runtime.episodeSeconds == 30)
+        #expect(runtime.loopHz == 24.5)
+        #expect(runtime.episodeStartedAt?.timeIntervalSince1970 == 1788592998.5)
+        #expect(status.recording.slowLoopWarnings == 3)
+        #expect(status.sceneCamera.recordingControls["white_balance_temperature"] == 4600)
+        #expect(status.sceneCamera.recordingControls["auto_exposure"] == 3)
+        #expect(status.sceneCamera.recordingControlFailures.isEmpty)
+
+        // 회 사이에는 시작 시각이 비고, 화면은 그때 남은 시간을 세면 안 된다.
+        let resetting = try SOArmStatus.parse(Data(json
+            .replacingOccurrences(of: "\"phase\": \"recording\"", with: "\"phase\": \"resetting\"")
+            .replacingOccurrences(of: "\"episode_started_at\": 1788592998.5", with: "\"episode_started_at\": null").utf8))
+        #expect(resetting.recordingRuntime?.episodeStartedAt == nil)
+        #expect(resetting.recordingRuntime?.phaseTitle == "다음 회 준비 중")
+
+        // 아직 한 번도 수집을 시작하지 않았으면 서버가 `null`을 준다. 그때 화면은
+        // 되읽은 값이 없다고 말해야지, 빈 값을 사실로 적으면 안 된다.
+        let never = try SOArmStatus.parse(Data(json
+            .replacingOccurrences(of: "\"recording_controls\": {\"values\"", with: "\"unused\": {\"values\"").utf8))
+        #expect(never.sceneCamera.recordingControls.isEmpty)
+    }
+
+    // MARK: 팔에 다시 흘리는 재생
+
+    @Test("재생 상태를 읽고, 도는 동안에는 다른 모드를 막는다")
+    func replayHoldsTheFollower() throws {
+        let json = """
+        {"motion_enabled": true, "teleop_preflight": [], "record_preflight": [],
+         "teleoperation": {"running": false}, "recording": {"running": false},
+         "virtual_leader": {"running": false},
+         "replay": {"running": true, "speeds": [0.25, 0.5, 1.0], "default_speed": 0.5,
+           "runtime": {"phase": "aligning", "dataset": "soarm101_x", "episode": 0,
+                       "frame": 0, "total_frames": 665, "speed": 0.25,
+                       "aligning_seconds_left": 1.4}}}
+        """
+        let status = try SOArmStatus.parse(Data(json.utf8))
+        #expect(status.replay.running)
+        #expect(status.replay.isMoving)
+        #expect(status.replay.phaseTitle == "시작 자세로 가는 중")
+        #expect(status.replay.totalFrames == 665)
+        #expect(status.replay.speed == 0.25)
+        #expect(status.replay.aligningSecondsLeft == 1.4)
+        // 팔로워의 주인은 하나다. 재생이 도는 동안에는 텔레옵도 수집도 시작할 수 없고,
+        // 화면이 그 이유와 어디서 멈추는지를 말해야 한다.
+        #expect(status.teleopReady == false)
+        #expect(status.recordReady == false)
+        #expect(status.followerHeldElsewhere?.contains("수집 데이터") == true)
+
+        // 끝난 뒤에는 상태만 남는다. 그때는 팔이 움직이지 않으므로 다시 시작할 수 있다.
+        let done = try SOArmStatus.parse(Data(json
+            .replacingOccurrences(of: "\"running\": true, \"speeds\"", with: "\"running\": false, \"speeds\"")
+            .replacingOccurrences(of: "\"phase\": \"aligning\"", with: "\"phase\": \"complete\"").utf8))
+        #expect(done.replay.isMoving == false)
+        #expect(done.replay.phaseTitle == "끝났습니다")
+        #expect(done.teleopReady)
+    }
+
+    // MARK: 팔로워의 주인은 하나다
+
+    @Test("가상 리더가 관찰 중이면 텔레옵도 수집도 시작할 수 없다고 미리 말한다")
+    func aRunningVirtualLeaderBlocksTheOtherModes() throws {
+        // 사용자가 실제로 겪은 것: `정지`와 `권한 반납`을 눌러 팔을 세우고 권한까지
+        // 놓았는데도 `텔레옵 시작`이 영어 409로 거절당했다. 관찰을 끄는 것은 그 둘이
+        // 아니라 `관찰 끄기`이고, 서버는 이 사실을 `/api/status`에 늘 실어 보내는데
+        // 앱이 읽지 않아 버튼이 눌리는 채로 남아 있었다.
+        let base = """
+        {"motion_enabled": true, "camera_roles_confirmed": true,
+         "teleop_preflight": [], "record_preflight": [],
+         "teleoperation": {"running": false}, "recording": {"running": false},
+         "virtual_leader": {"running": %@, "state": "SAFE"}}
+        """
+
+        let observing = try SOArmStatus.parse(Data(base.replacingOccurrences(of: "%@", with: "true").utf8))
+        #expect(observing.virtualLeaderRunning)
+        #expect(observing.teleopReady == false)
+        #expect(observing.recordReady == false)
+        let reason = try #require(observing.followerHeldElsewhere)
+        #expect(reason.contains("관찰 끄기"))
+
+        // 관찰이 꺼져 있으면 아무 말도 하지 않는다. 정상 상태를 경고로 적으면 화면이
+        // 늘 노란 채로 남고, 그때부터 아무도 읽지 않는다.
+        let off = try SOArmStatus.parse(Data(base.replacingOccurrences(of: "%@", with: "false").utf8))
+        #expect(off.virtualLeaderRunning == false)
+        #expect(off.teleopReady)
+        #expect(off.recordReady)
+        #expect(off.followerHeldElsewhere == nil)
+    }
 }
 #endif
 

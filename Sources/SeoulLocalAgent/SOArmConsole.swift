@@ -162,12 +162,32 @@ enum SOArmError: LocalizedError, Equatable {
         case .confirmationMismatch(let detail):
             detail.isEmpty ? "확인 문구가 맞지 않습니다." : detail
         case .blocked(let detail):
-            detail
+            Self.korean(for: detail) ?? detail
         case .serverFailure(let detail):
             "서버가 요청을 끝내지 못했습니다: \(detail). 팔이 계속 움직이면 물리 전원을 차단하세요."
         case .badResponse(let detail):
             "서버 응답을 읽지 못했습니다: \(detail)"
         }
+    }
+
+    /// 서버가 영어로 적어 보내는 거절 가운데, **어느 버튼을 눌러야 하는지**가 답인 것들.
+    ///
+    /// 서버의 `detail`은 대체로 그 자체가 가장 정확한 설명이라 그대로 보여 주는 것이
+    /// 맞다. 그러나 이 몇 개는 다르다. `Stop the virtual leader…`를 읽고 사용자가 실제로
+    /// 한 일은 `정지`와 `권한 반납`을 누른 것이었고, 그 둘로는 관찰이 꺼지지 않는다 —
+    /// 화면은 "관찰 전용"이라고 적혀 있으니 이미 멈춘 것으로 읽힌다. 문장이 버튼 이름을
+    /// 말하지 않으면 사용자는 같은 버튼을 다시 누른다.
+    static func korean(for detail: String) -> String? {
+        if detail.hasPrefix("Stop the virtual leader before physical-leader teleoperation") {
+            return "가상 리더가 아직 팔로워 USB를 쥐고 있습니다. 원격 텔레옵 화면에서 `관찰 끄기`를 누른 뒤 다시 시작하세요 — `정지`와 `권한 반납`은 관찰을 끄지 않습니다."
+        }
+        if detail.hasPrefix("Stop the virtual leader before recording") {
+            return "가상 리더가 아직 팔로워 USB를 쥐고 있습니다. 원격 텔레옵 화면에서 `관찰 끄기`를 누른 뒤 수집을 시작하세요 — `정지`와 `권한 반납`은 관찰을 끄지 않습니다."
+        }
+        if detail.hasPrefix("Recording fixes every camera at") {
+            return "데이터 수집이 도는 동안에는 카메라 설정을 바꿀 수 없습니다. 수집은 언제나 같은 화질로 찍습니다."
+        }
+        return nil
     }
 
     /// 다시 눌러 볼 만한 실패인가. 409와 400은 아니다.
@@ -202,12 +222,29 @@ struct SOArmStatus: Sendable, Equatable {
     var teleop = SOArmProcess()
     var recording = SOArmProcess()
     var recordingRuntime: SOArmRecordingRuntime?
+    var replay = SOArmReplay()
     var doctor: SOArmDoctor?
     /// 데이터 수집이 고정으로 쓰는 카메라 설정. 서버가 정하고 앱은 그대로 옮겨 적는다.
     var recordingProfile = SOArmCameraProfile.recordingDefault
+    /// 가상 리더의 관찰 루프가 팔로워 USB를 쥐고 있는가.
+    ///
+    /// 팔로워의 주인은 하나뿐이라, 이것이 참인 동안에는 물리 리더 텔레옵도 데이터 수집도
+    /// 시작할 수 없다. 서버는 이 사실을 `/api/status`에 늘 실어 보내는데 앱이 읽지 않고
+    /// 있었다 — 그래서 `텔레옵 시작`이 눌리는 채로 남아 있다가, 누르면 영어 409 한 줄을
+    /// 돌려주었다. 막힌 것을 **누르기 전에** 말해야 한다.
+    var virtualLeaderRunning = false
 
-    var teleopReady: Bool { motionEnabled && teleopPreflight.isEmpty }
-    var recordReady: Bool { motionEnabled && recordPreflight.isEmpty }
+    /// 팔로워를 다른 것이 쥐고 있어서 시작할 수 없다면, 그 이유와 풀 방법.
+    var followerHeldElsewhere: String? {
+        if replay.running {
+            return "찍은 시연을 팔에 재생하는 중입니다. `수집 데이터` 화면에서 재생을 멈춘 뒤 다시 시작하세요."
+        }
+        guard virtualLeaderRunning else { return nil }
+        return "가상 리더가 팔로워 USB를 쥐고 있습니다. 원격 텔레옵 화면에서 `관찰 끄기`를 누르세요 — `정지`와 `권한 반납`은 관찰을 끄지 않습니다."
+    }
+
+    var teleopReady: Bool { motionEnabled && teleopPreflight.isEmpty && followerHeldElsewhere == nil }
+    var recordReady: Bool { motionEnabled && recordPreflight.isEmpty && followerHeldElsewhere == nil }
     var mode: SOArmMode {
         if recording.running { .recording } else if teleop.running { .teleoperation } else { .idle }
     }
@@ -258,6 +295,8 @@ struct SOArmStatus: Sendable, Equatable {
         if let profile = SOArmCameraProfile(root.soarmDict("recording_profile")) {
             status.recordingProfile = profile
         }
+        status.virtualLeaderRunning = root.soarmDict("virtual_leader").soarmBool("running")
+        status.replay = SOArmReplay(root.soarmDict("replay"))
         return status
     }
 }
@@ -283,6 +322,11 @@ struct SOArmCamera: Sendable, Equatable {
     /// 실제로 나오고 있는 것. 크기는 드라이버가 열어 준 값, 프레임은 서버가 센 전달량이다.
     /// 프리뷰가 꺼져 있으면 없다.
     var actual: SOArmCameraProfile?
+    /// 수집을 시작할 때 서버가 이 카메라에 넣고 **되읽은** V4L2 값. 넣으려 한 값이 아니라
+    /// 장치가 돌려준 값이라, 화면이 적는 것과 카메라가 하는 일이 어긋나지 않는다.
+    var recordingControls: [String: Int] = [:]
+    /// 그중 장치가 받아 주지 않은 것들. 카메라를 바꾸면 목록이 달라질 수 있다.
+    var recordingControlFailures: [String] = []
     /// 이 카메라가 정말로 낼 수 있는 모드. 서버가 장치에 직접 물어서 준다.
     var modes: [SOArmCameraMode] = []
 
@@ -294,6 +338,9 @@ struct SOArmCamera: Sendable, Equatable {
         error = json.soarmString("error")
         if let profile = SOArmCameraProfile(json.soarmDict("requested")) { requested = profile }
         if let value = json["actual"] as? [String: Any] { actual = SOArmCameraProfile(value) }
+        let controls = json.soarmDict("recording_controls")
+        recordingControls = controls.soarmDict("values").compactMapValues { ($0 as? NSNumber)?.intValue }
+        recordingControlFailures = (controls["failures"] as? [Any] ?? []).compactMap { $0 as? String }
         modes = (json["modes"] as? [[String: Any]] ?? []).compactMap(SOArmCameraMode.init)
     }
 
@@ -362,6 +409,12 @@ struct SOArmProcess: Sendable, Equatable {
     var running = false
     var pid: Int?
     var logs: [String] = []
+    /// LeRobot이 "Record loop is running slower…"를 낸 횟수. 서버가 로그에서 세어 준다.
+    ///
+    /// 이 경고가 데이터가 조용히 나빠지는 것을 알려 주는 유일한 신호다. 데이터셋의
+    /// `timestamp`는 `frame_index / fps`로 계산되므로, 루프가 느렸어도 파일은 언제나
+    /// 30fps라고 적는다. 경고를 로그 안에만 두면 아무도 읽지 않는다.
+    var slowLoopWarnings = 0
 
     init() {}
 
@@ -369,6 +422,7 @@ struct SOArmProcess: Sendable, Equatable {
         running = json.soarmBool("running")
         pid = json.soarmInt("pid")
         logs = json.soarmStrings("logs")
+        slowLoopWarnings = json.soarmInt("slow_loop_warnings") ?? 0
     }
 }
 
@@ -377,22 +431,100 @@ struct SOArmRecordingRuntime: Sendable, Equatable {
     var datasetName: String?
     var task: String?
     var lastControl: String?
+    /// 지금 회가 시작한 시각(서버의 벽시계). 서버가 알려 주지 않으면 `nil`이고, 그때
+    /// 화면은 남은 시간을 세지 않는다 — 앱이 혼자 세면 회 사이 정리 시간만큼 어긋난다.
+    var episodeStartedAt: Date?
+    /// 한 회의 최대 길이(초). 서버가 실제로 쓴 값이지 앱이 보낸 값이 아니다.
+    var episodeSeconds: Int?
+    /// 지금 몇 번째 회인가. 0부터 센다.
+    var episodeIndex: Int?
+    /// 수집 루프가 실제로 도는 속도. 30을 목표로 도는데 못 지키면 이미지가 중복되고,
+    /// 그것은 로그에만 남아 조용히 데이터가 나빠지는 유일한 경로다.
+    var loopHz: Double?
 
     init(_ json: [String: Any]) {
         phase = json.soarmString("phase")
         datasetName = json.soarmString("dataset_name")
         task = json.soarmString("task")
         lastControl = json.soarmString("last_control")
+        if let seconds = (json["episode_started_at"] as? NSNumber)?.doubleValue, seconds > 0 {
+            episodeStartedAt = Date(timeIntervalSince1970: seconds)
+        }
+        episodeSeconds = json.soarmInt("episode_seconds")
+        episodeIndex = json.soarmInt("episode_index")
+        loopHz = (json["loop_hz"] as? NSNumber)?.doubleValue
     }
 
     var phaseTitle: String {
         switch phase {
         case "starting": "시작하는 중"
         case "recording": "수집 중"
+        // 회와 회 사이. 이때는 팔을 제자리로 돌려놓는 시간이고 남은 시간을 세면 안 된다.
+        case "resetting": "다음 회 준비 중"
         case "complete": "완료"
         case "error": "오류로 끝남"
         default: phase ?? "—"
         }
+    }
+}
+
+/// 찍은 에피소드를 실제 팔에 다시 흘리는 재생의 상태.
+///
+/// 사람 손 없이 팔이 움직이는 유일한 경로라, 화면은 언제나 지금 어느 단계인지와 정지
+/// 버튼을 함께 보여 준다.
+struct SOArmReplay: Sendable, Equatable {
+    var running = false
+    var phase: String?
+    var dataset: String?
+    var episode: Int?
+    var frame = 0
+    var totalFrames = 0
+    var speed = 0.5
+    /// 정렬 단계가 몇 초 남았는가. 재생 단계에서는 0이다.
+    var aligningSecondsLeft: Double = 0
+    var error: String?
+    var speeds: [Double] = [0.25, 0.5, 1.0]
+    var defaultSpeed = 0.5
+    var logs: [String] = []
+
+    /// 팔이 지금 움직이고 있는가. `running`은 프로세스가 살아 있다는 뜻일 뿐이라,
+    /// 끝난 뒤 상태만 남은 순간과 구별해야 한다.
+    var isMoving: Bool { running && (phase == "aligning" || phase == "replaying") }
+
+    var phaseTitle: String {
+        switch phase {
+        // 첫 프레임으로 뛰지 않으려고 걸어서 가는 구간이다. 이때 팔이 움직이는 것은
+        // 녹화된 동작이 아니라 출발점까지 가는 길이라, 화면이 다르게 말해야 한다.
+        case "aligning": "시작 자세로 가는 중"
+        case "replaying": "재생 중"
+        case "complete": "끝났습니다"
+        case "stopped": "중간에 멈췄습니다"
+        case "error": "오류로 멈췄습니다"
+        default: phase ?? "—"
+        }
+    }
+
+    var progress: Double {
+        totalFrames > 0 ? min(1, Double(frame) / Double(totalFrames)) : 0
+    }
+
+    init() {}
+
+    init(_ json: [String: Any]) {
+        running = json.soarmBool("running")
+        logs = json.soarmStrings("logs")
+        speeds = (json["speeds"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.doubleValue }
+        if speeds.isEmpty { speeds = [0.25, 0.5, 1.0] }
+        defaultSpeed = (json["default_speed"] as? NSNumber)?.doubleValue ?? 0.5
+        let runtime = json.soarmDict("runtime")
+        phase = runtime.soarmString("phase")
+        dataset = runtime.soarmString("dataset")
+        episode = runtime.soarmInt("episode")
+        frame = runtime.soarmInt("frame") ?? 0
+        totalFrames = runtime.soarmInt("total_frames") ?? 0
+        speed = (runtime["speed"] as? NSNumber)?.doubleValue ?? defaultSpeed
+        aligningSecondsLeft = (runtime["aligning_seconds_left"] as? NSNumber)?.doubleValue ?? 0
+        error = runtime.soarmString("error")
     }
 }
 
@@ -569,6 +701,21 @@ struct SOArmClient: Sendable {
 
     func stopTeleoperation() async throws {
         _ = try await send("/api/teleoperation/stop", method: "POST", timeout: 30)
+    }
+
+    static let replayConfirmation = "REPLAY SOARM101"
+
+    /// 찍은 에피소드를 팔에 다시 흘린다. **팔이 실제로 움직인다.**
+    func startReplay(confirmation: String, dataset: String, episode: Int, speed: Double) async throws {
+        _ = try await send(
+            "/api/replay/start", method: "POST",
+            body: ["confirmation": confirmation, "dataset": dataset, "episode": episode, "speed": speed],
+            timeout: 30
+        )
+    }
+
+    func stopReplay() async throws {
+        _ = try await send("/api/replay/stop", method: "POST", timeout: 15)
     }
 
     func startRecording(confirmation: String, task: String, episodes: Int, episodeSeconds: Int) async throws {

@@ -353,7 +353,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case music
     case compression, convert
     case briefing, archive, briefingCalendar
-    case soarm, soarmTeleop, soarmData
+    case soarm, soarmTeleop, soarmRecord, soarmData
 
     var id: String { rawValue }
 
@@ -380,6 +380,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .briefingCalendar: "일정 달력"
         case .soarm: "SO-ARM 101"
         case .soarmTeleop: "원격 텔레옵"
+        case .soarmRecord: "데이터 수집"
         case .soarmData: "수집 데이터"
         }
     }
@@ -401,8 +402,9 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .briefing: "메일·메시지·웹 공지를 모아 이 Mac의 모델로 정리합니다. 수집부터 저장까지의 상태를 여기서 봅니다."
         case .archive: "정리된 결과가 날짜별로 쌓입니다. 끝낸 일을 체크하고, 남은 일은 Mac 캘린더나 미리 알림으로 바로 넘깁니다."
         case .briefingCalendar: "브리핑에서 나온 마감과, 캘린더·미리 알림으로 넘긴 일정을 한 달치 달력에 모아 놓습니다. 날짜를 읽지 못한 것은 아래에 따로 셉니다."
-        case .soarm: "집 서버에 붙은 SO-ARM101 팔을 여기서 조작합니다. 팔과 카메라는 서버가 쥐고 있고, 이 Mac은 SSH 터널 너머로 시작과 중지만 지시합니다."
+        case .soarm: "집 서버에 붙은 SO-ARM101 팔을 물리 리더로 조작합니다. 팔과 카메라는 서버가 쥐고 있고, 이 Mac은 SSH 터널 너머로 시작과 중지만 지시합니다."
         case .soarmTeleop: "3D로 그린 팔을 만지면 집에 있는 진짜 팔이 따라옵니다. 물리 리더 팔이 없어도 되고, 같은 화면을 아이폰에서도 씁니다. 멈춰야 할 일이 생기면 서버가 먼저 멈추고 왜 멈췄는지 알려 줍니다."
+        case .soarmRecord: "VLA 학습용 시연을 찍습니다. 화질은 640×480@30으로 못 박혀 있고 고르는 자리가 없습니다 — 에피소드마다 설정이 달라지면 데이터셋을 못 쓰기 때문입니다."
         case .soarmData: "서버에 쌓인 시연 데이터를 에피소드 단위로 되돌려 봅니다. 영상은 서버에 그대로 두고 필요한 구간만 받아 재생합니다."
         }
     }
@@ -428,6 +430,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .briefingCalendar: "마감과 일정을 달력으로"
         case .soarm: "로봇 팔 상태와 카메라"
         case .soarmTeleop: "3D로 팔을 직접 움직이기"
+        case .soarmRecord: "시연을 찍어 데이터셋 만들기"
         case .soarmData: "찍어 둔 시연 다시 보기"
         }
     }
@@ -457,6 +460,8 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .soarm: "arrow.up.and.down.and.arrow.left.and.right"
         // 손으로 직접 붙잡아 움직인다는 것이 이 화면의 전부다.
         case .soarmTeleop: "hand.draw"
+        // 찍는 화면과 찍은 것을 보는 화면은 기호부터 달라야 한다.
+        case .soarmRecord: "record.circle"
         case .soarmData: "film.stack"
         }
     }
@@ -481,7 +486,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .music: "m"
         case .print: "p"
         case .briefing, .archive, .briefingCalendar: "b"
-        case .soarm, .soarmTeleop, .soarmData: "r"
+        case .soarm, .soarmTeleop, .soarmRecord, .soarmData: "r"
         }
     }
 
@@ -492,6 +497,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .archive, .soarm, .music: [.command, .shift]
         case .briefingCalendar: [.command, .option]
         case .soarmTeleop: [.command, .control]
+        case .soarmRecord: [.command, .shift, .option]
         case .soarmData: [.command, .option]
         default: .command
         }
@@ -519,7 +525,7 @@ enum AppSection: String, CaseIterable, Identifiable {
             case .music: [.music]
             case .files: [.compression, .convert]
             case .automation: [.briefing, .archive, .briefingCalendar]
-            case .robot: [.soarm, .soarmTeleop, .soarmData]
+            case .robot: [.soarm, .soarmTeleop, .soarmRecord, .soarmData]
             }
         }
     }

@@ -63,6 +63,12 @@ final class SOArmConsoleModel: ObservableObject {
     }
     @Published var selectedEpisode: Int?
     @Published var selectedCamera: String?
+    /// 데이터셋 이름 → 그 세션의 과제 문장.
+    ///
+    /// 목록 API(`/api/datasets`)는 과제를 싣지 않고 상세에만 들어 있어서, 목록을 읽은 뒤
+    /// 모르는 것만 한 번씩 더 물어 채운다. 세션 이름은 타임스탬프라 무엇을 찍은 것인지
+    /// 말해 주지 않는다 — 화면이 과제로 묶으려면 이 표가 있어야 한다.
+    @Published private(set) var datasetTasks: [String: String] = [:]
 
     // 학습 서버(Spark)
     @Published private(set) var sparkStatus: SOArmSparkStatus?
@@ -389,6 +395,27 @@ final class SOArmConsoleModel: ObservableObject {
         }
     }
 
+    /// 사람이 고른 재생 속도. 기본은 절반이다 — 처음 보는 재생은 느린 편이 낫다.
+    /// 서버도 같은 기본값을 갖고 있고, 이 값은 화면에서 고른 것을 기억해 둘 뿐이다.
+    @Published var replaySpeed: Double = 0.5
+
+    /// 찍은 에피소드를 팔에 다시 흘린다. **팔이 실제로 움직인다.**
+    func startReplay(dataset: String, episode: Int) {
+        let speed = replaySpeed
+        perform { client in
+            try await client.startReplay(
+                confirmation: SOArmClient.replayConfirmation,
+                dataset: dataset, episode: episode, speed: speed
+            )
+        }
+    }
+
+    /// 재생을 그 자리에서 멈춘다. 토크는 걸어 둔 채다 — 멈추는 것과 힘을 놓는 것은
+    /// 다른 일이고, 팔이 든 것을 떨어뜨리면 안 된다.
+    func stopReplay() {
+        perform { client in try await client.stopReplay() }
+    }
+
     func send(_ control: SOArmRecordControl) {
         perform { client in try await client.control(control) }
     }
@@ -417,6 +444,16 @@ final class SOArmConsoleModel: ObservableObject {
     // MARK: 수집 데이터
 
     /// 수집 데이터 화면이 열렸다. 터널이 서기 전에 목록을 부르면 반드시 실패하므로 기다린다.
+    /// 수집 화면이 열렸다. 데이터셋 목록까지 읽는 이유는 하나뿐이다 — 과제 문장
+    /// 드롭다운이 그 목록에서 나온다. 목록 자체는 이 화면에 그리지 않는다.
+    func recordScreenAppeared() {
+        screenAppeared()
+        Task {
+            await connect()
+            loadDatasets()
+        }
+    }
+
     func datasetsScreenAppeared() {
         screenAppeared()
         Task {
@@ -434,6 +471,7 @@ final class SOArmConsoleModel: ObservableObject {
             do {
                 let list = try await client.datasets()
                 datasets = list
+                loadTasks(for: list)
                 // 앞선 실패가 남아 있으면 목록이 멀쩡히 떠 있는데 붉은 줄이 함께 보인다.
                 errorMessage = nil
                 // 고른 것이 사라졌거나 아직 없으면 첫 줄을 편다. 목록만 있고 아무것도 열려
@@ -446,6 +484,37 @@ final class SOArmConsoleModel: ObservableObject {
             }
             isLoadingDatasets = false
         }
+    }
+
+    /// 과제 문장을 모르는 데이터셋만 골라 한 번씩 더 물어 온다.
+    ///
+    /// 한 번 안 것은 다시 묻지 않는다. 데이터셋은 다시 찍히지 않는 한 과제가 바뀌지
+    /// 않으므로, 새로고침마다 전부 다시 물으면 터널 너머로 같은 답을 반복해 받게 된다.
+    private func loadTasks(for list: [SOArmDatasetSummary]) {
+        let missing = list.map(\.name).filter { datasetTasks[$0] == nil }
+        guard !missing.isEmpty else { return }
+        let client = client
+        Task {
+            for name in missing {
+                guard let detail = try? await client.dataset(name) else { continue }
+                // 한 세션은 과제 하나로 찍는다(`single_task`). 그래도 첫 회의 것을
+                // 집는 대신 실제로 나온 문장을 세어, 나중에 여러 과제가 한 데이터셋에
+                // 들어오더라도 화면이 틀리지 않게 한다.
+                let tasks = detail.episodes.compactMap { $0.task.isEmpty ? nil : $0.task }
+                if let first = tasks.first {
+                    datasetTasks[name] = Set(tasks).count == 1 ? first : "여러 과제"
+                }
+            }
+        }
+    }
+
+    /// 지금까지 쓴 과제 문장들. `데이터 수집` 화면의 드롭다운이 이것을 보여 준다.
+    ///
+    /// 과제 문장은 데이터셋을 묶는 열쇠인데 매번 손으로 치면 `빨간 블록 집기`와
+    /// `빨간 블록을 집는다`가 서로 다른 묶음이 된다. 고를 수 있게 해 두는 것이
+    /// 문자열을 같게 유지하는 유일한 길이다.
+    var knownTasks: [String] {
+        Array(Set(datasetTasks.values)).filter { $0 != "여러 과제" }.sorted()
     }
 
     private func loadDataset(_ name: String) {

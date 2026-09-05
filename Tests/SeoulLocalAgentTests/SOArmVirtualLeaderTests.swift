@@ -604,5 +604,100 @@ struct SOArmVirtualLeaderTests {
         // 모르는 값이 저장되어 있어도 화면이 비지 않는다.
         #expect(SOArmControlMode(rawValue: "wrist") == nil)
     }
+
+    // MARK: 손을 뗀 뒤
+
+    @Test("중력 처짐은 목표를 끌고 내려가지 못한다")
+    func gravitySagDoesNotDragTheGoalDown() throws {
+        // 사용자가 실제로 본 것: 끝점을 끌다 마우스를 떼면 팔이 천천히 쳐진다. 토크는
+        // 걸려 있었다. 원인은 토크가 아니라 목표였다 — 조작하지 않는 동안 목표를 매
+        // 프레임 실제 자세에 붙이면, STS3215의 정상적인 추종오차(중력이 만드는 그
+        // 작은 어긋남)가 30Hz로 새 목표가 되어 서보가 낼 복원 토크가 매 틱 0이 된다.
+        let status = try Self.status()
+        let held = ["shoulder_pan": -44.922, "elbow_flex": 8.0, "gripper": 0.4]
+
+        // 팔을 흉내 낸다. STS3215는 위치 P 제어라 목표를 잡아 두면 팔은 목표보다
+        // `followingError`만큼 아래에서 **멈춘다** — 더 내려가면 오차가 커지고 오차가
+        // 곧 힘이라 도로 올라온다. 실물이 그렇다는 증거는 서버의 `HOLD`에 있다:
+        // `_hold_goal`을 한 번 박아 둔 상태의 팔은 여섯 관절 모두 목표와 실제가
+        // 어긋나지 않은 채로 서 있다.
+        let followingError = 0.8
+        // 이 시험이 성립하려면 추종오차가 놓아 주는 문턱보다 작아야 한다. 문턱을
+        // 이보다 낮추면 처짐이 문턱을 넘고, 목표가 한 계단씩 내려가기 시작한다.
+        let threshold = status.policy.leadDegrees * SOArmTeleopModel.driftShare
+        #expect(followingError < threshold)
+
+        var goal = held
+        var present = held
+        for _ in 0..<200 {
+            present["elbow_flex"] = (goal["elbow_flex"] ?? 0) - followingError
+            goal = SOArmTeleopModel.holding(
+                goal, against: present, spec: status.spec, policy: status.policy
+            )
+        }
+        // 200틱(≈6.7초)이 지나도 목표는 그 자리에 있고, 팔은 그 아래 한 뼘에 서 있다.
+        // 예전 코드는 매 틱 `목표 = 실제`였으므로 여기서 목표가 -152°까지 걸어 내려갔다.
+        #expect(goal["elbow_flex"] == 8.0)
+        #expect(present["elbow_flex"] == 8.0 - followingError)
+        #expect(goal["shoulder_pan"] == -44.922)
+    }
+
+    @Test("사람이 팔을 옮기면 목표는 따라간다")
+    func aHandThatMovesTheArmIsFollowed() throws {
+        let status = try Self.status()
+        let held = ["shoulder_pan": -44.922, "elbow_flex": 8.0, "gripper": 0.4]
+
+        // 문턱(`lead_deg` 12의 1/4 = 3°)을 넘지 않는 어긋남은 잡아 둔다.
+        let small = SOArmTeleopModel.holding(
+            held, against: ["shoulder_pan": -44.922, "elbow_flex": 10.9, "gripper": 0.4],
+            spec: status.spec, policy: status.policy
+        )
+        #expect(small["elbow_flex"] == 8.0)
+
+        // 넘으면 놓아 준다. 그러지 않으면 다음 명령이 팔을 옛 자리로 홱 되돌린다.
+        let large = SOArmTeleopModel.holding(
+            held, against: ["shoulder_pan": -44.922, "elbow_flex": 40.0, "gripper": 0.4],
+            spec: status.spec, policy: status.policy
+        )
+        #expect(large["elbow_flex"] == 40.0)
+        // 움직이지 않은 관절까지 함께 놓아 주지는 않는다.
+        #expect(large["shoulder_pan"] == -44.922)
+
+        // 집게는 퍼센트라 문턱도 퍼센트로 읽는다(`lead_percent` 12의 1/4 = 3%).
+        let gripper = SOArmTeleopModel.holding(
+            held, against: ["shoulder_pan": -44.922, "elbow_flex": 8.0, "gripper": 9.0],
+            spec: status.spec, policy: status.policy
+        )
+        #expect(gripper["gripper"] == 9.0)
+    }
+
+    @Test("아직 목표가 없으면 팔의 지금 자세로 시작한다")
+    func anEmptyTargetStartsFromTheArm() throws {
+        let status = try Self.status()
+        let present = ["shoulder_pan": -44.922, "elbow_flex": 8.0, "gripper": 0.4]
+        let seeded = SOArmTeleopModel.holding(
+            [:], against: present, spec: status.spec, policy: status.policy
+        )
+        #expect(seeded == present)
+    }
+
+    @Test("어느 버튼을 눌러야 하는지가 답인 거절은 그 버튼 이름으로 옮긴다")
+    func aRefusalThatMeansPressAButtonSaysWhichButton() {
+        // 서버는 영어로 "Stop the virtual leader…"라고 적어 보내고, 앱은 그것을 그대로
+        // 보여 주었다. 사용자가 실제로 한 일은 `정지`와 `권한 반납`을 누른 것이었고 —
+        // 그 둘로는 관찰이 꺼지지 않는다. 화면은 "관찰 전용"이라고 적혀 있으니 이미
+        // 멈춘 것으로 읽힌다.
+        let blocked = SOArmError.blocked(
+            "Stop the virtual leader before physical-leader teleoperation: the follower has one owner"
+        )
+        let message = try? #require(blocked.errorDescription)
+        #expect(message?.contains("관찰 끄기") == true)
+        #expect(message?.contains("Stop the virtual leader") == false)
+
+        // 옮길 문장이 없는 거절은 서버가 적어 준 그대로 보여 준다. 그쪽이 언제나 더
+        // 정확하고, 여기에 사전을 쌓기 시작하면 새 거절이 생길 때마다 화면이 낡는다.
+        let other = SOArmError.blocked("Follower calibration is missing")
+        #expect(other.errorDescription == "Follower calibration is missing")
+    }
 }
 #endif

@@ -17,11 +17,14 @@ struct SOArmDatasetsView: View {
 private struct SOArmDatasetsWorkspace: View {
     @ObservedObject var model: SOArmConsoleModel
 
+    @State private var pendingReplay: SOArmStartRequest?
+
     var body: some View {
         WorkspaceScreen(title: AppSection.soarmData.title, subtitle: AppSection.soarmData.subtitle) {
             if let message = model.errorMessage {
                 DismissibleError(message: message) { model.errorMessage = nil }
             }
+            replayPanel
             sparkPanel
             if model.datasets.isEmpty {
                 empty
@@ -52,6 +55,86 @@ private struct SOArmDatasetsWorkspace: View {
         }
         .onAppear { model.datasetsScreenAppeared() }
         .onDisappear { model.screenDisappeared() }
+        .sheet(item: $pendingReplay) { request in
+            SOArmConfirmationSheet(request: request) {
+                guard let dataset = model.selectedDataset, let episode = model.selectedEpisode else { return }
+                model.startReplay(dataset: dataset, episode: episode)
+            }
+        }
+        .animation(.appControl, value: model.status?.replay ?? SOArmReplay())
+    }
+
+    // MARK: 팔로 재생
+
+    private var replay: SOArmReplay { model.status?.replay ?? SOArmReplay() }
+
+    /// 재생이 도는 동안에만 뜬다. **사람 손 없이 팔이 움직이는 유일한 경로**라, 지금 어느
+    /// 단계이고 얼마나 왔는지, 그리고 정지가 화면 맨 위에 있어야 한다.
+    @ViewBuilder
+    private var replayPanel: some View {
+        if replay.running || replay.phase == "error" {
+            GroupBox {
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    HStack(spacing: Spacing.s) {
+                        if replay.isMoving { ProgressView().controlSize(.small) }
+                        Text(replay.phaseTitle).font(.headline)
+                        if let dataset = replay.dataset, let episode = replay.episode {
+                            Text("\(dataset) · \(episode + 1)번째")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("정지", systemImage: "stop.fill") { model.stopReplay() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .keyboardShortcut(".", modifiers: .command)
+                            .disabled(!replay.running || model.isBusy)
+                            .help("팔을 그 자리에 세웁니다. 토크는 걸린 채로 둡니다 — 팔이 든 것을 떨어뜨리지 않기 위해서입니다 (⌘.)")
+                    }
+                    if replay.phase == "aligning" {
+                        // 이때 움직이는 것은 녹화된 동작이 아니라 출발점까지 가는 길이다.
+                        Text("녹화 시작 자세까지 걸어가는 중입니다 · 약 \(String(format: "%.1f", replay.aligningSecondsLeft))초 남음")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ProgressView().progressViewStyle(.linear).tint(.orange)
+                    } else if replay.phase == "replaying" {
+                        Text("\(replay.frame)/\(replay.totalFrames)프레임 · \(String(format: "%.2f", replay.speed))배속")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ProgressView(value: replay.progress).tint(.snuBlue)
+                    }
+                    if let error = replay.error {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// 속도와 시작 버튼. 고른 회가 있어야 누를 수 있다.
+    @ViewBuilder
+    private var replayControls: some View {
+        HStack(spacing: Spacing.s) {
+            Picker("속도", selection: $model.replaySpeed) {
+                ForEach(replay.speeds, id: \.self) { value in
+                    Text("\(String(format: "%.2f", value))배").tag(value)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .disabled(replay.running)
+            Button("팔로 재생", systemImage: "arrow.triangle.2.circlepath") {
+                pendingReplay = .replay
+            }
+            .buttonStyle(.bordered)
+            .tint(.orange)
+            .disabled(model.selectedEpisode == nil || replay.running || model.isModeRunning || model.isBusy)
+            .help(model.isModeRunning
+                  ? "다른 모드가 도는 동안에는 팔을 재생할 수 없습니다"
+                  : "고른 회를 실제 팔에 다시 흘립니다. 먼저 시작 자세까지 천천히 걸어갑니다")
+            Spacer()
+        }
     }
 
     @ViewBuilder
@@ -68,15 +151,62 @@ private struct SOArmDatasetsWorkspace: View {
         }
     }
 
+    /// 과제 문장으로 묶은 세션들. 폴더 두 겹이고, 그 안의 에피소드는 오른쪽 상세에 있다.
+    ///
+    /// **과제가 위, 세션이 아래다.** 학습 데이터를 고르는 축이 세션이 아니라 과제이기
+    /// 때문이다 — "이 과제 시연 전부"가 한 덩이이고, 세션 이름(`soarm101_20260905_072242`)
+    /// 은 타임스탬프라 무엇을 찍은 것인지 한 글자도 말해 주지 않는다.
+    private var groupedDatasets: [(task: String, sessions: [SOArmDatasetSummary])] {
+        var buckets: [String: [SOArmDatasetSummary]] = [:]
+        for dataset in model.datasets {
+            buckets[model.datasetTasks[dataset.name] ?? Self.unknownTask, default: []].append(dataset)
+        }
+        return buckets
+            .map { (task: $0.key, sessions: $0.value.sorted { ($0.recordedAt ?? .distantPast) > ($1.recordedAt ?? .distantPast) }) }
+            // 아직 과제를 못 읽은 묶음은 언제나 맨 아래. 잠깐 있다 사라지는 줄이 목록
+            // 첫머리를 차지하면 그때마다 아래 줄들이 밀린다.
+            .sorted { a, b in
+                if (a.task == Self.unknownTask) != (b.task == Self.unknownTask) { return b.task == Self.unknownTask }
+                return a.task < b.task
+            }
+    }
+
+    private static let unknownTask = "과제를 읽는 중"
+
     private var datasetList: some View {
-        VStack(alignment: .leading, spacing: Spacing.s) {
-            ForEach(model.datasets) { dataset in
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            ForEach(groupedDatasets, id: \.task) { group in
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    HStack(spacing: Spacing.xs) {
+                        Image(systemName: group.task == Self.unknownTask ? "folder.badge.questionmark" : "folder.fill")
+                            .font(.caption)
+                            .foregroundStyle(Color.snuBlueLabel)
+                        Text(group.task)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
+                        Text("\(group.sessions.reduce(0) { $0 + $1.episodes })회")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    sessionRows(group.sessions)
+                }
+            }
+        }
+    }
+
+    private func sessionRows(_ sessions: [SOArmDatasetSummary]) -> some View {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+            ForEach(sessions) { dataset in
                 Button {
                     model.selectedDataset = dataset.name
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: Spacing.xs) {
-                            Text(dataset.name)
+                            // 세션의 이름표는 찍은 시각이다. `soarm101_20260905_072242`는
+                            // 그 시각을 사람이 못 읽는 모양으로 적어 둔 것뿐이고, 전체
+                            // 이름은 오른쪽 상세에 그대로 있다.
+                            Text(dataset.recordedAt?.formatted(date: .abbreviated, time: .shortened) ?? dataset.name)
                                 .font(.callout.weight(.medium))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
@@ -87,12 +217,9 @@ private struct SOArmDatasetsWorkspace: View {
                                     .help("학습 서버에 있습니다")
                             }
                         }
-                        Text("에피소드 \(dataset.episodes)개 · \(SOArmFormat.duration(dataset.seconds))")
+                        Text("에피소드 \(dataset.episodes)개 · \(SOArmFormat.duration(dataset.seconds)) · \(SOArmFormat.size(dataset.sizeBytes))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text("\(SOArmFormat.size(dataset.sizeBytes))\(dataset.recordedAt.map { " · " + $0.formatted(date: .numeric, time: .shortened) } ?? "")")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(Spacing.s)
@@ -101,6 +228,7 @@ private struct SOArmDatasetsWorkspace: View {
                 .contentCard(selected: model.selectedDataset == dataset.name)
             }
         }
+        .padding(.leading, Spacing.m)
     }
 
     @ViewBuilder
@@ -280,6 +408,13 @@ private struct SOArmDatasetsWorkspace: View {
     }
 
     private func episodes(_ list: [SOArmEpisode]) -> some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            episodeRows(list)
+            replayControls
+        }
+    }
+
+    private func episodeRows(_ list: [SOArmEpisode]) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(list) { episode in
                 if episode.index != list.first?.index { Divider() }

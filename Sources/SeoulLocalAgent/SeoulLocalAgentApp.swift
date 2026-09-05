@@ -2524,6 +2524,7 @@ private struct MainWorkspaceView: View {
                 case .briefingCalendar: BriefingCalendarView(controller: controller)
                 case .soarm: SOArmView(controller: controller)
                 case .soarmTeleop: SOArmTeleopView(controller: controller)
+                case .soarmRecord: SOArmRecordView(controller: controller)
                 case .soarmData: SOArmDatasetsView(controller: controller)
                 }
             }

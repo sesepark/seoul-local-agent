@@ -34,7 +34,6 @@ private struct SOArmWorkspace: View {
             }
             diagnosis
             cameras
-            recording
             logs
             safetyNote
         }
@@ -51,12 +50,10 @@ private struct SOArmWorkspace: View {
             SOArmTorqueReleaseSheet(gate: gate) { model.releaseTorque(arm: gate.arm) }
         }
         .sheet(item: $pending) { request in
-            SOArmConfirmationSheet(request: request) {
-                switch request {
-                case .teleoperation: model.startTeleoperation()
-                case .recording: model.startRecording()
-                }
-            }
+            // 이 화면에서 시작하는 것은 물리 리더 텔레옵 하나뿐이다. 데이터 수집은
+            // `데이터 수집` 화면으로 옮겼다 — 찍는 동안 알아야 하는 것과 팔을 조작할 때
+            // 알아야 하는 것이 서로 다르고, 한 화면에 있으면 둘 다 잘 보이지 않는다.
+            SOArmConfirmationSheet(request: request) { model.startTeleoperation() }
         }
         .onAppear { model.screenAppeared() }
         .onDisappear { model.screenDisappeared() }
@@ -127,7 +124,11 @@ private struct SOArmWorkspace: View {
                     .tint(.snuBlue)
                     .toolbarKeepsTitle()
                     .disabled(model.status?.teleopReady != true || model.isModeRunning || model.isBusy)
-                    .help("현장 확인과 확인 문구를 거쳐 리더 팔의 움직임을 팔로워에 전달합니다")
+                    // 못 누르는 버튼은 **왜** 못 누르는지를 말해야 한다. 여기서 막히는
+                    // 가장 흔한 이유가 가상 리더의 관찰이고, 그것은 이 화면에 없는
+                    // 버튼으로 끈다 — 이유를 적지 않으면 회색 버튼만 남는다.
+                    .help(model.status?.followerHeldElsewhere
+                          ?? "현장 확인과 확인 문구를 거쳐 리더 팔의 움직임을 팔로워에 전달합니다")
             }
         }
     }
@@ -254,110 +255,16 @@ private struct SOArmWorkspace: View {
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { cameraRowWidth = $0 }
     }
 
-    // MARK: 데이터 수집
-
-    private var recording: some View {
-        GroupBox("데이터 수집") {
-            VStack(alignment: .leading, spacing: Spacing.m) {
-                if model.status?.recording.running == true {
-                    runningRecording
-                } else {
-                    recordingSetup
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private var recordingSetup: some View {
-        VStack(alignment: .leading, spacing: Spacing.m) {
-            TextField("무엇을 시연하는지 한 문장으로", text: $model.recordTask, axis: .vertical)
-                .lineLimit(1...3)
-                .textFieldStyle(.roundedBorder)
-            HStack(spacing: Spacing.l) {
-                // 몇 번 찍을지는 묻지 않는다. 될 때까지 찍다가 `수집 종료`로 끝내는 일이고,
-                // 시작 전에 정할 수 있는 숫자가 아니다.
-                Stepper("한 회 최대 \(model.recordSeconds)초", value: $model.recordSeconds, in: 5...300, step: 5)
-                Spacer()
-                Button("수집 시작", systemImage: "record.circle") { pending = .recording }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.snuBlue)
-                    .disabled(
-                        model.status?.recordReady != true
-                        || model.isModeRunning
-                        || model.isBusy
-                        || model.recordTask.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
-            }
-            Text("`수집 종료`를 누를 때까지 계속 찍습니다. 한 회는 위 시간이 지나거나 `성공 저장`·`다시 찍기`를 누르면 끝납니다. 서버의 `data/`에 LeRobot 데이터셋으로 남고 Hub로 올라가지 않으며, 시작하면 카메라 프리뷰는 자동으로 내려갑니다.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            // 프리뷰 화질은 골라 두어도 수집에는 따라오지 않는다. 그 사실을 시작 버튼 옆에
-            // 적어 두지 않으면, 1280×720으로 보다가 그대로 찍힌 줄 알기 딱 좋다.
-            Label(
-                "카메라는 두 대 모두 \(model.status?.recordingProfile.text ?? SOArmCameraProfile.recordingDefault.text)로 고정해 찍습니다. 프리뷰에서 고른 화질·프레임은 보기 위한 것이고 수집에는 쓰이지 않습니다 — VLA 학습용 데이터셋은 회차마다 카메라 설정이 달라지면 못 씁니다.",
-                systemImage: "lock"
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-    }
-
-    private var runningRecording: some View {
-        VStack(alignment: .leading, spacing: Spacing.m) {
-            HStack(spacing: Spacing.s) {
-                ProgressView().controlSize(.small)
-                Text(model.status?.recordingRuntime?.phaseTitle ?? "수집 중")
-                    .font(.headline)
-                if let dataset = model.status?.recordingRuntime?.datasetName {
-                    Text(dataset)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-                Spacer()
-            }
-            if let task = model.status?.recordingRuntime?.task, !task.isEmpty {
-                Text(task).font(.callout).foregroundStyle(.secondary)
-            }
-            HStack(spacing: Spacing.s) {
-                // 성공이 가장 자주 눌리는 버튼이라 하나만 prominent다. 셋을 똑같이 그리면
-                // 시연이 끝난 직후 어느 것을 눌러야 하는지 매번 읽어야 한다.
-                Button(SOArmRecordControl.success.title, systemImage: SOArmRecordControl.success.symbol) {
-                    model.send(.success)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.snuBlue)
-                .disabled(model.isBusy)
-                .help(SOArmRecordControl.success.help)
-
-                Button(SOArmRecordControl.retry.title, systemImage: SOArmRecordControl.retry.symbol) {
-                    model.send(.retry)
-                }
-                .buttonStyle(.bordered)
-                .tint(.orange)
-                .disabled(model.isBusy)
-                .help(SOArmRecordControl.retry.help)
-
-                Button(SOArmRecordControl.stop.title, systemImage: SOArmRecordControl.stop.symbol) {
-                    model.send(.stop)
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
-                .disabled(model.isBusy)
-                .help(SOArmRecordControl.stop.help)
-            }
-        }
-    }
-
     // MARK: 로그
 
     @ViewBuilder
     private var logs: some View {
-        let lines = model.status?.visibleLogs ?? []
+        // 수집 로그는 `데이터 수집` 화면이 따로 보여 준다. 두 화면이 같은 로그 상자를
+        // 그리면, 텔레옵이 왜 멈췄는지 보러 온 사람이 수집 로그를 읽게 된다.
+        let lines = model.status?.teleop.logs ?? []
         if !lines.isEmpty {
             VStack(alignment: .leading, spacing: Spacing.s) {
-                Text("실행 로그").font(.callout).foregroundStyle(.secondary)
+                Text("텔레옵 로그").font(.callout).foregroundStyle(.secondary)
                 ScrollView {
                     Text(lines.suffix(60).joined(separator: "\n"))
                         .font(.system(.caption, design: .monospaced))
@@ -440,12 +347,16 @@ enum SOArmCameraLayout {
 
 // MARK: - 카메라 카드
 
-private struct SOArmCameraCard: View {
+struct SOArmCameraCard: View {
     let role: SOArmCameraRole
     let viewportHeight: CGFloat
     let camera: SOArmCamera
     let recordingProfile: SOArmCameraProfile
     let isRecording: Bool
+    /// 화질·프레임을 고를 수 있는가. 데이터 수집 화면에서는 거짓이다 — 그 화면의 카메라는
+    /// 구도를 잡으라고 있는 것이지 고르라고 있는 것이 아니고, 수집은 언제나 같은 값으로
+    /// 찍는다. 비활성 메뉴를 남겨 두면 고를 수 있는 것처럼 보인다.
+    var showsSettings = true
     @ObservedObject var stream: MJPEGStream
     let enabled: Bool
     /// 영상 받기를 꺼 두었는가. 서버가 못 주는 것과 우리가 안 받는 것은 다른 일이다.
@@ -462,7 +373,7 @@ private struct SOArmCameraCard: View {
                     Text(role.title).font(.headline)
                 }
                 Spacer()
-                settings
+                if showsSettings { settings }
                 if stream.isRunning {
                     Button("중지", systemImage: "stop.fill", action: stop)
                         .buttonStyle(.bordered)
@@ -658,27 +569,41 @@ private struct SOArmTorqueReleaseSheet: View {
     }
 }
 
-private enum SOArmStartRequest: String, Identifiable {
-    case teleoperation, recording
+enum SOArmStartRequest: String, Identifiable {
+    case teleoperation, recording, replay
 
     var id: String { rawValue }
 
     var title: String {
-        self == .teleoperation ? "텔레오퍼레이션 시작" : "데이터 수집 시작"
+        switch self {
+        case .teleoperation: "텔레오퍼레이션 시작"
+        case .recording: "데이터 수집 시작"
+        case .replay: "찍은 시연을 팔에 재생"
+        }
     }
 
     var copy: String {
-        self == .teleoperation
-            ? "두 팔을 서로 대응하는 비슷한 자세로 맞춘 뒤 시작하세요. 리더의 관절값이 팔로워로 전달되며, 프레임당 상대 목표는 서버가 제한합니다."
-            : "카메라 프리뷰를 내리고 새 로컬 데이터셋 세션을 시작합니다. 수집 중에는 성공·재시도·종료만 조작할 수 있습니다."
+        switch self {
+        case .teleoperation:
+            "두 팔을 서로 대응하는 비슷한 자세로 맞춘 뒤 시작하세요. 리더의 관절값이 팔로워로 전달되며, 프레임당 상대 목표는 서버가 제한합니다."
+        case .recording:
+            "카메라 프리뷰를 내리고 새 로컬 데이터셋 세션을 시작합니다. 수집 중에는 성공·재시도·종료만 조작할 수 있습니다."
+        case .replay:
+            // 사람 손 없이 팔이 움직이는 유일한 경로다. 확인 문구 앞에서 그 사실을 그대로 적는다.
+            "**사람이 조종하지 않는 상태로 팔이 움직입니다.** 먼저 시작 자세까지 천천히 걸어간 뒤(관절 초당 20도 이하) 녹화된 동작을 흘립니다. 시작 자세가 60도 넘게 떨어져 있으면 서버가 거절합니다. 재생 중에는 `정지`가 언제나 듣습니다."
+        }
     }
 
     var startTitle: String {
-        self == .teleoperation ? "텔레옵 시작" : "수집 시작"
+        switch self {
+        case .teleoperation: "텔레옵 시작"
+        case .recording: "수집 시작"
+        case .replay: "재생 시작"
+        }
     }
 }
 
-private struct SOArmConfirmationSheet: View {
+struct SOArmConfirmationSheet: View {
     let request: SOArmStartRequest
     let confirm: () -> Void
 
