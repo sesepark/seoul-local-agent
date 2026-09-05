@@ -233,6 +233,17 @@ struct SOArmStatus: Sendable, Equatable {
     /// 있었다 — 그래서 `텔레옵 시작`이 눌리는 채로 남아 있다가, 누르면 영어 409 한 줄을
     /// 돌려주었다. 막힌 것을 **누르기 전에** 말해야 한다.
     var virtualLeaderRunning = false
+    /// 서버가 할 수 있다고 스스로 적어 보낸 것들.
+    ///
+    /// 앱이 서버보다 먼저 올라가는 일이 있다. 그때 새 단추가 먼저 나와 있으면 눌러도
+    /// 서버가 모르는 요청이라 409·404가 돌아오고, 화면은 고장 난 것처럼 보인다. 그래서
+    /// 서버 쪽에 새로 생긴 일(찍는 회 버리기, 이어 찍기, 수집 중 프리뷰, 삭제, 학습 시작…)은
+    /// 서버가 이 목록에 이름을 적어 보낼 때만 화면에 나온다. 옛 서버는 빈 목록이고, 그때
+    /// 화면은 예전과 똑같이 동작한다.
+    var capabilities: Set<String> = []
+
+    /// 서버가 이 일을 할 수 있다고 말했는가.
+    func can(_ capability: SOArmCapability) -> Bool { capabilities.contains(capability.rawValue) }
 
     /// 팔로워를 다른 것이 쥐고 있어서 시작할 수 없다면, 그 이유와 풀 방법.
     var followerHeldElsewhere: String? {
@@ -297,8 +308,33 @@ struct SOArmStatus: Sendable, Equatable {
         }
         status.virtualLeaderRunning = root.soarmDict("virtual_leader").soarmBool("running")
         status.replay = SOArmReplay(root.soarmDict("replay"))
+        status.capabilities = Set(root.soarmStrings("capabilities"))
         return status
     }
+}
+
+/// 서버가 `/api/status`의 `capabilities`에 적어 보내는 이름들. 서버 저장소의 같은 이름과
+/// 글자까지 같아야 한다 — 여기서 이름이 어긋나면 그 기능은 조용히 나오지 않는다.
+enum SOArmCapability: String, Sendable {
+    /// `POST /api/recording/control {"key": "abort"}` — 찍는 중인 회를 버리고 수집을 끝낸다.
+    case abort
+    /// `POST /api/recording/start`에 `dataset`·`resume`을 넣어 기존 데이터셋에 회를 이어 붙인다.
+    case resume
+    /// `GET /api/recording/preview/{scene|wrist}.jpg` — 수집 중 카메라 스냅숏.
+    case preview
+    /// 데이터셋 목록의 `quality`(루프 속도·중복 프레임·느린 루프 경고)와 `tasks`.
+    case quality
+    /// `DELETE /api/datasets/{name}` · `DELETE /api/datasets/{name}/episodes/{index}`.
+    case delete
+    /// `POST /api/spark/train` · `POST /api/spark/runs/{run}/stop` · `runs[].training`.
+    case train
+    /// `GET /api/replay/preview` — 재생 전에 관절별 거리와 정렬 시간을 미리 본다.
+    case replayPreview = "replay_preview"
+    /// 텔레옵·수집을 시작할 때 팔로워가 리더 자세까지 천천히 걸어간다(첫 틱에 튀지 않는다).
+    case softStart = "soft_start"
+    /// 수집이 서보의 부하·속도·온도·전압·상태와 프레임 시각·카메라 새 프레임 여부를 별도 열로
+    /// 함께 저장한다. `observation.state`는 그대로 위치 여섯 개다.
+    case sensorExtras = "sensor_extras"
 }
 
 enum SOArmMode: String, Sendable, Equatable {
@@ -449,6 +485,27 @@ struct SOArmRecordingRuntime: Sendable, Equatable {
     var cameraFreshHz: [String: Double] = [:]
     /// 그중 직전과 같은 프레임이었던 비율(%).
     var cameraStalePct: [String: Double] = [:]
+    /// 회 사이 정리 구간이 시작한 시각. 서버가 `resetting`에 함께 적어 보낸다.
+    ///
+    /// 이 값이 없던 동안 화면은 "다음 회 준비 중"만 적었고, 사람은 15초를 그냥 기다렸다.
+    /// LeRobot의 reset 루프도 `exit_early`를 듣기 때문에 ⌘⏎로 곧바로 다음 회를 시작할 수
+    /// 있는데, 몇 초 남았는지 모르는 화면에서는 그 사실이 보이지 않는다.
+    var resetStartedAt: Date?
+    var resetSeconds: Int?
+    /// 지금까지 데이터셋에 실제로 저장된 회의 수. 끝난 뒤 요약 카드가 이 값을 적는다.
+    var episodesSaved: Int?
+    /// 기존 데이터셋에 이어 찍은 회차인가.
+    var resumed = false
+    /// 서버가 받아 주지 않은 마지막 조작. 회 사이 저장 중처럼 LeRobot의 루프가 돌지 않는
+    /// 동안 온 키는 다음 회 첫 틱에서 읽혀 그 회를 0프레임으로 끝내므로, 서버가 버리고
+    /// 여기에 적어 준다. 앱은 그것을 몇 초 보여 준다 — 눌렀는데 아무 일도 없으면 사람은
+    /// 다시 누른다.
+    var lastControlIgnored: String?
+    var lastControlIgnoredAt: Date?
+    /// 프레임 0장으로 끝나 저장하지 않고 건너뛴 회의 수. 예전에는 이것이 세션을 죽였다.
+    var emptyEpisodesSkipped = 0
+    /// 직전 저장(영상 굽기)에 걸린 초. 스트리밍 인코딩이 켜져 있으면 1초 안쪽이다.
+    var savingSecondsEstimate: Double?
 
     init(_ json: [String: Any]) {
         phase = json.soarmString("phase")
@@ -463,14 +520,43 @@ struct SOArmRecordingRuntime: Sendable, Equatable {
         loopHz = (json["loop_hz"] as? NSNumber)?.doubleValue
         cameraFreshHz = json.soarmDict("camera_fresh_hz").compactMapValues { ($0 as? NSNumber)?.doubleValue }
         cameraStalePct = json.soarmDict("camera_stale_pct").compactMapValues { ($0 as? NSNumber)?.doubleValue }
+        if let seconds = (json["reset_started_at"] as? NSNumber)?.doubleValue, seconds > 0 {
+            resetStartedAt = Date(timeIntervalSince1970: seconds)
+        }
+        resetSeconds = json.soarmInt("reset_seconds")
+        episodesSaved = json.soarmInt("episodes_saved")
+        resumed = json.soarmBool("resumed")
+        let ignored = json.soarmDict("last_control_ignored")
+        lastControlIgnored = ignored.soarmString("key")
+        if let at = (ignored["at"] as? NSNumber)?.doubleValue, at > 0 {
+            lastControlIgnoredAt = Date(timeIntervalSince1970: at)
+        }
+        emptyEpisodesSkipped = json.soarmInt("empty_episodes_skipped") ?? 0
+        savingSecondsEstimate = json.soarmDouble("saving_seconds_estimate")
     }
+
+    /// 몇 초 안에 서버가 버린 조작이 있으면 그 키. 화면이 잠깐 알려 주는 데 쓴다.
+    func recentlyIgnoredControl(now: Date = Date()) -> String? {
+        guard let key = lastControlIgnored, let at = lastControlIgnoredAt, now.timeIntervalSince(at) < 6 else { return nil }
+        return key
+    }
+
+    var isRecordingEpisode: Bool { phase == "recording" }
+    var isResetting: Bool { phase == "resetting" }
+    /// LeRobot이 방금 찍은 회를 영상으로 굽는 동안. **텔레옵 루프가 서 있다** — 이때 리더를
+    /// 움직이면 다음 회가 시작되는 순간 팔로워가 그 자리로 한 번에 따라붙는다.
+    var isSaving: Bool { phase == "saving" }
+    var isFinished: Bool { phase == "complete" || phase == "error" }
 
     var phaseTitle: String {
         switch phase {
-        case "starting": "시작하는 중"
+        case "starting": "모터와 카메라를 여는 중"
+        // 부드러운 시작. 팔로워가 리더 자세까지 걸어가는 구간이고, 아직 찍지 않는다.
+        case "aligning": "리더 자세로 가는 중"
         case "recording": "수집 중"
         // 회와 회 사이. 이때는 팔을 제자리로 돌려놓는 시간이고 남은 시간을 세면 안 된다.
         case "resetting": "다음 회 준비 중"
+        case "saving": "저장 중"
         case "complete": "완료"
         case "error": "오류로 끝남"
         default: phase ?? "—"
@@ -579,6 +665,13 @@ struct SOArmArmDiagnostic: Sendable, Equatable {
     var torqueDisabled = false
     /// 사람이 읽을 전압 범위. 한 모터만 보면 다른 모터의 이상을 놓친다.
     var voltageRange: (low: Double, high: Double)?
+    /// 여섯 모터 가운데 가장 뜨거운 것(°C). 서버가 진단에 온도를 실어 줄 때만 있다.
+    ///
+    /// 토크가 걸린 팔은 중력을 버티며 계속 뜨거워진다. 토크가 더는 시작을 막지 않으므로,
+    /// 토크를 언제 풀어 쉬게 할지는 이 숫자를 보고 사람이 정한다. 토크가 꺼진 모터는
+    /// 이 값이 0으로 올라오는데, 그것은 읽기 실패가 아니라 그 모터가 온도를 갱신하지 않는
+    /// 것이다(서버 RUNBOOK 1.0절).
+    var maxTemperature: Int?
 
     init(role: String, _ json: [String: Any]) {
         self.role = role
@@ -590,6 +683,8 @@ struct SOArmArmDiagnostic: Sendable, Equatable {
         respondingMotors = models.values.filter { !($0 is NSNull) }.count
         let torque = json.soarmDict("torque_enabled").values.compactMap { ($0 as? NSNumber)?.intValue }
         torqueDisabled = !torque.isEmpty && torque.allSatisfy { $0 == 0 }
+        let temperatures = json.soarmDict("temperature").values.compactMap { ($0 as? NSNumber)?.intValue }.filter { $0 > 0 }
+        maxTemperature = temperatures.max()
         // 가장 낮은 모터를 쓴다. 사전의 `values`에서 아무거나 하나 집으면 순서가 정해져 있지
         // 않아 폴링마다 다른 모터의 값이 표시되고, 숫자가 이유 없이 오르내리는 것처럼 보인다.
         // 여섯 개 중 가장 낮은 값이 팔의 상태를 가장 먼저 말해 주기도 한다.
@@ -623,27 +718,43 @@ struct SOArmArmDiagnostic: Sendable, Equatable {
 
     var summary: String {
         if let error, !error.isEmpty { return "\(title) \(error)" }
-        return "\(title) \(healthy ? "정상" : "이상") \(voltageText)"
+        var text = "\(title) \(healthy ? "정상" : "이상") \(voltageText)"
+        if let maxTemperature { text += " · 최고 \(maxTemperature)°C" }
+        if !torqueDisabled { text += " · 토크 걸림" }
+        return text
     }
+
+    /// 온도 경고선. 서버의 가상 리더 사다리와 같은 숫자다(경고 58°C, 정지 65°C). 서보 자신은
+    /// 70°C에서 토크를 끊는다 — 팔이 떨어진다.
+    var isHot: Bool { (maxTemperature ?? 0) >= 58 }
 }
 
 // MARK: - 녹화 제어
 
-/// 녹화 중 누르는 세 가지.
+/// 녹화 중 누르는 것들.
 ///
-/// **화면 문구와 전송값이 다르다.** 서버의 `record_manager.control()`은 `right` · `left` ·
-/// `esc` 세 값만 받고 나머지는 409로 거절한다(LeRobot의 키보드 리스너를 파일로 흉내 낸 것이라
-/// 그 키 이름을 그대로 쓴다). 사람이 읽을 이름은 여기서만 붙인다.
+/// **화면 문구와 전송값이 다르다.** 서버의 `record_manager.control()`은 LeRobot 키보드
+/// 리스너의 키 이름(`right` · `left` · `esc`)과, 서버가 더한 `abort`를 받고 나머지는 409로
+/// 거절한다. 사람이 읽을 이름은 여기서만 붙인다.
+///
+/// `esc`와 `abort`의 차이가 요점이다. LeRobot의 `esc`는 `stop_recording`과 `exit_early`를
+/// 함께 세우는데, 기록 루프를 빠져나온 뒤 `save_episode()`가 **그대로 돈다** — 찍다 만 회가
+/// 데이터셋에 들어간다. 실제로 오늘 82프레임(2.7초)짜리 회가 그렇게 저장됐다. `abort`는
+/// 거기에 `rerecord_episode`를 더해 버퍼를 비우고 끝낸다.
 enum SOArmRecordControl: String, CaseIterable, Sendable {
     case success = "right"
     case retry = "left"
+    /// 지금 회를 **저장하고** 끝낸다. reset 구간에서는 앞 회가 이미 완성이라 이것이 맞다.
     case stop = "esc"
+    /// 지금 찍는 회를 **버리고** 끝낸다. 서버가 `abort`를 알 때만 보낼 수 있다.
+    case abort = "abort"
 
     var title: String {
         switch self {
-        case .success: "성공 저장"
+        case .success: "지금 저장"
         case .retry: "다시 찍기"
-        case .stop: "수집 종료"
+        case .stop: "저장하고 끝내기"
+        case .abort: "버리고 끝내기"
         }
     }
 
@@ -652,14 +763,16 @@ enum SOArmRecordControl: String, CaseIterable, Sendable {
         case .success: "checkmark.circle.fill"
         case .retry: "arrow.counterclockwise"
         case .stop: "stop.fill"
+        case .abort: "xmark.circle.fill"
         }
     }
 
     var help: String {
         switch self {
-        case .success: "이번 시연을 데이터셋에 저장하고 다음 에피소드로 넘어갑니다"
-        case .retry: "이번 시연을 버리고 같은 에피소드를 다시 찍습니다"
-        case .stop: "남은 에피소드를 포기하고 수집을 끝냅니다"
+        case .success: "이번 시연을 데이터셋에 저장하고, 남은 시간을 기다리지 않고 다음 회로 넘어갑니다"
+        case .retry: "이번 시연을 버리고 같은 회를 다시 찍습니다"
+        case .stop: "지금 회를 저장하고 수집을 끝냅니다"
+        case .abort: "지금 찍는 회는 버리고 수집을 끝냅니다. 저장하려면 먼저 `지금 저장`을 누르세요"
         }
     }
 }
@@ -728,22 +841,81 @@ struct SOArmClient: Sendable {
         _ = try await send("/api/replay/stop", method: "POST", timeout: 15)
     }
 
-    func startRecording(confirmation: String, task: String, episodes: Int, episodeSeconds: Int) async throws {
+    func startRecording(
+        confirmation: String, task: String, episodes: Int, episodeSeconds: Int,
+        resumeDataset: String? = nil
+    ) async throws {
         _ = try await send(
             "/api/recording/start",
             method: "POST",
-            body: [
-                "confirmation": confirmation,
-                "task": task,
-                "episodes": episodes,
-                "episode_seconds": episodeSeconds,
-            ],
+            body: Self.recordingBody(
+                confirmation: confirmation, task: task, episodes: episodes,
+                episodeSeconds: episodeSeconds, resumeDataset: resumeDataset
+            ),
             timeout: 60
         )
     }
 
+    /// `POST /api/recording/start`의 본문. 화면에서 떼어 둔 것은 이어 찍기가 실제로 무엇을
+    /// 보내는지 시험으로 박아 두기 위해서다.
+    ///
+    /// `resumeDataset`이 있으면 `dataset`과 `resume: true`가 함께 간다. 옛 서버는 두 키를
+    /// 모르고 지나쳐 새 데이터셋을 만들므로, 화면은 서버가 `resume`을 할 수 있다고 말했을
+    /// 때만 이 값을 넣는다.
+    static func recordingBody(
+        confirmation: String, task: String, episodes: Int, episodeSeconds: Int, resumeDataset: String?
+    ) -> [String: any Sendable] {
+        var body: [String: any Sendable] = [
+            "confirmation": confirmation,
+            "task": task,
+            "episodes": episodes,
+            "episode_seconds": episodeSeconds,
+        ]
+        if let resumeDataset, !resumeDataset.isEmpty {
+            body["dataset"] = resumeDataset
+            body["resume"] = true
+        }
+        return body
+    }
+
     func control(_ key: SOArmRecordControl) async throws {
         _ = try await send("/api/recording/control", method: "POST", body: ["key": key.rawValue], timeout: 15)
+    }
+
+    /// 수집 중 카메라 스냅숏. LeRobot이 카메라를 쥐고 있어 MJPEG 프리뷰는 열리지 않으므로,
+    /// 기록 루프가 몇 Hz로 떨어뜨려 두는 JPEG 한 장을 대신 받는다.
+    func recordingPreviewURL(_ role: SOArmCameraRole) -> URL {
+        baseURL.appending(path: "api/recording/preview/\(role.rawValue).jpg")
+    }
+
+    /// 한 회의 관절 궤적. 영상에서는 멀쩡해 보이는 회가 관절 곡선에서는 튀어 있는 것이
+    /// 실제 문제라, 같은 시간축에서 본다.
+    func trajectory(_ name: String, episode: Int) async throws -> SOArmTrajectory {
+        try SOArmTrajectory.parse(
+            try await send("/api/datasets/\(name)/episodes/\(episode)/trajectory", method: "GET", timeout: 30)
+        )
+    }
+
+    /// 데이터셋 하나를 지운다. 서버는 바로 지우지 않고 `data/.trash`로 옮긴다.
+    func deleteDataset(_ name: String) async throws {
+        _ = try await send("/api/datasets/\(name)", method: "DELETE", timeout: 120)
+    }
+
+    /// 한 회만 지운다. 영상을 다시 굽는 일이라 데이터셋이 크면 몇 분이 걸린다.
+    func deleteEpisode(_ name: String, index: Int) async throws {
+        _ = try await send("/api/datasets/\(name)/episodes/\(index)", method: "DELETE", timeout: 900)
+    }
+
+    /// 재생을 시작하기 전에, 팔이 지금 서 있는 자리에서 에피소드 첫 자세까지 관절마다 얼마나
+    /// 떨어져 있고 정렬에 몇 초가 걸릴지를 미리 본다.
+    func replayPreview(dataset: String, episode: Int) async throws -> SOArmReplayPreview {
+        try SOArmReplayPreview.parse(
+            try await send(
+                "/api/replay/preview", method: "GET",
+                query: [URLQueryItem(name: "dataset", value: dataset), URLQueryItem(name: "episode", value: String(episode))],
+                timeout: 30
+            )
+        )
     }
 
     /// 비상 중지 성격의 명시적 사용자 액션. 도는 모드가 무엇이든 전부 내린다.
@@ -835,10 +1007,35 @@ struct SOArmClient: Sendable {
         _ = try await send("/api/spark/runs/\(run)/\(step)", method: "POST", timeout: 1800)
     }
 
+    /// 학습을 시작한다. 콘솔 서버가 학습 서버의 tmux 안에 띄우므로 이 요청은 곧 돌아오고,
+    /// 진행은 `sparkRuns()`의 `training`으로 본다. 돌려주는 값은 실행 이름이다.
+    func startTraining(dataset: String, policy: SOArmTrainingPolicy) async throws -> String {
+        let data = try await send(
+            "/api/spark/train", method: "POST",
+            body: ["dataset": dataset, "policy": policy.rawValue],
+            timeout: 120
+        )
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let run = json.soarmString("run") else {
+            throw SOArmError.badResponse("학습 시작 응답에 실행 이름이 없습니다")
+        }
+        return run
+    }
+
+    /// 도는 학습을 세운다. 지금까지 남긴 체크포인트는 그대로 남는다.
+    func stopTraining(run: String) async throws {
+        _ = try await send("/api/spark/runs/\(run)/stop", method: "POST", timeout: 30)
+    }
+
     // MARK: 전송
 
-    private func send(_ path: String, method: String, body: [String: any Sendable]? = nil, timeout: TimeInterval, motionToken: String = "") async throws -> Data {
-        var request = URLRequest(url: baseURL.appending(path: path.hasPrefix("/") ? String(path.dropFirst()) : path))
+    private func send(
+        _ path: String, method: String, body: [String: any Sendable]? = nil,
+        query: [URLQueryItem]? = nil, timeout: TimeInterval, motionToken: String = ""
+    ) async throws -> Data {
+        var url = baseURL.appending(path: path.hasPrefix("/") ? String(path.dropFirst()) : path)
+        if let query, !query.isEmpty { url.append(queryItems: query) }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -933,6 +1130,46 @@ enum SOArmServerText {
             ("Clear the fault before arming",
              "멈춘 이유를 먼저 확인해 주세요. `확인하고 계속`을 누르면 지금 자세에서 다시 시작합니다."),
             ("Confirmation phrase does not match", "확인 문구가 맞지 않습니다."),
+            // 시작 전 진단. 옛 서버는 토크가 걸린 팔도 여기서 막았고, 그 영어 한 줄이 화면
+            // 한가운데 떠 있었다 — 세션마다.
+            ("Hardware doctor did not pass",
+             "시작 전 진단을 통과하지 못했습니다. 모터가 모두 응답하고 전원이 켜져 있는지 확인하세요. 서버가 옛 버전이면 토크가 걸린 팔도 여기서 막힙니다 — 그때는 SO-ARM 101 화면의 `환경 진단` → `토크 해제`입니다."),
+            ("Read-only hardware doctor did not confirm",
+             "시작 전 진단을 통과하지 못했습니다. 모터가 모두 응답하고 전원이 켜져 있는지 확인하세요. 서버가 옛 버전이면 토크가 걸린 팔도 여기서 막힙니다 — 그때는 `환경 진단` → `토크 해제`입니다."),
+            ("Missing motor IDs", "응답하지 않는 모터가 있습니다. 전원과 케이블을 확인하세요"),
+            ("Device is owned by",
+             "다른 프로세스가 그 장치를 쥐고 있습니다. 도는 모드(텔레옵·수집·재생·관찰)를 먼저 끝내세요."),
+            ("camera is already in use",
+             "카메라를 다른 것이 쓰고 있습니다. 프리뷰와 폰 화면을 닫고 다시 시작하세요."),
+            ("Recording is already running", "수집이 이미 돌고 있습니다."),
+            ("Recording is not running", "수집이 돌고 있지 않습니다."),
+            ("Unknown recording control",
+             "서버가 이 조작을 모릅니다. 서버를 최신으로 올리면 `버리고 끝내기`를 쓸 수 있습니다."),
+            ("Cannot inspect serial buses during an active mode",
+             "모드가 도는 동안에는 진단을 돌릴 수 없습니다. 먼저 멈추세요."),
+            ("Stop the running mode before releasing torque",
+             "도는 모드를 먼저 끝낸 뒤에 토크를 풀 수 있습니다."),
+            ("Stop the replay that is already running", "재생이 이미 돌고 있습니다."),
+            ("A replay is already running", "재생이 이미 돌고 있습니다."),
+            ("Stop recording before",
+             "데이터 수집이 도는 동안에는 시작할 수 없습니다. 수집을 먼저 끝내세요."),
+            ("Stop teleoperation before",
+             "텔레옵이 도는 동안에는 시작할 수 없습니다. 텔레옵을 먼저 멈추세요."),
+            ("Stop the replay before",
+             "재생이 도는 동안에는 시작할 수 없습니다. `수집 데이터` 화면에서 재생을 멈추세요."),
+            ("The arm is too far from where this episode starts",
+             "팔이 이 회의 시작 자세에서 너무 멀리 있습니다. 팔을 시작 자세 근처로 옮기거나 다른 회를 고르세요."),
+            ("Training is already running",
+             "학습이 이미 돌고 있습니다. 끝나거나 `중지`한 뒤 다시 시작하세요."),
+            ("Dataset is not on the training machine",
+             "이 데이터셋이 학습 서버에 없습니다. 먼저 `학습 서버로 전송`을 누르세요."),
+            ("Dataset task does not match",
+             "이어 찍을 데이터셋의 과제 문장이 지금 문장과 다릅니다. 글자까지 같아야 이어 붙일 수 있습니다."),
+            ("Dataset was recorded without the sensor columns",
+             "이 데이터셋은 센서 열 없이 찍혀 이어 붙일 수 없습니다. 새 데이터셋으로 시작하세요."),
+            ("Cannot delete while",
+             "수집이나 재생이 도는 동안에는 지울 수 없습니다. 먼저 끝내세요."),
+            ("No such dataset", "그런 데이터셋이 서버에 없습니다. 목록을 새로고침하세요."),
             // 학습 서버로 보내고 받는 길에서 나는 실패들. 끊긴 전송은 받다 만 곳이 서버에
             // 남아 있으므로, 다시 눌러도 처음부터 다시 보내지 않는다는 점을 함께 말한다.
             ("The connection dropped during transfer",
@@ -1113,13 +1350,34 @@ enum SOArmDiagnosis {
 
         if let doctor = status.doctor {
             let disengaged = doctor.arms.allSatisfy(\.torqueDisabled)
-            checks.append(SOArmCheck(
-                state: doctor.safeForMotionStart ? .ok : .warning,
-                symbol: "bolt.slash", title: "토크 상태",
-                summary: doctor.safeForMotionStart
-                    ? "두 팔 모두 토크가 풀려 있어 동작을 시작할 수 있습니다"
-                    : (disengaged ? "모터 상태가 정상 범위를 벗어났습니다" : "토크가 걸려 있어 동작을 시작할 수 없습니다")
-            ))
+            let holding = doctor.arms.filter { $0.healthy && !$0.torqueDisabled }.map(\.title)
+            // 토크는 더 이상 시작 조건이 아니다(서버가 `soft_start`를 할 수 있을 때). 걸려 있으면
+            // 팔이 자세를 버티고 있다는 뜻이고, 그것은 사고가 아니라 지난 세션이 팔을 떨어뜨리지
+            // 않고 끝난 결과다. 옛 서버에서는 여전히 시작을 막는다.
+            let torqueBlocks = !status.can(.softStart)
+            let summary: String
+            let state: ConnectionCheck.State
+            if disengaged {
+                summary = "두 팔 모두 토크가 풀려 있습니다"
+                state = doctor.healthy ? .ok : .warning
+            } else if torqueBlocks {
+                summary = "토크가 걸려 있어 동작을 시작할 수 없습니다 — `토크 해제`로 풀어야 합니다"
+                state = .warning
+            } else {
+                summary = "\(holding.joined(separator: "·")) 팔에 토크가 걸려 자세를 버티고 있습니다. 시작을 막지 않습니다 — 팔을 쉬게 하려면 접힌 자세에서 `토크 해제`"
+                state = .ok
+            }
+            checks.append(SOArmCheck(state: state, symbol: "bolt.slash", title: "토크 상태", summary: summary))
+            let temperatures = doctor.arms.compactMap { arm in arm.maxTemperature.map { (arm.title, $0) } }
+            if !temperatures.isEmpty {
+                let hottest = temperatures.map(\.1).max() ?? 0
+                checks.append(SOArmCheck(
+                    state: hottest >= 65 ? .failed : (hottest >= 58 ? .warning : .ok),
+                    symbol: "thermometer.medium", title: "모터 온도",
+                    summary: temperatures.map { "\($0.0) 최고 \($0.1)°C" }.joined(separator: " · ")
+                        + (hottest >= 58 ? " — 58°C부터 경고, 70°C에서 서보가 스스로 토크를 끊습니다(팔이 떨어짐). 토크를 풀어 쉬게 하세요" : "")
+                ))
+            }
         }
 
         checks.append(SOArmCheck(
@@ -1163,11 +1421,34 @@ struct SOArmDatasetSummary: Sendable, Equatable, Identifiable {
     var cameras: [String] = []
     var sizeBytes = 0
     var recordedAt: Date?
+    /// 이 데이터셋에 든 과제 문장들. 서버가 목록에 실어 보내면 상세를 따로 묻지 않아도
+    /// 과제로 묶을 수 있다. 옛 서버는 비워 보내고, 그때는 상세에서 채운다.
+    var tasks: [String] = []
+    /// 찍힐 때의 품질. 루프가 30Hz를 지켰는지, 카메라가 같은 프레임을 얼마나 되돌려 줬는지.
+    var quality: SOArmRecordingQuality?
+    /// 위치 말고 함께 저장된 열들의 마지막 마디. `load`·`velocity`·`temperature`·`voltage`·
+    /// `servo_status`·`servo_moving`·`current`·`wall_time`·`camera_fresh`. 옛 데이터셋은 비어 있다.
+    var extras: [String] = []
 
     var id: String { name }
 
+    /// 화면에 적을 추가 열 이름.
+    var extrasText: String? {
+        guard !extras.isEmpty else { return nil }
+        let korean: [String: String] = [
+            "load": "부하", "velocity": "속도", "temperature": "온도", "voltage": "전압",
+            "servo_status": "서보 상태", "servo_moving": "이동 플래그", "current": "전류",
+            "wall_time": "프레임 시각", "camera_fresh": "새 프레임 여부",
+            "sensor_read_ok": "판독 성공 표시",
+        ]
+        return extras.map { korean[$0] ?? $0 }.joined(separator: "·")
+    }
+
     /// 초 단위 길이. 프레임 수를 fps로 나눈 값이라 실제 녹화 길이와 같다.
     var seconds: Double { fps > 0 ? Double(frames) / Double(fps) : 0 }
+
+    /// 과제가 하나면 그것. 여럿이거나 아직 모르면 `nil`.
+    var singleTask: String? { tasks.count == 1 ? tasks[0] : nil }
 
     init() {}
 
@@ -1179,6 +1460,9 @@ struct SOArmDatasetSummary: Sendable, Equatable, Identifiable {
         cameras = json.soarmStrings("cameras")
         sizeBytes = json.soarmInt("size_bytes") ?? 0
         if let stamp = json.soarmDouble("recorded_at") { recordedAt = Date(timeIntervalSince1970: stamp) }
+        tasks = json.soarmStrings("tasks")
+        quality = SOArmRecordingQuality(json["quality"] as? [String: Any])
+        extras = json.soarmStrings("extras")
     }
 
     static func list(_ data: Data) throws -> [SOArmDatasetSummary] {
@@ -1186,6 +1470,335 @@ struct SOArmDatasetSummary: Sendable, Equatable, Identifiable {
             throw SOArmError.badResponse("데이터셋 목록이 배열이 아닙니다")
         }
         return rows.map(SOArmDatasetSummary.init).filter { !$0.name.isEmpty }
+    }
+
+    /// 목록에서 가장 최근에 찍힌 것.
+    ///
+    /// 서버 목록은 이름 오름차순이고 이름은 타임스탬프라, `first`를 고르면 **가장 오래된**
+    /// 데이터셋이 열린다. 방금 찍은 것을 보러 온 사람이 매번 다시 골라야 했다.
+    static func newest(in list: [SOArmDatasetSummary]) -> SOArmDatasetSummary? {
+        list.max { ($0.recordedAt ?? .distantPast, $0.name) < ($1.recordedAt ?? .distantPast, $1.name) }
+    }
+}
+
+/// 찍힐 때의 품질 요약. 데이터셋 파일만 봐서는 알 수 없는 것들이다 — `timestamp`는
+/// `frame_index / fps`로 합성되므로 루프가 느렸어도 파일은 30fps라고 적고, AV1 인코더는
+/// 같은 두 장을 하나로 합치므로 영상에서는 중복 프레임을 셀 수 없다. 서버가 수집 로그에서
+/// 읽어 데이터셋 옆에 남긴 값이다.
+struct SOArmRecordingQuality: Sendable, Equatable {
+    var loopHz: Double?
+    var cameraStalePct: [String: Double] = [:]
+    var slowLoopWarnings = 0
+    /// 서보 블록 읽기가 실패해 **직전 값을 그대로 다시 쓴** 프레임 수. 값을 고치는 대신
+    /// 그 사실을 남기기로 한 자리다(`observation.sensor_read_ok`가 프레임마다 0/1로 적힌다).
+    var sensorReadFailures = 0
+    /// 물리적으로 불가능한 판독의 수. **고친 것이 아니라 센 것이다** — 원본은 그대로 있고,
+    /// 어떤 기준으로 셌는지는 데이터셋의 `soarm_quality.json`에 함께 적혀 있다.
+    var sensorImplausible: [String: Int] = [:]
+    /// 서보 블록 한 번 읽는 데 걸린 시간. 30Hz의 33ms 예산에서 얼마를 쓰는지.
+    var blockReadMsP50: Double?
+    var blockReadMsP99: Double?
+    /// 중복 프레임을 장수로도. 비율만 있으면 짧은 회에서 한 장이 커 보인다.
+    var cameraStaleFrames = 0
+    var totalFrames = 0
+
+    init?(_ json: [String: Any]?) {
+        guard let json, !json.isEmpty else { return nil }
+        loopHz = json.soarmDouble("loop_hz")
+        cameraStalePct = json.soarmDict("camera_stale_pct").compactMapValues { ($0 as? NSNumber)?.doubleValue }
+        slowLoopWarnings = json.soarmInt("slow_loop_warnings") ?? 0
+        sensorReadFailures = json.soarmInt("sensor_read_failures") ?? 0
+        sensorImplausible = json.soarmDict("sensor_implausible").compactMapValues { ($0 as? NSNumber)?.intValue }
+        blockReadMsP50 = json.soarmDouble("sensor_block_read_ms_p50")
+        blockReadMsP99 = json.soarmDouble("sensor_block_read_ms_p99")
+        cameraStaleFrames = json.soarmInt("camera_stale_frames") ?? 0
+        totalFrames = json.soarmInt("total_frames") ?? 0
+    }
+
+    /// 무언가 걸리는 값이 있는가. 중복 5% 넘김, 느린 루프 경고, 루프 27Hz 미만, 읽기 실패.
+    ///
+    /// 불가능한 판독의 수는 여기 넣지 않는다. 수천 판독 중 한둘은 버스가 튄 것이고, 그것으로
+    /// 데이터셋 전체에 경고를 다는 것은 과장이다 — 숫자는 아래 `text`가 그대로 적는다.
+    var hasConcern: Bool {
+        if slowLoopWarnings > 0 || sensorReadFailures > 0 { return true }
+        if let loopHz, loopHz > 0, loopHz < 27 { return true }
+        return cameraStalePct.values.contains { $0 > 5 }
+    }
+
+    var text: String {
+        var parts: [String] = []
+        if let loopHz, loopHz > 0 { parts.append("루프 " + String(format: "%.1f", loopHz) + "Hz") }
+        if !cameraStalePct.isEmpty {
+            let cameras = cameraStalePct.keys.sorted().map { key in
+                "\(SOArmCameraName.display(key)) " + String(format: "%.1f", cameraStalePct[key] ?? 0) + "%"
+            }
+            let count = cameraStaleFrames > 0 && totalFrames > 0 ? " (\(cameraStaleFrames)/\(totalFrames)장)" : ""
+            parts.append("중복 프레임 " + cameras.joined(separator: " / ") + count)
+        }
+        if slowLoopWarnings > 0 { parts.append("느린 루프 경고 \(slowLoopWarnings)번") }
+        if sensorReadFailures > 0 { parts.append("서보 판독 실패 \(sensorReadFailures)프레임") }
+        let implausible = sensorImplausible.values.reduce(0, +)
+        if implausible > 0 {
+            let detail = sensorImplausible.filter { $0.value > 0 }.keys.sorted()
+                .map { "\(Self.korean(field: $0)) \(sensorImplausible[$0] ?? 0)" }
+                .joined(separator: " / ")
+            parts.append("불가능한 판독 " + detail + "개")
+        }
+        if let p50 = blockReadMsP50 {
+            parts.append("서보 읽기 " + String(format: "%.1f", p50) + "ms")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func korean(field: String) -> String {
+        switch field {
+        case "temperature": "온도"
+        case "voltage": "전압"
+        case "load": "부하"
+        case "velocity": "속도"
+        default: field
+        }
+    }
+}
+
+/// 한 회의 관절 궤적. `state`는 팔로워가 실제로 있던 자리, `action`은 리더가 시킨 자리다.
+///
+/// 두 줄이 벌어져 있는 곳이 팔이 못 따라간 곳이고, 한 줄이 튀는 곳이 센서나 시연이 이상한
+/// 곳이다. 영상만 봐서는 둘 다 보이지 않는다.
+struct SOArmTrajectory: Sendable, Equatable {
+    var fps = 30
+    var joints: [String] = []
+    var state: [[Double]] = []
+    var action: [[Double]] = []
+    /// 서보 부하(부호 포함 −1000..1000). 서버가 그 열을 저장했을 때만 있다.
+    var load: [[Double]] = []
+    /// 서보 속도(raw 눈금/초).
+    var velocity: [[Double]] = []
+    /// 프레임마다 카메라별로 새 프레임이었는가(1) 아니면 지난 프레임의 반복인가(0).
+    var cameraFresh: [[Double]] = []
+    var cameraKeys: [String] = []
+    /// 그 프레임의 서보 블록 읽기가 성공했는가(1). 0이면 **읽기가 실패해 직전 값을 그대로
+    /// 다시 쓴 행**이다 — 값이 틀린 것이 아니라 그 시각의 새 판독이 아니라는 뜻이고,
+    /// 부하로 접촉을 보는 분석에서는 그 행을 빼야 한다.
+    var sensorReadOk: [[Double]] = []
+
+    var frames: Int { state.count }
+    var seconds: Double { fps > 0 ? Double(frames) / Double(fps) : 0 }
+    var hasLoad: Bool { !load.isEmpty }
+    var hasVelocity: Bool { !velocity.isEmpty }
+    var hasCameraFresh: Bool { !cameraFresh.isEmpty }
+    var hasSensorReadOk: Bool { !sensorReadOk.isEmpty }
+
+    /// 새 판독이 아니라 직전 값을 되쓴 프레임의 번호들.
+    var repeatedSensorFrames: [Int] {
+        sensorReadOk.enumerated().compactMap { index, row in (row.first ?? 1) < 0.5 ? index : nil }
+    }
+
+    /// 어느 카메라든 지난 프레임을 그대로 되돌려 준 프레임 번호들.
+    var staleFrames: [Int] {
+        cameraFresh.enumerated().compactMap { index, row in row.contains { $0 < 0.5 } ? index : nil }
+    }
+
+    var stalePercent: Double {
+        guard frames > 0, hasCameraFresh else { return 0 }
+        return 100 * Double(staleFrames.count) / Double(frames)
+    }
+
+    static func parse(_ data: Data) throws -> SOArmTrajectory {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw SOArmError.badResponse("궤적이 JSON이 아닙니다")
+        }
+        var value = SOArmTrajectory()
+        value.fps = json.soarmInt("fps") ?? 30
+        value.joints = json.soarmStrings("joints").map { $0.replacingOccurrences(of: ".pos", with: "") }
+        value.state = Self.rows(json["state"])
+        value.action = Self.rows(json["action"])
+        guard value.state.count == value.action.count else {
+            throw SOArmError.badResponse("관측과 명령의 프레임 수가 다릅니다")
+        }
+        // 추가 열은 있으면 읽고, 길이가 안 맞으면 그 열만 버린다. 위치 곡선을 그리는 데
+        // 부하 열이 필요하지는 않다.
+        let frames = value.state.count
+        let load = Self.rows(json["load"])
+        if load.count == frames { value.load = load }
+        let velocity = Self.rows(json["velocity"])
+        if velocity.count == frames { value.velocity = velocity }
+        let fresh = Self.rows(json["camera_fresh"])
+        if fresh.count == frames {
+            value.cameraFresh = fresh
+            value.cameraKeys = json.soarmStrings("camera_keys")
+        }
+        let readOk = Self.rows(json["sensor_read_ok"])
+        if readOk.count == frames { value.sensorReadOk = readOk }
+        return value
+    }
+
+    private static func rows(_ raw: Any?) -> [[Double]] {
+        (raw as? [Any] ?? []).map { row in (row as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.doubleValue } }
+    }
+
+    /// 화면에 그릴 점 하나. 프레임 수가 많으면 `stride`로 솎아서 그린다 — 900프레임 × 6관절 ×
+    /// 2줄은 한 번에 그리기엔 많고, 눈은 30개 중 1개를 골라도 같은 곡선을 본다.
+    struct Point: Identifiable, Sendable, Equatable {
+        var id: Int { frame }
+        var frame: Int
+        var seconds: Double
+        var value: Double
+    }
+
+    func points(joint index: Int, of series: [[Double]], stride: Int = 1) -> [Point] {
+        guard index >= 0 else { return [] }
+        var result: [Point] = []
+        result.reserveCapacity(series.count / max(1, stride) + 1)
+        for frame in Swift.stride(from: 0, to: series.count, by: max(1, stride)) {
+            let row = series[frame]
+            guard index < row.count else { continue }
+            result.append(Point(frame: frame, seconds: Double(frame) / Double(max(1, fps)), value: row[index]))
+        }
+        return result
+    }
+
+    /// 한 관절에서 명령과 실제가 가장 크게 벌어진 값. 따라가지 못한 정도다.
+    func largestGap(joint index: Int) -> Double {
+        zip(state, action).reduce(0.0) { best, pair in
+            guard index < pair.0.count, index < pair.1.count else { return best }
+            return max(best, abs(pair.0[index] - pair.1[index]))
+        }
+    }
+
+    /// 화면에 적을 관절 이름.
+    static func label(_ joint: String) -> String {
+        switch joint {
+        case "shoulder_pan": "어깨 회전"
+        case "shoulder_lift": "어깨 들기"
+        case "elbow_flex": "팔꿈치"
+        case "wrist_flex": "손목 굽힘"
+        case "wrist_roll": "손목 회전"
+        case "gripper": "집게"
+        default: joint
+        }
+    }
+}
+
+/// 학습 서버에서 도는(또는 끝난) 학습 하나의 진행.
+///
+/// 콘솔 서버가 `outputs/<run>/train.log`의 마지막 `step:` 줄과 tmux 세션의 생존을 읽어
+/// 채운다. 앱은 이 값을 그릴 뿐이고, 학습을 직접 붙잡고 있지 않다 — 앱을 닫아도 학습은
+/// 학습 서버의 tmux 안에서 계속 돈다.
+struct SOArmTrainingProgress: Sendable, Equatable {
+    var running = false
+    var step = 0
+    var steps = 0
+    var loss: Double?
+    var policy: String?
+    var startedAt: Date?
+    var updatedAt: Date?
+    var logTail: [String] = []
+    /// 학습이 스스로 죽었을 때 서버가 로그에서 건진 마지막 오류 한 줄.
+    var error: String?
+
+    init() {}
+
+    init?(_ json: [String: Any]?) {
+        guard let json, !json.isEmpty else { return nil }
+        running = json.soarmBool("running")
+        step = json.soarmInt("step") ?? 0
+        steps = json.soarmInt("steps") ?? 0
+        loss = json.soarmDouble("loss")
+        policy = json.soarmString("policy")
+        if let stamp = json.soarmDouble("started_at") { startedAt = Date(timeIntervalSince1970: stamp) }
+        if let stamp = json.soarmDouble("updated_at") { updatedAt = Date(timeIntervalSince1970: stamp) }
+        logTail = json.soarmStrings("log_tail")
+        error = json.soarmString("error")
+    }
+
+    var progress: Double { steps > 0 ? min(1, Double(step) / Double(steps)) : 0 }
+
+    /// 남은 시간의 어림값. 지금까지의 평균 속도로 나머지를 나눈다.
+    var remainingSeconds: Double? {
+        guard running, step > 0, steps > step, let startedAt, let updatedAt else { return nil }
+        let elapsed = updatedAt.timeIntervalSince(startedAt)
+        guard elapsed > 0 else { return nil }
+        return elapsed / Double(step) * Double(steps - step)
+    }
+
+    var text: String {
+        var parts = ["\(step)/\(steps) 스텝"]
+        if let loss { parts.append("loss " + String(format: "%.3f", loss)) }
+        if let remaining = remainingSeconds { parts.append("약 " + SOArmFormat.duration(remaining) + " 남음") }
+        if !running, step > 0 { parts.append(step >= steps && steps > 0 ? "끝남" : "멈춤") }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// 사람이 고르는 정책 두 가지. 숫자(스텝·배치)는 서버가 정한다 — 학습 서버의 실측
+/// (`TRAINING.md`)이 그쪽에 있고, 앱은 이름과 설명만 그린다.
+enum SOArmTrainingPolicy: String, CaseIterable, Identifiable, Sendable {
+    case act
+    case smolvla
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .act: "ACT"
+        case .smolvla: "SmolVLA"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .act:
+            "과제 하나를 빠르게 배우는 52M 정책입니다. 과제 문장은 쓰지 않고, 카메라 두 장과 관절값으로 100프레임씩 앞을 내다보며 움직입니다. 처음 확인하기에 맞습니다."
+        case .smolvla:
+            "사전학습된 450M 비전·언어·행동 모델을 이 데이터로 미세조정합니다. 과제 **문장**을 입력으로 쓰므로 영어 지시문이 사전학습 분포와 맞고, 오래 걸립니다."
+        }
+    }
+}
+
+/// 재생을 시작하기 전에 보는 것. 팔이 지금 자리에서 에피소드 첫 자세까지 관절마다 얼마나
+/// 가야 하고, 정렬에 몇 초가 걸릴지.
+struct SOArmReplayPreview: Sendable, Equatable {
+    struct Joint: Sendable, Equatable, Identifiable {
+        var name: String
+        var from: Double
+        var to: Double
+        var distance: Double
+        var unit: String
+
+        var id: String { name }
+        var text: String {
+            "\(SOArmTrajectory.label(name)) " + String(format: "%.1f", from) + unit
+                + " → " + String(format: "%.1f", to) + unit
+                + " (" + String(format: "%.1f", distance) + unit + ")"
+        }
+    }
+
+    var joints: [Joint] = []
+    var alignSeconds: Double = 0
+    /// 서버가 시작을 거절할 이유가 있으면 그 문장.
+    var refusal: String?
+
+    var farthest: Joint? { joints.max { $0.distance < $1.distance } }
+
+    static func parse(_ data: Data) throws -> SOArmReplayPreview {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw SOArmError.badResponse("재생 미리보기가 JSON이 아닙니다")
+        }
+        var value = SOArmReplayPreview()
+        value.joints = (json["joints"] as? [[String: Any]] ?? []).compactMap { entry in
+            guard let name = entry.soarmString("name") else { return nil }
+            return Joint(
+                name: name.replacingOccurrences(of: ".pos", with: ""),
+                from: entry.soarmDouble("from") ?? 0,
+                to: entry.soarmDouble("to") ?? 0,
+                distance: entry.soarmDouble("distance") ?? 0,
+                unit: entry.soarmString("unit") ?? "°"
+            )
+        }
+        value.alignSeconds = json.soarmDouble("align_seconds") ?? 0
+        value.refusal = json.soarmString("refusal").map(SOArmServerText.korean)
+        return value
     }
 }
 
@@ -1260,7 +1873,8 @@ struct SOArmSparkStatus: Sendable, Equatable {
     init(_ data: Data) {
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
         isReachable = (json["reachable"] as? Bool) ?? false
-        failure = json.soarmString("error")
+        // 서버가 영어로 적어 준 원인을 화면의 말로. 다른 거절과 같은 표를 지난다.
+        failure = json.soarmString("error").map(SOArmServerText.korean)
         host = json.soarmString("host") ?? ""
         diskFreeBytes = json.soarmInt("disk_free_bytes") ?? 0
         let gpu = json.soarmDict("gpu")
@@ -1298,13 +1912,17 @@ struct SOArmSparkDataset: Sendable, Equatable, Identifiable {
 struct SOArmSparkRun: Sendable, Equatable, Identifiable {
     var name = ""
     var checkpoints: [SOArmSparkCheckpoint] = []
+    /// 이 실행이 지금 돌고 있거나 돌았던 흔적. 콘솔이 띄운 학습에만 있다.
+    var training: SOArmTrainingProgress?
 
     var id: String { name }
+    var isTraining: Bool { training?.running ?? false }
 
     init(_ json: [String: Any]) {
         name = json.soarmString("run") ?? ""
         let rows = (json["checkpoints"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
         checkpoints = rows.map(SOArmSparkCheckpoint.init).filter { !$0.step.isEmpty }
+        training = SOArmTrainingProgress(json["training"] as? [String: Any])
     }
 
     static func list(_ data: Data) throws -> [SOArmSparkRun] {

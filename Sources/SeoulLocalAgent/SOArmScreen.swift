@@ -20,7 +20,6 @@ private struct SOArmWorkspace: View {
     /// 받는 양. 원격 텔레옵 화면과 같은 값이라 모델이 아니라 여기에서 직접 본다.
     @ObservedObject private var cameraPolicy = SOArmCameraPolicy.shared
     @Environment(\.openSettings) private var openSettings
-    @State private var pending: SOArmStartRequest?
     @State private var torqueGate: SOArmTorqueGate?
     /// 카메라 두 장이 나눠 쓸 수 있는 가로 폭. 창을 줄이고 늘릴 때마다 다시 들어온다.
     @State private var cameraRowWidth: CGFloat = 0
@@ -48,12 +47,6 @@ private struct SOArmWorkspace: View {
         .toolbar(model.isConsoleFullScreen ? .hidden : .visible, for: .windowToolbar)
         .sheet(item: $torqueGate) { gate in
             SOArmTorqueReleaseSheet(gate: gate) { model.releaseTorque(arm: gate.arm) }
-        }
-        .sheet(item: $pending) { request in
-            // 이 화면에서 시작하는 것은 물리 리더 텔레옵 하나뿐이다. 데이터 수집은
-            // `데이터 수집` 화면으로 옮겼다 — 찍는 동안 알아야 하는 것과 팔을 조작할 때
-            // 알아야 하는 것이 서로 다르고, 한 화면에 있으면 둘 다 잘 보이지 않는다.
-            SOArmConfirmationSheet(request: request) { model.startTeleoperation() }
         }
         .onAppear { model.screenAppeared() }
         .onDisappear { model.screenDisappeared() }
@@ -119,7 +112,9 @@ private struct SOArmWorkspace: View {
                     .disabled(model.isBusy)
                     .help("리더 → 팔로워 전달을 멈춥니다")
             } else {
-                Button("텔레옵 시작", systemImage: "dot.radiowaves.left.and.right") { pending = .teleoperation }
+                // 시트 없이 한 번이다. 리더를 쥔 사람의 손이 게이트이고, 확인할 것은 아래
+                // 안전 문구에 늘 적혀 있다. 무인으로 팔이 움직이는 재생에만 시트가 남았다.
+                Button("텔레옵 시작", systemImage: "dot.radiowaves.left.and.right") { model.startTeleoperation() }
                     .buttonStyle(.glassProminent)
                     .tint(.snuBlue)
                     .toolbarKeepsTitle()
@@ -128,7 +123,7 @@ private struct SOArmWorkspace: View {
                     // 가장 흔한 이유가 가상 리더의 관찰이고, 그것은 이 화면에 없는
                     // 버튼으로 끈다 — 이유를 적지 않으면 회색 버튼만 남는다.
                     .help(model.status?.followerHeldElsewhere
-                          ?? "현장 확인과 확인 문구를 거쳐 리더 팔의 움직임을 팔로워에 전달합니다")
+                          ?? "리더 팔의 움직임을 팔로워에 전달합니다. 팔로워는 리더가 움직이는 만큼만 움직입니다")
             }
         }
     }
@@ -233,6 +228,8 @@ private struct SOArmWorkspace: View {
                     stream: model.stream(role),
                     enabled: model.connection.isConnected && !(model.status?.recording.running ?? false) && !cameraPolicy.isOff,
                     isDataOff: cameraPolicy.isOff,
+                    snapshot: model.recordingSnapshots[role],
+                    snapshotsAvailable: model.status?.can(.preview) ?? false,
                     start: { model.startPreview(role) },
                     stop: { model.stopPreview(role) },
                     apply: { model.setCameraProfile($0, for: role) }
@@ -280,6 +277,15 @@ private struct SOArmWorkspace: View {
 
     private var safetyNote: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {
+            // 시작 시트를 없앤 자리에 그 시트가 말하던 것을 늘 보이게 둔다. 서버가 부드러운
+            // 시작을 할 수 있으면 팔로워가 리더 자세까지 걸어가고, 못 하면 첫 틱에 리더
+            // 자세로 한 번에 따라붙으므로 두 팔을 먼저 맞춰야 한다.
+            Text(model.status?.can(.softStart) == true
+                 ? "`텔레옵 시작`을 누르면 팔로워가 리더 자세까지 천천히 걸어간 뒤 따라옵니다. 현장에 사람·장애물·케이블이 없는지, 전원 차단 위치가 어디인지 확인하고 시작하세요."
+                 : "`텔레옵 시작`을 누르는 순간 팔로워가 리더 자세로 **한 번에** 따라붙습니다. 두 팔을 서로 대응하는 비슷한 자세로 맞춘 뒤, 현장에 사람·장애물·케이블이 없는지 확인하고 시작하세요.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text("`모드 중지`는 소프트웨어 중지입니다. 물리 E-stop이나 전원 차단을 대신하지 않으니, 팔이 움직이는 동안에는 현장에 사람이 있어야 합니다.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -289,7 +295,7 @@ private struct SOArmWorkspace: View {
 }
 
 /// `설정 › 연결 상태`의 줄과 같은 모양. 같은 질문에 답하는 화면은 같아 보여야 한다.
-private struct SOArmCheckRow: View {
+struct SOArmCheckRow: View {
     let check: SOArmCheck
 
     private var tint: Color {
@@ -361,6 +367,11 @@ struct SOArmCameraCard: View {
     let enabled: Bool
     /// 영상 받기를 꺼 두었는가. 서버가 못 주는 것과 우리가 안 받는 것은 다른 일이다.
     let isDataOff: Bool
+    /// 수집 중 기록 루프가 남긴 스냅숏. LeRobot이 카메라를 쥐고 있는 동안 볼 수 있는 유일한
+    /// 그림이다.
+    var snapshot: NSImage? = nil
+    /// 서버가 스냅숏을 내줄 수 있는가. 아니면 수집 중에는 카드가 왜 비어 있는지만 적는다.
+    var snapshotsAvailable = false
     let start: () -> Void
     let stop: () -> Void
     let apply: (SOArmCameraProfile) -> Void
@@ -388,7 +399,20 @@ struct SOArmCameraCard: View {
             }
             reading
             ZStack {
-                if let image = stream.image {
+                if isRecording, let snapshot {
+                    Image(nsImage: snapshot)
+                        .resizable()
+                        .scaledToFit()
+                } else if isRecording {
+                    EmptyResults(
+                        symbol: "video.badge.ellipsis",
+                        message: isDataOff
+                            ? "영상 받기를 껐습니다 · 수집은 그대로 찍힙니다"
+                            : (snapshotsAvailable
+                               ? "수집 중 스냅숏을 기다리는 중입니다"
+                               : "수집 중에는 서버가 카메라를 쥡니다. 서버를 올리면 여기에 스냅숏이 보입니다")
+                    )
+                } else if let image = stream.image {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
@@ -420,7 +444,7 @@ struct SOArmCameraCard: View {
     @ViewBuilder
     private var reading: some View {
         if isRecording {
-            Text("수집 중 · \(recordingProfile.text) 고정")
+            Text("수집 중 · \(recordingProfile.text) 고정" + (snapshot != nil ? " · 스냅숏" : ""))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } else if let actual = camera.actual, stream.isRunning {
@@ -523,7 +547,7 @@ struct SOArmTorqueGate: Identifiable {
 ///
 /// 원격 텔레옵 화면의 게이트와 같은 말을 한다. 같은 일을 하는 두 자리가 서로 다른 위험을
 /// 설명하면, 사람은 둘 중 무엇이 맞는지 화면 밖에서 판단해야 한다.
-private struct SOArmTorqueReleaseSheet: View {
+struct SOArmTorqueReleaseSheet: View {
     let gate: SOArmTorqueGate
     let confirm: () -> Void
 
@@ -569,42 +593,33 @@ private struct SOArmTorqueReleaseSheet: View {
     }
 }
 
+/// 시작 전에 사람을 한 번 멈춰 세우는 자리. **이제 재생 하나뿐이다.**
+///
+/// 텔레옵과 수집도 여기를 지났었다. 그러나 그 둘은 사람이 리더를 쥐고 있어야 팔이 움직이는
+/// 경로라 사람의 손이 곧 게이트이고, 매일 여러 번 누르는 단추 앞의 시트는 신중함이 아니라
+/// 통행세가 됐다. 재생은 다르다 — 사람 손 없이 팔이 혼자 움직이는 유일한 경로다.
 enum SOArmStartRequest: String, Identifiable {
-    case teleoperation, recording, replay
+    case replay
 
     var id: String { rawValue }
 
-    var title: String {
-        switch self {
-        case .teleoperation: "텔레오퍼레이션 시작"
-        case .recording: "데이터 수집 시작"
-        case .replay: "찍은 시연을 팔에 재생"
-        }
-    }
+    var title: String { "찍은 시연을 팔에 재생" }
 
     var copy: String {
-        switch self {
-        case .teleoperation:
-            "두 팔을 서로 대응하는 비슷한 자세로 맞춘 뒤 시작하세요. 리더의 관절값이 팔로워로 전달되며, 프레임당 상대 목표는 서버가 제한합니다."
-        case .recording:
-            "카메라 프리뷰를 내리고 새 로컬 데이터셋 세션을 시작합니다. 수집 중에는 성공·재시도·종료만 조작할 수 있습니다."
-        case .replay:
-            // 사람 손 없이 팔이 움직이는 유일한 경로다. 확인 문구 앞에서 그 사실을 그대로 적는다.
-            "**사람이 조종하지 않는 상태로 팔이 움직입니다.** 먼저 시작 자세까지 천천히 걸어간 뒤(관절 초당 20도 이하) 녹화된 동작을 흘립니다. 시작 자세가 60도 넘게 떨어져 있으면 서버가 거절합니다. 재생 중에는 `정지`가 언제나 듣습니다."
-        }
+        // 사람 손 없이 팔이 움직이는 유일한 경로다. 확인 문구 앞에서 그 사실을 그대로 적는다.
+        "**사람이 조종하지 않는 상태로 팔이 움직입니다.** 먼저 시작 자세까지 천천히 걸어간 뒤(관절 초당 20도 이하) 녹화된 동작을 흘립니다. 재생 중에는 `정지`가 언제나 듣습니다."
     }
 
-    var startTitle: String {
-        switch self {
-        case .teleoperation: "텔레옵 시작"
-        case .recording: "수집 시작"
-        case .replay: "재생 시작"
-        }
-    }
+    var startTitle: String { "재생 시작" }
 }
 
 struct SOArmConfirmationSheet: View {
     let request: SOArmStartRequest
+    /// 팔이 지금 자리에서 첫 자세까지 관절마다 얼마나 가야 하는지. 서버가 재 준 값이 있으면
+    /// 시트가 그것을 그대로 적는다 — "천천히 걸어간다"는 말보다 "어깨 들기 38° · 4.5초"가
+    /// 사람이 판단할 수 있는 정보다.
+    var preview: SOArmReplayPreview? = nil
+    var isLoadingPreview = false
     let confirm: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -619,6 +634,7 @@ struct SOArmConfirmationSheet: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            previewRows
             Label("현장에 사람·장애물·케이블이 없는지, 전원 차단 위치가 어디인지 확인하세요.", systemImage: "exclamationmark.triangle.fill")
                 .font(.callout)
                 .foregroundStyle(.orange)
@@ -633,6 +649,7 @@ struct SOArmConfirmationSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.snuBlue)
+                .disabled(preview?.refusal != nil)
                 // 확인 문구를 손으로 옮겨 적게 하던 자리다. 서버는 여전히 정확한 문구를
                 // 요구하고 앱이 그것을 보내지만, 사람에게 타자를 요구하지는 않는다.
                 // Return 한 번으로 시작한다.
@@ -640,7 +657,38 @@ struct SOArmConfirmationSheet: View {
             }
         }
         .padding(Spacing.xl)
-        .frame(width: 460)
+        .frame(width: 480)
+    }
+
+    @ViewBuilder
+    private var previewRows: some View {
+        if isLoadingPreview {
+            HStack(spacing: Spacing.s) {
+                ProgressView().controlSize(.small)
+                Text("팔이 지금 어디 서 있는지 읽는 중입니다…").font(.caption).foregroundStyle(.secondary)
+            }
+        } else if let preview {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                if let refusal = preview.refusal {
+                    Label(refusal, systemImage: "hand.raised.slash")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("시작 자세까지 약 \(String(format: "%.1f", preview.alignSeconds))초 걸어갑니다"
+                         + (preview.farthest.map { " · 가장 먼 관절 \(SOArmTrajectory.label($0.name)) \(String(format: "%.1f", $0.distance))\($0.unit)" } ?? ""))
+                        .font(.callout)
+                }
+                ForEach(preview.joints) { joint in
+                    Text(joint.text)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(joint.distance > 60 ? Color.orange : Color.secondary)
+                }
+            }
+            .padding(Spacing.m)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Radius.card, style: .continuous))
+        }
     }
 }
 

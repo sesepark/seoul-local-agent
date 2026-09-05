@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Combine
 
 /// SO-ARM 101 화면이 들고 있는 상태 전부.
@@ -40,8 +41,38 @@ final class SOArmConsoleModel: ObservableObject {
 
     // 수집 조건. 시트를 닫아도 남아 있어야 해서 화면이 아니라 여기에 둔다.
     @Published var recordTask = ""
-    /// 한 에피소드가 저절로 끊기는 상한. 사람이 `성공 저장`·`다시 찍기`를 누르면 그 전에 끝난다.
+    /// 한 에피소드가 저절로 끊기는 상한. 사람이 `지금 저장`·`다시 찍기`를 누르면 그 전에 끝난다.
     @Published var recordSeconds = 30
+    /// 같은 과제의 데이터셋이 이미 있으면 거기에 회를 이어 붙일 것인가. 기본은 참이다.
+    ///
+    /// 학습은 데이터셋 하나만 받는다. 같은 과제를 세션마다 새 폴더에 찍으면 화면에서는 한
+    /// 묶음으로 보여도 학습에는 그중 하나만 들어간다. 과제 하나가 데이터셋 하나여야 그 묶음이
+    /// 곧 학습 단위가 된다.
+    @Published var resumeExisting = true
+    /// 수집 중 카메라 스냅숏. LeRobot이 카메라를 쥐고 있어 MJPEG 프리뷰는 열리지 않으므로
+    /// 기록 루프가 남기는 JPEG를 몇 Hz로 받아 온다. 서버가 `preview`를 할 수 있을 때만.
+    @Published private(set) var recordingSnapshots: [SOArmCameraRole: NSImage] = [:]
+    /// 이 앱이 켜져 있는 동안 마지막으로 끝난 수집. 끝난 뒤 요약 카드가 이것을 그린다 —
+    /// 전에는 끝나는 순간 처음 화면으로 돌아가 몇 회를 찍었는지도 알 수 없었다.
+    @Published private(set) var lastRun: SOArmRecordingRuntime?
+    /// 지금 서버로 가고 있는 수집 조작의 수. 버튼을 잠그지 않는다 — ⌘⏎ 직후의 ⇧⌘R이
+    /// 조용히 버려지던 자리다. 순서대로 보내고, 도는 동안이라는 표시만 한다.
+    @Published private(set) var pendingControls = 0
+    /// 고른 회의 관절 궤적.
+    @Published private(set) var trajectory: SOArmTrajectory?
+    @Published private(set) var isLoadingTrajectory = false
+    /// 학습에 쓸 정책. 숫자(스텝·배치)는 서버가 정한다.
+    @Published var trainingPolicy: SOArmTrainingPolicy = .act
+    @Published private(set) var startingTraining: String?
+    @Published private(set) var stoppingTraining: String?
+    @Published private(set) var deletingDataset: String?
+    @Published private(set) var deletingEpisode: Int?
+    /// 재생 전에 서버가 재 준 관절별 거리와 정렬 시간.
+    @Published private(set) var replayPreview: SOArmReplayPreview?
+    @Published private(set) var isLoadingReplayPreview = false
+    private var snapshotTask: Task<Void, Never>?
+    private var sparkPollTask: Task<Void, Never>?
+    private var controlChain: Task<Void, Never>?
 
     let sceneCamera = MJPEGStream()
     let wristCamera = MJPEGStream()
@@ -61,7 +92,12 @@ final class SOArmConsoleModel: ObservableObject {
             if let selectedDataset { loadDataset(selectedDataset) }
         }
     }
-    @Published var selectedEpisode: Int?
+    @Published var selectedEpisode: Int? {
+        didSet {
+            guard selectedEpisode != oldValue else { return }
+            loadTrajectory()
+        }
+    }
     @Published var selectedCamera: String?
     /// 데이터셋 이름 → 그 세션의 과제 문장.
     ///
@@ -127,6 +163,10 @@ final class SOArmConsoleModel: ObservableObject {
     /// 열리는 것이고, 데이터 설정을 만졌다는 이유로 카메라를 점유하기 시작하면 그것은
     /// 고른 적 없는 일이 벌어지는 것이다.
     private func cameraPolicyChanged(to mode: SOArmCameraDataMode) {
+        // 수집 중 스냅숏도 받는 양을 따른다. 간격이 바뀌므로 도는 것을 세우고 다시 판단한다.
+        snapshotTask?.cancel()
+        snapshotTask = nil
+        updateSnapshotPolling()
         guard let profile = mode.profile else {
             stopPreviews()
             return
@@ -201,6 +241,9 @@ final class SOArmConsoleModel: ObservableObject {
             return
         }
         stopPreviews()
+        updateSnapshotPolling()
+        sparkPollTask?.cancel()
+        sparkPollTask = nil
         restartPolling()
         teardownTask?.cancel()
         teardownTask = Task { [weak self] in
@@ -250,6 +293,7 @@ final class SOArmConsoleModel: ObservableObject {
         connection = .idle
         status = nil
         lastUpdated = nil
+        updateSnapshotPolling()
         // 종료를 기다리느라 화면이 멈추지 않게 메인 밖에서. 보통은 stdin을 닫는 즉시 끝난다.
         // 표를 들려 보내는 이유: 이 정리가 실제로 도는 시점에 이미 새 터널이 열려 있다면
         // 그것은 다른 터널이고, 건드리면 방금 연 연결을 끊는 꼴이 된다.
@@ -264,14 +308,26 @@ final class SOArmConsoleModel: ObservableObject {
         }
         do {
             let value = try await client.status()
+            let wasRecording = status?.recording.running ?? false
             status = value
             lastUpdated = Date()
             connection = .connected
+            // 수집이 방금 끝났다. 끝난 회차의 상태를 요약 카드용으로 붙잡아 두고, 목록을 다시
+            // 읽어 새 데이터셋(또는 회가 늘어난 데이터셋)이 곧바로 보이게 한다.
+            if wasRecording, !value.recording.running, let runtime = value.recordingRuntime, runtime.isFinished {
+                lastRun = runtime
+                loadDatasets()
+            }
+            updateSnapshotPolling()
         } catch {
             status = nil
             connection = .failed(Self.message(for: error))
+            updateSnapshotPolling()
         }
     }
+
+    /// 요약 카드를 닫는다.
+    func dismissLastRun() { lastRun = nil }
 
     private func applyLaunchOptions() {
         guard !appliedLaunchOptions, connection.isConnected else { return }
@@ -304,10 +360,21 @@ final class SOArmConsoleModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self, self.shouldPoll else { return }
                 await self.refresh()
-                let seconds = self.isScreenVisible && !self.isConsoleFullScreen ? 2.0 : 5.0
-                try? await Task.sleep(for: .seconds(seconds))
+                try? await Task.sleep(for: .seconds(self.pollInterval))
             }
         }
+    }
+
+    /// 다음 상태를 얼마 만에 다시 물을 것인가.
+    ///
+    /// **수집 중에는 빠르게 묻는다.** 회가 시작한 시각은 서버만 알고 있고, 앱은 그것을 다음
+    /// 폴링에서야 배운다. 2초에 한 번 물으면 회가 시작하고 최대 2초가 지나서야 시계가 나타나
+    /// 처음 1~2초를 건너뛴 것처럼 보인다 — 그동안 화면에는 지난 단계의 회전자만 돈다.
+    /// 상태 응답은 작고 서버가 10ms 안에 답하므로, 찍는 동안에는 0.4초가 낫다.
+    private var pollInterval: TimeInterval {
+        guard isScreenVisible, !isConsoleFullScreen else { return 5.0 }
+        if status?.recording.running == true { return 0.4 }
+        return 2.0
     }
 
     func enterConsoleFullScreen() {
@@ -384,15 +451,65 @@ final class SOArmConsoleModel: ObservableObject {
     func startRecording() {
         let task = recordTask.trimmingCharacters(in: .whitespacesAndNewlines)
         let seconds = recordSeconds
+        let resume = resumeTarget?.name
+        lastRun = nil
         // 서버도 시작 직전에 카메라 worker를 내리지만, 우리 스트림을 먼저 놓아야 재연결이
         // 서버의 정리와 경쟁하지 않는다.
         stopPreviews()
         perform { client in
             try await client.startRecording(
                 confirmation: SOArmClient.recordConfirmation,
-                task: task, episodes: SOArmClient.openEndedEpisodes, episodeSeconds: seconds
+                task: task, episodes: SOArmClient.openEndedEpisodes, episodeSeconds: seconds,
+                resumeDataset: resume
             )
         }
+    }
+
+    /// 지금 과제 문장과 글자까지 같은 과제로 찍힌 데이터셋 가운데 가장 최근 것.
+    ///
+    /// 서버가 이어 찍기를 할 수 있고 사람이 그것을 켜 두었을 때만 값이 있다. 과제가 여럿
+    /// 섞인 데이터셋은 후보가 아니다 — 거기에 이어 붙이면 어느 과제의 회인지 흐려진다.
+    var resumableDataset: SOArmDatasetSummary? {
+        guard status?.can(.resume) == true else { return nil }
+        let task = recordTask.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !task.isEmpty else { return nil }
+        return SOArmDatasetSummary.newest(in: datasets.filter { taskOf($0) == task && isResumeCompatible($0) })
+    }
+
+    /// 같은 과제인데 이어 붙일 수 없는 데이터셋. 화면이 왜 새로 만드는지 말할 때 쓴다.
+    var incompatibleSameTaskDataset: SOArmDatasetSummary? {
+        guard status?.can(.resume) == true else { return nil }
+        let task = recordTask.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !task.isEmpty else { return nil }
+        return SOArmDatasetSummary.newest(in: datasets.filter { taskOf($0) == task && !isResumeCompatible($0) })
+    }
+
+    /// 서버가 센서 열을 함께 저장하는데 데이터셋에 그 열이 없으면 LeRobot의 호환 검사가 막는다.
+    /// 서버도 400으로 거절하지만, 거절을 받고 나서 아는 것보다 화면이 미리 새 데이터셋으로
+    /// 가는 편이 낫다.
+    func isResumeCompatible(_ dataset: SOArmDatasetSummary) -> Bool {
+        guard status?.can(.sensorExtras) == true else { return true }
+        return !dataset.extras.isEmpty
+    }
+
+    /// 실제로 이어 붙일 곳. 사람이 `새 데이터셋`을 골랐으면 없다.
+    var resumeTarget: SOArmDatasetSummary? { resumeExisting ? resumableDataset : nil }
+
+    /// 데이터셋 하나의 과제. 목록이 실어 준 것이 먼저고, 없으면 상세에서 읽어 둔 것.
+    func taskOf(_ dataset: SOArmDatasetSummary) -> String? {
+        if let task = dataset.singleTask { return task }
+        guard let task = datasetTasks[dataset.name], task != Self.mixedTasks else { return nil }
+        return task
+    }
+
+    /// `끝내기`가 실제로 보내는 것.
+    ///
+    /// 찍는 중이면 그 회를 **버리고** 끝낸다(`abort`) — 찍다 만 시연은 정책에게 과제 중간에
+    /// 멈추는 것을 가르친다. 회 사이(reset·saving)에는 앞 회가 이미 완성이라 `esc`로 저장하고
+    /// 끝낸다. 서버가 `abort`를 모르면 `esc`밖에 없고, 그때는 화면이 그렇게 말한다.
+    var stopControl: SOArmRecordControl {
+        if status?.recordingRuntime?.isRecordingEpisode == true, status?.can(.abort) == true { return .abort }
+        return .stop
     }
 
     /// 사람이 고른 재생 속도. 기본은 절반이다 — 처음 보는 재생은 느린 편이 낫다.
@@ -416,9 +533,32 @@ final class SOArmConsoleModel: ObservableObject {
         perform { client in try await client.stopReplay() }
     }
 
+    /// 수집 조작 하나를 보낸다. **버튼을 잠그지 않는다.**
+    ///
+    /// 전에는 다른 요청과 같은 `isBusy`를 썼고, 요청 뒤 상태를 한 번 다시 읽는 동안 버튼이
+    /// 잠겼다. 그 반 초 사이에 누른 ⇧⌘R은 아무 말 없이 버려졌다. 시연을 끝낸 손은 빠르게
+    /// 두 번 누른다. 그래서 순서대로 줄을 세워 보내고, 화면에는 가고 있다는 표시만 한다.
     func send(_ control: SOArmRecordControl) {
-        perform { client in try await client.control(control) }
+        let client = client
+        let previous = controlChain
+        pendingControls += 1
+        controlChain = Task { [weak self] in
+            await previous?.value
+            var failure: String?
+            do {
+                try await client.control(control)
+            } catch {
+                failure = Self.message(for: error)
+            }
+            guard let self else { return }
+            self.pendingControls = max(0, self.pendingControls - 1)
+            if let failure { self.errorMessage = failure }
+            await self.refresh()
+        }
     }
+
+    /// 지금 회를 끝내는 단추. 찍는 중이면 버리고, 회 사이면 저장하고 끝낸다(`stopControl`).
+    func stopRecording() { send(stopControl) }
 
     /// 도는 모드를 전부 내린다. 소프트웨어 중지이며 물리 E-stop이 아니다.
     func stopActiveMode() {
@@ -471,13 +611,19 @@ final class SOArmConsoleModel: ObservableObject {
             do {
                 let list = try await client.datasets()
                 datasets = list
+                // 목록이 과제를 실어 줬으면 그대로 받아 둔다. 상세를 하나씩 묻는 것은 그것이
+                // 없는 옛 서버에서만 한다.
+                for dataset in list where !dataset.tasks.isEmpty {
+                    datasetTasks[dataset.name] = dataset.tasks.count == 1 ? dataset.tasks[0] : Self.mixedTasks
+                }
                 loadTasks(for: list)
                 // 앞선 실패가 남아 있으면 목록이 멀쩡히 떠 있는데 붉은 줄이 함께 보인다.
                 errorMessage = nil
-                // 고른 것이 사라졌거나 아직 없으면 첫 줄을 편다. 목록만 있고 아무것도 열려
-                // 있지 않은 화면은 한 번 더 클릭을 요구할 뿐이다.
+                // 고른 것이 사라졌거나 아직 없으면 **가장 최근** 것을 편다. 목록만 있고 아무것도
+                // 열려 있지 않은 화면은 한 번 더 클릭을 요구할 뿐이고, 가장 오래된 것이 열리는
+                // 화면은 방금 찍은 것을 보러 온 사람에게 매번 다시 고르게 한다.
                 if selectedDataset == nil || !list.contains(where: { $0.name == selectedDataset }) {
-                    selectedDataset = list.first?.name
+                    selectedDataset = SOArmDatasetSummary.newest(in: list)?.name
                 }
             } catch {
                 errorMessage = Self.message(for: error)
@@ -486,12 +632,15 @@ final class SOArmConsoleModel: ObservableObject {
         }
     }
 
+    /// 과제가 여럿 섞인 데이터셋의 표식.
+    static let mixedTasks = "여러 과제"
+
     /// 과제 문장을 모르는 데이터셋만 골라 한 번씩 더 물어 온다.
     ///
     /// 한 번 안 것은 다시 묻지 않는다. 데이터셋은 다시 찍히지 않는 한 과제가 바뀌지
     /// 않으므로, 새로고침마다 전부 다시 물으면 터널 너머로 같은 답을 반복해 받게 된다.
     private func loadTasks(for list: [SOArmDatasetSummary]) {
-        let missing = list.map(\.name).filter { datasetTasks[$0] == nil }
+        let missing = list.filter { $0.tasks.isEmpty && datasetTasks[$0.name] == nil }.map(\.name)
         guard !missing.isEmpty else { return }
         let client = client
         Task {
@@ -502,7 +651,7 @@ final class SOArmConsoleModel: ObservableObject {
                 // 들어오더라도 화면이 틀리지 않게 한다.
                 let tasks = detail.episodes.compactMap { $0.task.isEmpty ? nil : $0.task }
                 if let first = tasks.first {
-                    datasetTasks[name] = Set(tasks).count == 1 ? first : "여러 과제"
+                    datasetTasks[name] = Set(tasks).count == 1 ? first : Self.mixedTasks
                 }
             }
         }
@@ -514,7 +663,181 @@ final class SOArmConsoleModel: ObservableObject {
     /// `빨간 블록을 집는다`가 서로 다른 묶음이 된다. 고를 수 있게 해 두는 것이
     /// 문자열을 같게 유지하는 유일한 길이다.
     var knownTasks: [String] {
-        Array(Set(datasetTasks.values)).filter { $0 != "여러 과제" }.sorted()
+        Array(Set(datasetTasks.values)).filter { $0 != Self.mixedTasks }.sorted()
+    }
+
+    /// 고른 회의 관절 궤적을 읽는다. 서버가 없는 회(404)나 옛 서버(경로 없음)면 조용히 비운다.
+    private func loadTrajectory() {
+        trajectory = nil
+        isLoadingTrajectory = false
+        guard let dataset = selectedDataset, let episode = selectedEpisode else { return }
+        isLoadingTrajectory = true
+        let client = client
+        Task {
+            let value = try? await client.trajectory(dataset, episode: episode)
+            guard selectedDataset == dataset, selectedEpisode == episode else { return }
+            trajectory = value
+            isLoadingTrajectory = false
+        }
+    }
+
+    // MARK: 지우기
+
+    /// 데이터셋 하나를 지운다. 서버는 `data/.trash`로 옮기므로 되돌릴 수 있다.
+    func deleteDataset(_ name: String) {
+        guard deletingDataset == nil else { return }
+        deletingDataset = name
+        let client = client
+        Task {
+            do {
+                try await client.deleteDataset(name)
+                errorMessage = nil
+                datasetTasks[name] = nil
+                if selectedDataset == name { selectedDataset = nil }
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            deletingDataset = nil
+            loadDatasets()
+        }
+    }
+
+    /// 고른 데이터셋에서 한 회를 지운다. 영상을 다시 굽는 일이라 데이터셋이 크면 몇 분이 걸린다.
+    func deleteEpisode(_ index: Int) {
+        guard deletingEpisode == nil, let name = selectedDataset else { return }
+        deletingEpisode = index
+        let client = client
+        Task {
+            do {
+                try await client.deleteEpisode(name, index: index)
+                errorMessage = nil
+                // 회 번호가 당겨지므로 상세를 다시 읽는다. 과제 표도 다시 채운다.
+                datasetTasks[name] = nil
+                if selectedDataset == name { loadDataset(name) }
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            deletingEpisode = nil
+            loadDatasets()
+        }
+    }
+
+    // MARK: 학습
+
+    /// 학습을 시작한다. 콘솔 서버가 학습 서버의 tmux에 띄우고 곧 돌아온다.
+    func startTraining(_ dataset: String) {
+        guard startingTraining == nil else { return }
+        startingTraining = dataset
+        let client = client
+        let policy = trainingPolicy
+        Task {
+            do {
+                _ = try await client.startTraining(dataset: dataset, policy: policy)
+                errorMessage = nil
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            startingTraining = nil
+            loadSpark()
+        }
+    }
+
+    func stopTraining(_ run: String) {
+        guard stoppingTraining == nil else { return }
+        stoppingTraining = run
+        let client = client
+        Task {
+            do {
+                try await client.stopTraining(run: run)
+                errorMessage = nil
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            stoppingTraining = nil
+            loadSpark()
+        }
+    }
+
+    var isAnyTraining: Bool { sparkRuns.contains { $0.isTraining } }
+
+    /// 학습이 돌고 있으면 몇 초마다 진행을 다시 읽는다. 화면이 열려 있을 때만.
+    private func scheduleSparkPolling() {
+        sparkPollTask?.cancel()
+        sparkPollTask = nil
+        guard isScreenVisible, isAnyTraining else { return }
+        sparkPollTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self, self.isScreenVisible else { return }
+            self.loadSpark()
+        }
+    }
+
+    // MARK: 재생 미리보기
+
+    /// 재생 확인 시트가 열릴 때, 팔이 지금 자리에서 첫 자세까지 얼마나 가야 하는지 서버에 묻는다.
+    func loadReplayPreview() {
+        replayPreview = nil
+        guard status?.can(.replayPreview) == true, let dataset = selectedDataset, let episode = selectedEpisode else { return }
+        isLoadingReplayPreview = true
+        let client = client
+        Task {
+            let value = try? await client.replayPreview(dataset: dataset, episode: episode)
+            guard selectedDataset == dataset, selectedEpisode == episode else { return }
+            replayPreview = value
+            isLoadingReplayPreview = false
+        }
+    }
+
+    // MARK: 수집 중 스냅숏
+
+    /// 수집이 돌고, 서버가 스냅숏을 내주고, 화면이 보이고, 영상 받기를 끄지 않았을 때만 돈다.
+    ///
+    /// 받는 양은 `영상 받기`를 따른다. 스냅숏도 바이트다 — `절약`이면 초당 한 장, `보통`이면
+    /// 세 장, `최고`면 다섯 장. `끔`이면 받지 않는다.
+    private func updateSnapshotPolling() {
+        let wants = isScreenVisible
+            && (status?.recording.running ?? false)
+            && (status?.can(.preview) ?? false)
+            && !cameraPolicy.isOff
+        if wants {
+            guard snapshotTask == nil else { return }
+            let interval: Duration = switch cameraPolicy.mode {
+            case .saver: .milliseconds(1000)
+            case .medium: .milliseconds(330)
+            default: .milliseconds(200)
+            }
+            snapshotTask = Task { [weak self] in
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+                configuration.timeoutIntervalForRequest = 2
+                configuration.waitsForConnectivity = false
+                let session = URLSession(configuration: configuration)
+                defer { session.finishTasksAndInvalidate() }
+                while !Task.isCancelled {
+                    guard let self else { return }
+                    let client = self.client
+                    // 두 카메라를 모은 뒤 **한 번에** 넣는다. 역할마다 넣으면 그때마다 화면
+                    // 전체가 다시 그려지고, 초당 열 번 다시 그려지는 화면에서는 0.25초짜리
+                    // 타이머가 발화할 틈이 없다 — 실제로 그것이 회 시계를 얼렸다.
+                    var frames: [SOArmCameraRole: NSImage] = [:]
+                    for role in SOArmCameraRole.allCases {
+                        var request = URLRequest(url: client.recordingPreviewURL(role))
+                        request.cachePolicy = .reloadIgnoringLocalCacheData
+                        request.timeoutInterval = 2
+                        guard let (data, response) = try? await session.data(for: request),
+                              (response as? HTTPURLResponse)?.statusCode == 200,
+                              let image = NSImage(data: data) else { continue }
+                        frames[role] = image
+                    }
+                    if !frames.isEmpty { self.recordingSnapshots = frames }
+                    try? await Task.sleep(for: interval)
+                }
+            }
+        } else if snapshotTask != nil || !recordingSnapshots.isEmpty {
+            snapshotTask?.cancel()
+            snapshotTask = nil
+            recordingSnapshots = [:]
+        }
     }
 
     private func loadDataset(_ name: String) {
@@ -569,6 +892,7 @@ final class SOArmConsoleModel: ObservableObject {
                 sparkRuns = []
             }
             isLoadingSpark = false
+            scheduleSparkPolling()
         }
     }
 

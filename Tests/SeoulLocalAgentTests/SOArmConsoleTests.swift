@@ -264,15 +264,20 @@ struct SOArmConsoleTests {
 
     // MARK: 녹화 제어
 
-    /// 서버 `record_manager.control()`은 `right` · `left` · `esc`만 받고 나머지는 409로
-    /// 거절한다. 화면 문구를 그대로 보내면 수집 중 버튼 셋이 전부 실패한다.
+    /// 서버 `record_manager.control()`은 LeRobot 키 이름 `right` · `left` · `esc`와 서버가
+    /// 더한 `abort`만 받고 나머지는 409로 거절한다. 화면 문구를 그대로 보내면 수집 중 버튼이
+    /// 전부 실패한다.
     @Test("제어 버튼은 서버가 아는 키를 보낸다")
     func sendsKeysTheServerAccepts() {
         #expect(SOArmRecordControl.success.rawValue == "right")
         #expect(SOArmRecordControl.retry.rawValue == "left")
         #expect(SOArmRecordControl.stop.rawValue == "esc")
-        #expect(Set(SOArmRecordControl.allCases.map(\.rawValue)) == ["right", "left", "esc"])
-        #expect(SOArmRecordControl.success.title == "성공 저장")
+        #expect(SOArmRecordControl.abort.rawValue == "abort")
+        #expect(Set(SOArmRecordControl.allCases.map(\.rawValue)) == ["right", "left", "esc", "abort"])
+        // 이름이 하는 일을 말한다. `esc`는 LeRobot이 찍다 만 회도 저장하고 끝내는 키다.
+        #expect(SOArmRecordControl.success.title == "지금 저장")
+        #expect(SOArmRecordControl.stop.title == "저장하고 끝내기")
+        #expect(SOArmRecordControl.abort.title == "버리고 끝내기")
     }
 
     @Test("확인 문구는 서버가 비교하는 문자열 그대로다")
@@ -285,12 +290,27 @@ struct SOArmConsoleTests {
 
     @Test("HTTP 코드마다 다른 뜻으로 옮긴다")
     func mapsHTTPStatusCodes() {
-        let detail = Data(#"{"detail":"Stop recording before teleoperation"}"#.utf8)
-        #expect(SOArmClient.error(status: 400, body: detail) == .confirmationMismatch("Stop recording before teleoperation"))
-        #expect(SOArmClient.error(status: 409, body: detail) == .blocked("Stop recording before teleoperation"))
-        #expect(SOArmClient.error(status: 500, body: detail) == .serverFailure("Stop recording before teleoperation"))
+        // 번역표에 없는 문장이라야 코드별 분류만 본다. 아는 문장은 아래 시험이 따로 본다.
+        let detail = Data(#"{"detail":"Some refusal the app has never seen"}"#.utf8)
+        #expect(SOArmClient.error(status: 400, body: detail) == .confirmationMismatch("Some refusal the app has never seen"))
+        #expect(SOArmClient.error(status: 409, body: detail) == .blocked("Some refusal the app has never seen"))
+        #expect(SOArmClient.error(status: 500, body: detail) == .serverFailure("Some refusal the app has never seen"))
         // 본문이 없으면 코드라도 남긴다.
         #expect(SOArmClient.error(status: 409, body: Data()) == .blocked("HTTP 409"))
+    }
+
+    /// 서버가 영어로 적어 보내는 거절 가운데 화면이 아는 것들. 세션마다 떠 있던 것이 이 줄들이다.
+    @Test("거절 문장을 무엇을 해야 하는지로 옮긴다")
+    func translatesRefusals() {
+        #expect(SOArmServerText.korean("Hardware doctor did not pass").contains("진단"))
+        #expect(SOArmServerText.korean("Read-only hardware doctor did not confirm healthy buses with torque disabled").contains("진단"))
+        #expect(SOArmServerText.korean("Device is owned by record-leader (pid 5): /dev/ttyACM0").contains("다른 프로세스"))
+        #expect(SOArmServerText.korean("Stop recording before teleoperation").contains("수집"))
+        #expect(SOArmServerText.korean("Unknown recording control").contains("서버"))
+        #expect(SOArmServerText.korean("Training is already running: pick__act__1").contains("학습"))
+        // 학습 서버 상태의 실패도 같은 표를 지난다.
+        let spark = SOArmSparkStatus(Data(#"{"reachable": false, "error": "The training machine did not answer", "host": "spark"}"#.utf8))
+        #expect(spark.failure?.contains("응답하지") == true)
     }
 
     /// 409는 잠깐 기다렸다 다시 부른다고 풀리지 않는다. 재시도 대상은 연결 실패뿐이다.
@@ -625,6 +645,294 @@ struct SOArmConsoleTests {
         #expect(status.sceneCamera.modes.isEmpty)
         #expect(status.sceneCamera.resolutions.isEmpty)
         #expect(status.recordingProfile == SOArmCameraProfile.recordingDefault)
+    }
+
+    // MARK: 서버가 할 수 있는 것
+
+    /// 새 단추는 서버가 그 이름을 적어 보낼 때만 나온다. 옛 서버는 빈 목록이고, 그때 화면은
+    /// 예전과 똑같이 동작해야 한다 — 눌러도 서버가 모르는 요청을 보내는 단추가 먼저 나오면
+    /// 화면은 고장 난 것처럼 보인다.
+    @Test("서버가 적어 보낸 이름으로만 새 기능을 켠다")
+    func gatesFeaturesOnCapabilities() throws {
+        let old = try SOArmStatus.parse(Data(#"{"motion_enabled": true}"#.utf8))
+        #expect(!old.can(.abort))
+        #expect(!old.can(.resume))
+        #expect(!old.can(.train))
+
+        let new = try SOArmStatus.parse(Data(#"{"capabilities": ["abort", "resume", "preview", "replay_preview", "soft_start"]}"#.utf8))
+        #expect(new.can(.abort))
+        #expect(new.can(.resume))
+        #expect(new.can(.preview))
+        #expect(new.can(.replayPreview))
+        #expect(new.can(.softStart))
+        #expect(!new.can(.delete))
+        // 서버 저장소와 글자까지 같아야 하는 이름들.
+        #expect(SOArmCapability.replayPreview.rawValue == "replay_preview")
+        #expect(SOArmCapability.softStart.rawValue == "soft_start")
+    }
+
+    /// 토크는 서버가 부드러운 시작을 할 수 있으면 더는 시작 조건이 아니다. 같은 진단이 옛
+    /// 서버에서는 경고, 새 서버에서는 정상으로 읽혀야 하고, 온도는 새 줄로 나온다.
+    @Test("토크가 걸린 팔은 새 서버에서는 경고가 아니고, 온도는 따로 읽는다")
+    func readsTorqueAndTemperatureAgainstCapabilities() throws {
+        let doctor = """
+        "doctor": {"healthy": true, "safe_for_motion_start": true, "arms": {
+          "leader": {"role": "leader", "healthy": true, "safe_for_motion_start": true,
+                     "models": {"1": 777}, "torque_enabled": {"a": 0}, "voltage_raw": {"a": 121},
+                     "temperature": {"a": 0}},
+          "follower": {"role": "follower", "healthy": true, "safe_for_motion_start": true,
+                       "models": {"1": 777}, "torque_enabled": {"a": 1}, "voltage_raw": {"a": 121},
+                       "temperature": {"a": 40, "b": 50}}}}
+        """
+        let old = try SOArmStatus.parse(Data("{\(doctor)}".utf8))
+        let new = try SOArmStatus.parse(Data("{\"capabilities\": [\"soft_start\"], \(doctor)}".utf8))
+        let server = SOArmServer(host: "h", user: "u")
+        func check(_ status: SOArmStatus, _ title: String) -> SOArmCheck? {
+            SOArmDiagnosis.checks(server: server, status: status).first { $0.title == title }
+        }
+        #expect(check(old, "토크 상태")?.state == .warning)
+        #expect(check(new, "토크 상태")?.state == .ok)
+        #expect(check(new, "토크 상태")?.summary.contains("시작을 막지 않습니다") == true)
+        // 온도. 토크가 꺼진 모터의 0은 읽기 실패가 아니라 갱신되지 않는 값이므로 뺀다.
+        let follower = try #require(new.doctor?.arms.last)
+        #expect(follower.maxTemperature == 50)
+        #expect(new.doctor?.arms.first?.maxTemperature == nil)
+        #expect(follower.summary.contains("최고 50°C"))
+        #expect(follower.summary.contains("토크 걸림"))
+        #expect(check(new, "모터 온도")?.state == .ok)
+        #expect(check(new, "모터 온도")?.summary.contains("팔로워 최고 50°C") == true)
+    }
+
+    /// 회 시계가 실제로 흘러야 한다. 수집 중 화면이 초당 열 번 다시 그려지면서 0.25초짜리
+    /// 타이머가 한 번도 발화하지 못해 경과가 0에 얼어붙은 적이 있다 — 그때 화면은 회 내내
+    /// `남은 30초`였다. 이제 일정은 `TimelineView`가 쥐고, 남은 초 계산은 여기서 확인한다.
+    @Test("남은 시간은 흐르고, 서버 시계가 앞서도 음수가 되지 않는다")
+    func countsRemainingSeconds() {
+        let started = Date(timeIntervalSince1970: 1_000)
+        #expect(SOArmEpisodeClock.remaining(now: started, started: started, total: 30) == 30)
+        #expect(SOArmEpisodeClock.remaining(now: started.addingTimeInterval(10), started: started, total: 30) == 20)
+        // 다 지난 회는 0에서 멈춘다. 음수가 나오면 화면이 `남은 -5초`를 적는다.
+        #expect(SOArmEpisodeClock.remaining(now: started.addingTimeInterval(45), started: started, total: 30) == 0)
+        // 서버 시계가 앞서 있어도(프레임이 미래에서 오면) 남은 시간이 늘어나지 않는다.
+        #expect(SOArmEpisodeClock.remaining(now: started.addingTimeInterval(-5), started: started, total: 30) == 30)
+    }
+
+    @Test("회 사이 정리 시간과 저장 단계를 서버 이름 그대로 읽는다")
+    func readsResetAndSavingPhases() {
+        let resetting = SOArmRecordingRuntime([
+            "phase": "resetting", "reset_started_at": 1_788_600_000.0, "reset_seconds": 15,
+            "episode_started_at": NSNull(), "episode_index": 3, "episodes_saved": 3, "resumed": true,
+        ])
+        #expect(resetting.isResetting)
+        #expect(resetting.resetStartedAt == Date(timeIntervalSince1970: 1_788_600_000))
+        #expect(resetting.resetSeconds == 15)
+        #expect(resetting.episodesSaved == 3)
+        #expect(resetting.resumed)
+        #expect(resetting.episodeStartedAt == nil)
+        #expect(resetting.phaseTitle == "다음 회 준비 중")
+
+        let saving = SOArmRecordingRuntime(["phase": "saving"])
+        #expect(saving.isSaving)
+        #expect(saving.phaseTitle == "저장 중")
+        #expect(!saving.isFinished)
+
+        let done = SOArmRecordingRuntime(["phase": "complete", "episodes_saved": 12])
+        #expect(done.isFinished)
+        // 루프가 서 있는 동안 서버가 버린 키. 6초 안이면 화면이 말해 주고, 지나면 조용해진다.
+        let now = Date()
+        let ignored = SOArmRecordingRuntime([
+            "phase": "saving",
+            "last_control_ignored": ["key": "right", "reason": "no loop running", "at": now.timeIntervalSince1970 - 2],
+        ])
+        #expect(ignored.recentlyIgnoredControl(now: now) == "right")
+        #expect(ignored.recentlyIgnoredControl(now: now.addingTimeInterval(10)) == nil)
+        #expect(SOArmRecordingRuntime(["phase": "saving"]).recentlyIgnoredControl(now: now) == nil)
+        // 건너뛴 빈 회와 직전 저장 시간. 옛 서버는 둘 다 없다.
+        let counted = SOArmRecordingRuntime(["phase": "saving", "empty_episodes_skipped": 2, "saving_seconds_estimate": 7.45])
+        #expect(counted.emptyEpisodesSkipped == 2)
+        #expect(counted.savingSecondsEstimate == 7.45)
+        let bare = SOArmRecordingRuntime(["phase": "recording"])
+        #expect(bare.emptyEpisodesSkipped == 0 && bare.savingSecondsEstimate == nil)
+        // 옛 서버는 이 키들을 모른다. 빈 채로 읽혀야 한다.
+        let old = SOArmRecordingRuntime(["phase": "recording", "episode_started_at": 1.0])
+        #expect(old.resetStartedAt == nil && old.resetSeconds == nil && old.episodesSaved == nil && !old.resumed)
+    }
+
+    /// 이어 찍기는 `dataset`과 `resume`을 함께 보내는 것이고, 새로 찍을 때는 둘 다 없어야
+    /// 옛 서버가 그대로 새 데이터셋을 만든다.
+    @Test("이어 찍기는 데이터셋 이름과 resume을 함께 보낸다")
+    func buildsRecordingBody() {
+        let fresh = SOArmClient.recordingBody(
+            confirmation: "RECORD SOARM101", task: "Pick the block", episodes: 1000, episodeSeconds: 30, resumeDataset: nil
+        )
+        #expect(fresh["dataset"] == nil)
+        #expect(fresh["resume"] == nil)
+        #expect(fresh["episodes"] as? Int == 1000)
+
+        let resumed = SOArmClient.recordingBody(
+            confirmation: "RECORD SOARM101", task: "Pick the block", episodes: 1000, episodeSeconds: 30,
+            resumeDataset: "pick_the_block_20260905"
+        )
+        #expect(resumed["dataset"] as? String == "pick_the_block_20260905")
+        #expect(resumed["resume"] as? Bool == true)
+    }
+
+    /// 목록은 이름 오름차순이고 이름은 타임스탬프라, `first`는 가장 오래된 것이다.
+    @Test("자동으로 여는 데이터셋은 가장 최근 것이다")
+    func picksTheNewestDataset() throws {
+        let list = try SOArmDatasetSummary.list(Data("""
+        [{"name": "soarm101_20260905_072242", "recorded_at": 1788592998.5},
+         {"name": "soarm101_20260905_092024", "recorded_at": 1788600073.9},
+         {"name": "aaa_no_stamp"}]
+        """.utf8))
+        #expect(SOArmDatasetSummary.newest(in: list)?.name == "soarm101_20260905_092024")
+        #expect(SOArmDatasetSummary.newest(in: []) == nil)
+    }
+
+    @Test("목록의 과제와 품질을 읽고, 걸리는 값을 가려낸다")
+    func readsTasksAndQuality() throws {
+        let list = try SOArmDatasetSummary.list(Data("""
+        [{"name": "a", "tasks": ["Pick the block"],
+          "quality": {"loop_hz": 29.9, "camera_stale_pct": {"observation.images.scene": 2.2, "observation.images.wrist": 3.3}, "slow_loop_warnings": 0}},
+         {"name": "b", "tasks": ["x", "y"], "quality": {"loop_hz": 24.1, "camera_stale_pct": {}, "slow_loop_warnings": 7}},
+         {"name": "c"}]
+        """.utf8))
+        #expect(list[0].singleTask == "Pick the block")
+        #expect(list[0].quality?.hasConcern == false)
+        #expect(list[0].quality?.text.contains("29.9Hz") == true)
+        #expect(list[0].quality?.text.contains("작업공간 2.2%") == true)
+        #expect(list[1].singleTask == nil)
+        #expect(list[1].quality?.hasConcern == true)
+        #expect(list[1].quality?.text.contains("느린 루프 경고 7번") == true)
+        // 옛 서버: 과제도 품질도 없다.
+        #expect(list[2].tasks.isEmpty)
+        #expect(list[2].quality == nil)
+    }
+
+    @Test("관절 궤적을 서버 순서 그대로 읽고 솎아 그린다")
+    func readsTrajectory() throws {
+        let json = """
+        {"fps": 30, "frames": 4, "joints": ["shoulder_pan.pos", "gripper.pos"],
+         "state":  [[0.0, 10.0], [1.0, 11.0], [2.0, 12.0], [3.0, 13.0]],
+         "action": [[0.0, 10.0], [1.5, 11.0], [2.0, 12.0], [9.0, 13.0]]}
+        """
+        let trajectory = try SOArmTrajectory.parse(Data(json.utf8))
+        // `.pos`는 뗀다. 이름은 화면이 붙인다.
+        #expect(trajectory.joints == ["shoulder_pan", "gripper"])
+        #expect(trajectory.frames == 4)
+        #expect(trajectory.largestGap(joint: 0) == 6.0)
+        #expect(trajectory.largestGap(joint: 1) == 0.0)
+        let points = trajectory.points(joint: 0, of: trajectory.state, stride: 2)
+        #expect(points.map(\.frame) == [0, 2])
+        #expect(points[1].seconds == 2.0 / 30.0)
+        #expect(SOArmTrajectory.label("shoulder_lift") == "어깨 들기")
+        // 옛 서버: 추가 열이 없다.
+        #expect(!trajectory.hasLoad && !trajectory.hasVelocity && !trajectory.hasCameraFresh)
+        // 관측과 명령의 길이가 다르면 그리지 않는다. 어느 줄이 어느 프레임인지 알 수 없다.
+        #expect(throws: SOArmError.self) {
+            try SOArmTrajectory.parse(Data(#"{"joints": ["a"], "state": [[1]], "action": []}"#.utf8))
+        }
+    }
+
+    /// 서보가 내주는 값을 전부 저장하는 서버는 궤적에 부하·속도·카메라 새 프레임 여부를 함께 준다.
+    /// 길이가 안 맞는 열은 그 열만 버리고 위치 곡선은 그대로 그린다.
+    @Test("부하·속도·중복 프레임 열을 읽고, 길이가 어긋난 열만 버린다")
+    func readsSensorExtras() throws {
+        let json = """
+        {"fps": 30, "joints": ["gripper.pos"],
+         "state": [[10.0], [11.0], [12.0], [13.0]], "action": [[10.0], [11.0], [12.0], [13.0]],
+         "load": [[5.0], [80.0], [-600.0], [90.0]],
+         "velocity": [[1.0], [0.0]],
+         "camera_fresh": [[1, 1], [1, 0], [0, 0], [1, 1]], "camera_keys": ["scene", "wrist"]}
+        """
+        let trajectory = try SOArmTrajectory.parse(Data(json.utf8))
+        #expect(trajectory.hasLoad)
+        #expect(!trajectory.hasVelocity)
+        #expect(trajectory.hasCameraFresh)
+        #expect(trajectory.cameraKeys == ["scene", "wrist"])
+        #expect(trajectory.staleFrames == [1, 2])
+        #expect(trajectory.stalePercent == 50)
+        #expect(trajectory.points(joint: 0, of: trajectory.load).map(\.value) == [5, 80, -600, 90])
+
+        let list = try SOArmDatasetSummary.list(Data("""
+        [{"name": "a", "extras": ["load", "velocity", "camera_fresh"]}, {"name": "b"}]
+        """.utf8))
+        #expect(list[0].extrasText == "부하·속도·새 프레임 여부")
+        #expect(list[1].extrasText == nil)
+        #expect(SOArmCapability.sensorExtras.rawValue == "sensor_extras")
+    }
+
+    /// 서버는 값을 고치지 않고 **읽기의 사실**만 남긴다. 그 열을 읽어 몇 행이 새 판독이
+    /// 아닌지 세고, 품질 요약은 고친 수가 아니라 **센 수**를 적는다.
+    @Test("판독 반복 행과 센 이상값을 읽되, 값은 그대로 둔다")
+    func readsSensorReadFacts() throws {
+        let json = """
+        {"fps": 30, "joints": ["gripper.pos"],
+         "state": [[10.0], [11.0], [12.0], [13.0]], "action": [[10.0], [11.0], [12.0], [13.0]],
+         "load": [[5.0], [80.0], [80.0], [90.0]],
+         "sensor_read_ok": [[1], [1], [0], [1]]}
+        """
+        let trajectory = try SOArmTrajectory.parse(Data(json.utf8))
+        #expect(trajectory.hasSensorReadOk)
+        #expect(trajectory.repeatedSensorFrames == [2])
+        // 되쓴 행의 값도 그대로 읽힌다 — 지우거나 비우지 않는다.
+        #expect(trajectory.points(joint: 0, of: trajectory.load).map(\.value) == [5, 80, 80, 90])
+
+        let quality = try #require(SOArmRecordingQuality([
+            "loop_hz": 29.9,
+            "camera_stale_pct": ["observation.images.scene": 2.54],
+            "camera_stale_frames": 57, "total_frames": 1104,
+            "slow_loop_warnings": 0, "sensor_read_failures": 3,
+            "sensor_implausible": ["temperature": 5, "voltage": 1],
+            "sensor_block_read_ms_p50": 2.17, "sensor_block_read_ms_p99": 2.38,
+        ]))
+        #expect(quality.sensorReadFailures == 3)
+        #expect(quality.sensorImplausible["temperature"] == 5)
+        #expect(quality.text.contains("중복 프레임 작업공간 2.5% (57/1104장)"))
+        #expect(quality.text.contains("서보 판독 실패 3프레임"))
+        #expect(quality.text.contains("불가능한 판독 온도 5 / 전압 1개"))
+        #expect(quality.text.contains("서보 읽기 2.2ms"))
+        // 읽기 실패는 데이터의 구멍이라 경고, 센 이상값 자체는 경고가 아니다.
+        #expect(quality.hasConcern)
+        let counted = try #require(SOArmRecordingQuality(["loop_hz": 29.9, "sensor_implausible": ["temperature": 5]]))
+        #expect(!counted.hasConcern)
+        // 옛 데이터셋의 quality 에는 새 키가 없다.
+        let old = try #require(SOArmRecordingQuality(["loop_hz": 29.9, "slow_loop_warnings": 0]))
+        #expect(old.sensorReadFailures == 0 && old.sensorImplausible.isEmpty && old.blockReadMsP50 == nil)
+    }
+
+    @Test("학습 진행을 실행 목록에서 읽는다")
+    func readsTrainingProgress() throws {
+        let runs = try SOArmSparkRun.list(Data("""
+        [{"run": "pick__act__20260905_1900", "checkpoints": [{"step": "020000", "size_bytes": 10, "finished_at": 1.0}],
+          "training": {"running": true, "step": 25000, "steps": 100000, "loss": 0.0421, "policy": "act",
+                       "started_at": 1000.0, "updated_at": 1600.0, "log_tail": ["step:25000 loss:0.0421"]}},
+         {"run": "smoke_act", "checkpoints": [{"step": "000200", "size_bytes": 5, "finished_at": 1.0}]}]
+        """.utf8))
+        #expect(runs.count == 2)
+        let training = try #require(runs[0].training)
+        #expect(runs[0].isTraining)
+        #expect(training.progress == 0.25)
+        // 600초에 25,000스텝이면 남은 75,000스텝은 1,800초다.
+        #expect(training.remainingSeconds == 1800)
+        #expect(training.text.contains("25000/100000 스텝"))
+        #expect(training.text.contains("loss 0.042"))
+        #expect(runs[1].training == nil)
+        #expect(!runs[1].isTraining)
+    }
+
+    @Test("재생 미리보기는 관절별 거리와 정렬 시간을 준다")
+    func readsReplayPreview() throws {
+        let preview = try SOArmReplayPreview.parse(Data("""
+        {"joints": [{"name": "shoulder_lift.pos", "from": -100.0, "to": -62.0, "distance": 38.0, "unit": "°"},
+                    {"name": "gripper.pos", "from": 10.0, "to": 12.0, "distance": 2.0, "unit": "%"}],
+         "align_seconds": 4.5}
+        """.utf8))
+        #expect(preview.joints.map(\.name) == ["shoulder_lift", "gripper"])
+        #expect(preview.farthest?.name == "shoulder_lift")
+        #expect(preview.alignSeconds == 4.5)
+        #expect(preview.refusal == nil)
+        #expect(preview.joints[0].text.contains("어깨 들기"))
     }
 }
 
