@@ -62,6 +62,10 @@ enum WebNoticeCatalog {
         site("학부대학", "https://snuc.snu.ac.kr/공지사항/", feed: "https://snuc.snu.ac.kr\(kboardFeed)"),
         site("전기·정보공학부", "https://ece.snu.ac.kr/community/admissions?sc=y"),
         site("서울대 SR", "https://snusr.snu.ac.kr/community/notice"),
+        // Not a notice board: every row is a programme open for application,
+        // university-wide, with its own 신청기간. The default filter on this page
+        // is 모집중·마감임박·모집대기, so what is read is what can still be applied to.
+        site("SNU 비교과", "https://extra.snu.ac.kr/ptfol/pgm/index.do"),
         programs("인문대학", "https://humanities.snu.ac.kr/community/notice"),
         programs("경영대학", "https://cba.snu.ac.kr/newsroom/notice?sc=y"),
         programs("농업생명과학대학", "https://cals.snu.ac.kr/board/notice"),
@@ -99,10 +103,20 @@ struct WebNoticeConfiguration: Codable {
 
     /// Writes the catalogue out on first use so the list is discoverable and
     /// editable without touching the app.
+    ///
+    /// The file wins for every board it already names — that is how a site is
+    /// disabled or corrected — but a board added to the catalogue afterwards
+    /// would otherwise never reach a Mac that already has the file, so new
+    /// entries are appended and the file is rewritten.
     static func load(url: URL = Self.url) -> [WebNoticeSite] {
         if let data = try? Data(contentsOf: url),
            let stored = try? JSONDecoder().decode(Self.self, from: data), !stored.sites.isEmpty {
-            return stored.sites
+            let known = Set(stored.sites.map(\.id))
+            let added = WebNoticeCatalog.defaults.filter { !known.contains($0.id) }
+            guard !added.isEmpty else { return stored.sites }
+            let merged = stored.sites + added
+            try? LocalFileStorage.write(try JSONEncoder().encode(Self(sites: merged)), to: url)
+            return merged
         }
         let configuration = Self(sites: WebNoticeCatalog.defaults)
         try? LocalFileStorage.write(try JSONEncoder().encode(configuration), to: url)
@@ -396,28 +410,58 @@ private final class FeedParser: NSObject, XMLParserDelegate {
 /// `?bbsidx=57983`, `?md=v&bbsidx=3976`, or a path ending in digits — while the
 /// navigation around it does not. That one rule is what separates the notices from
 /// the menus without a per-site selector to maintain.
+///
+/// A second family links through a script call instead of an address:
+/// `onclick="global.write('PGM012002141', '/ptfol/pgm/view.do')"` drops the id into
+/// the page's search form and submits it. That form is a GET, so the same target is
+/// reachable as a plain URL — which is what a briefing line needs, something the
+/// reader can click — and the id is rebuilt into one here.
 enum HTMLNoticeExtractor {
     private static let anchor = try! NSRegularExpression(pattern: "<a\\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", options: [.caseInsensitive, .dotMatchesLineSeparators])
     private static let identifier = try! NSRegularExpression(pattern: "(?:^|[?&])[a-z_]*(?:idx|no|seq|id|uid|nttid|articleno)=\\d{2,}|/\\d{3,}(?:$|[/?#])", options: [.caseInsensitive])
+    private static let scriptCall = try! NSRegularExpression(
+        pattern: "<a\\b[^>]*onclick=[\"'][^\"']*global\\.write\\(\\s*'([A-Za-z0-9_-]{4,})'\\s*,\\s*'([^']+)'[^\"']*[\"'][^>]*>(.*?)</a>",
+        options: [.caseInsensitive, .dotMatchesLineSeparators])
     static let maximumEntries = 40
 
     static func entries(in html: String, pageURL: URL) -> [WebNoticeEntry] {
         var results: [WebNoticeEntry] = []
         var seen = Set<String>()
         let range = NSRange(html.startIndex..., in: html)
+
+        /// Both families end here: a post is only an entry if its address is on
+        /// this board's own host, has not been linked already on the page, and
+        /// carries a label long enough to be a title rather than a button.
+        func append(href: String, label: String) {
+            let title = label.strippingTags().decodingHTMLEntities()
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard title.count >= 8, title.count <= 150 else { return }
+            guard let url = URL(string: href, relativeTo: pageURL)?.absoluteURL,
+                  url.host == pageURL.host, seen.insert(url.absoluteString).inserted else { return }
+            results.append(WebNoticeEntry(title: title, link: url, summary: "", published: nil))
+        }
+
         for match in anchor.matches(in: html, range: range) {
             guard let hrefRange = Range(match.range(at: 1), in: html),
                   let textRange = Range(match.range(at: 2), in: html) else { continue }
             let href = String(html[hrefRange]).decodingHTMLEntities()
             let identifierRange = NSRange(href.startIndex..., in: href)
             guard identifier.firstMatch(in: href, range: identifierRange) != nil else { continue }
-            let title = String(html[textRange]).strippingTags().decodingHTMLEntities()
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard title.count >= 8, title.count <= 150 else { continue }
-            guard let url = URL(string: href, relativeTo: pageURL)?.absoluteURL,
-                  url.host == pageURL.host, seen.insert(url.absoluteString).inserted else { continue }
-            results.append(WebNoticeEntry(title: title, link: url, summary: "", published: nil))
+            append(href: href, label: String(html[textRange]))
+            if results.count >= maximumEntries { break }
+        }
+        guard results.count < maximumEntries else { return results }
+
+        for match in scriptCall.matches(in: html, range: range) {
+            guard let idRange = Range(match.range(at: 1), in: html),
+                  let pathRange = Range(match.range(at: 2), in: html),
+                  let textRange = Range(match.range(at: 3), in: html) else { continue }
+            let id = String(html[idRange])
+            let path = String(html[pathRange]).decodingHTMLEntities()
+            // `currentPageNo` is the field the form always carries; the detail page
+            // answers with it and the id alone, and refuses without it.
+            append(href: "\(path)?currentPageNo=1&dataSeq=\(id)&parentSeq=\(id)", label: String(html[textRange]))
             if results.count >= maximumEntries { break }
         }
         return results

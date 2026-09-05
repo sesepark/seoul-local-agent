@@ -212,6 +212,7 @@ struct BriefingService {
             • Slack: 접근 가능한 채널·DM의 새 메시지 검색
             • 메시지: iMessage·SMS·RCS 수신 메시지 검색
             • 캘린더: 앞으로 14일 일정 읽기
+            • eTL: 이번 학기 과목의 새 공지와 다가온 과제 마감 확인
             • 웹 공지: 등록한 학교 공지 게시판의 새 글 확인
             """, nil)
             let iMessageSince = manualSince ?? state.checkpoints["imessage"] ?? initial
@@ -223,11 +224,18 @@ struct BriefingService {
             async let webResult = collectSafely(checkpointKey: "web", sourceName: "웹 공지") {
                 await WebNoticeSource().collect(persists: persists)
             }
+            // The token is the only credential here and the seen-set is the source's
+            // own, so like the boards this one needs no checkpoint: an announcement is
+            // new when its id has not been seen, and an assignment reappears on its
+            // own schedule (처음 · D-3 · D-1).
+            async let etlResult = collectSafely(checkpointKey: "etl", sourceName: SourceName.etl) {
+                await ETLSource().collect(persists: persists)
+            }
             let calendarEnd = Calendar.current.date(byAdding: .day, value: 14, to: now)!
             async let calendarResult = collectSafely(checkpointKey: "calendar", sourceName: "캘린더") {
                 SourceHarvest(items: try calendar.collect(upcomingFrom: Calendar.current.startOfDay(for: now), through: calendarEnd))
             }
-            let collections = await [gmailResult, slackResult, iMessageResult, calendarResult, webResult]
+            let collections = await [gmailResult, slackResult, iMessageResult, calendarResult, etlResult, webResult]
             let collected = collections.flatMap(\.items)
             try Task.checkCancellation()
             let preferences = preferenceStore.load()
@@ -321,6 +329,9 @@ struct BriefingService {
                 throw AgentError.processFailed("수집 항목의 로컬 분류에 모두 실패했습니다. 원본은 변경하지 않았습니다.")
             }
             classified = ClassifiedIncidentMerger.merge(classified)
+            // A source that already knows the deadline overrules the model's reading
+            // of it, so an eTL 과제 lands on the calendar at the hour Canvas gave.
+            classified = ExactDeadlines.applied(to: classified)
             // A freshly analysed item wins over the carried copy of the same thing.
             classified = Array(Dictionary(grouping: classified + carried, by: { $0.trackingID }).compactMap { $0.value.first })
             try Task.checkCancellation()

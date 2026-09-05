@@ -712,7 +712,9 @@ enum SourceDeduplicator {
 }
 
 enum Keychain {
-    static func string(service: String, account: String) throws -> String {
+    /// `missing` is the caller's own message: a row that says "Slack 토큰이 없습니다"
+    /// while the eTL token is what is absent sends the reader to the wrong place.
+    static func string(service: String, account: String, missing: String = "Keychain에서 필요한 Slack 토큰을 찾지 못했습니다.") throws -> String {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -724,7 +726,7 @@ enum Keychain {
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data,
               let value = String(data: data, encoding: .utf8) else {
-            throw AgentError.missingCredential("Keychain에서 필요한 Slack 토큰을 찾지 못했습니다.")
+            throw AgentError.missingCredential(missing)
         }
         return value
     }

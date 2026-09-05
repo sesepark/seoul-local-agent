@@ -22,8 +22,12 @@ struct SourceItem: Codable, Hashable, Identifiable {
     /// A notice from another college's board is written for that college, so only
     /// something this user could personally apply to is worth reporting.
     var audience: String?
+    /// ISO-8601, set only when the source already knows the exact deadline rather
+    /// than leaving it to be read out of prose. An eTL assignment carries `due_at`;
+    /// asking the model to infer a date it was handed would be a downgrade.
+    var knownDeadline: String?
 
-    init(id: String, source: String, account: String, author: String, timestamp: Date, subject: String, body: String, link: URL, stableID: String? = nil, audience: String? = nil) {
+    init(id: String, source: String, account: String, author: String, timestamp: Date, subject: String, body: String, link: URL, stableID: String? = nil, audience: String? = nil, knownDeadline: String? = nil) {
         self.id = id
         self.source = source
         self.account = account
@@ -34,6 +38,7 @@ struct SourceItem: Codable, Hashable, Identifiable {
         self.link = link
         self.stableID = stableID
         self.audience = audience
+        self.knownDeadline = knownDeadline
     }
 }
 
@@ -46,7 +51,7 @@ struct ClassifiedItem: Codable, Hashable, Identifiable {
     let reason: String
     let importance: Int
     let nextAction: String
-    let deadline: String
+    var deadline: String
     var displayTitle: String?
     var displaySummary: String?
     var displayNextAction: String?
@@ -79,6 +84,23 @@ struct ClassifiedItem: Codable, Hashable, Identifiable {
     }
 }
 
+/// Where a source handed over an exact deadline, that value wins.
+///
+/// The classifier fills `deadline` by reading the message, which is the only
+/// option for a mail or a notice board. An eTL assignment is not that: Canvas
+/// answers with `due_at`, so the date is known before the model ever sees it,
+/// and a paraphrase of a known fact is only a chance to be wrong.
+enum ExactDeadlines {
+    static func applied(to items: [ClassifiedItem]) -> [ClassifiedItem] {
+        items.map { item in
+            guard let known = item.sourceItem.knownDeadline, !known.isEmpty, item.deadline != known else { return item }
+            var updated = item
+            updated.deadline = known
+            return updated
+        }
+    }
+}
+
 struct DailyBriefing: Codable {
     let dateKey: String
     var items: [ClassifiedItem]
@@ -103,7 +125,8 @@ enum SourceName {
     static let messages = "메시지"
     static let calendar = "캘린더"
     static let web = "웹 공지"
-    static let ordered = [gmail, slack, messages, calendar, web]
+    static let etl = "eTL"
+    static let ordered = [gmail, slack, messages, calendar, etl, web]
 }
 
 struct PersistentState: Codable {

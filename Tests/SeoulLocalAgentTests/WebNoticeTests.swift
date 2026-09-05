@@ -183,7 +183,9 @@ struct WebNoticeTests {
         try Data(json.utf8).write(to: url)
 
         let sites = WebNoticeConfiguration.load(url: url)
-        #expect(sites.count == 1)
+        // The stored entry keeps its place; the fields it predates take their
+        // defaults rather than dropping the board.
+        #expect(sites[0].name == "자유전공학부")
         #expect(sites[0].enabled)
         #expect(sites[0].interest == .direct)
     }
@@ -229,6 +231,7 @@ struct WebNoticeTests {
         #expect(Set(sites.map(\.id)).count == sites.count)
         #expect(sites.contains { $0.name.contains("OGA") && $0.enabled })
         #expect(sites.contains { $0.name.contains("자유전공학부") && $0.enabled })
+        #expect(sites.contains { $0.name.contains("비교과") && $0.enabled })
         // A board that cannot be read is kept but switched off, never silently
         // dropped, so the check tool can tell when the site is fixed.
         #expect(sites.contains { !$0.enabled })
@@ -242,6 +245,60 @@ struct WebNoticeTests {
         for site in sites {
             #expect(site.url.host?.hasSuffix("snu.ac.kr") == true)
         }
+    }
+
+    /// SNU 비교과 links every programme through `global.write`, the same shape the
+    /// eGov boards use: without this the board reads as empty and the briefing
+    /// reports it as broken every night.
+    @Test("스크립트로 여는 목록도 주소를 만들어 읽는다")
+    func extractsScriptLinkedRows() {
+        let html = """
+        <html><body>
+        <li class="wait"><div class="img_wrap">
+          <a href="#" onclick="global.write('PGM012002141', '/ptfol/pgm/view.do');"><img src="/comm/cmfile/openCrop.do?width=700" alt=".." /></a>
+        </div>
+        <div class="label_box"><a href="#" class="btn01" onclick="global.write('PGM012002141', '/ptfol/pgm/view.do');"><span>모집대기</span></a></div>
+        <a href="#;" class="tit ellipsis" onclick="global.write('PGM012002141', '/ptfol/pgm/view.do');">(대학원생) 26-2학기 대인관계 향상 집단상담 프로그램</a>
+        <a href="#;" class="apply_btn" onclick="global.write('PGM012002141', '/ptfol/pgm/view.do');"><span>신청하기</span></a>
+        </li>
+        <li><a href="#;" class="tit ellipsis" onclick="global.write('PGM012002182', '/ptfol/pgm/view.do');">제1회 TI:um Sprout 참가자 모집</a></li>
+        <nav><a href="/menu/redirect.do?url=/ptfol/pgm/PBC0001/index.do">교육 (특강/세미나)</a></nav>
+        </body></html>
+        """
+        let page = URL(string: "https://extra.snu.ac.kr/ptfol/pgm/index.do")!
+        let entries = HTMLNoticeExtractor.entries(in: html, pageURL: page)
+
+        #expect(entries.count == 2)
+        // Three anchors carry the same programme; only the titled one survives, and
+        // the thumbnail and the 신청하기 button are too short to be titles.
+        #expect(entries[0].title == "(대학원생) 26-2학기 대인관계 향상 집단상담 프로그램")
+        #expect(entries[0].link.absoluteString
+            == "https://extra.snu.ac.kr/ptfol/pgm/view.do?currentPageNo=1&dataSeq=PGM012002141&parentSeq=PGM012002141")
+        #expect(entries[1].link.absoluteString.contains("dataSeq=PGM012002182"))
+        // The menu is a real address with no programme id behind it.
+        #expect(!entries.contains { $0.title.contains("특강") })
+    }
+
+    /// The file on disk wins, which is how a board is disabled — but a Mac that
+    /// already had the file would otherwise never see a board added later.
+    @Test("설정 파일에 없던 새 게시판은 합쳐져 저장된다")
+    func newCatalogueEntriesReachAnExistingFile() throws {
+        let json = """
+        {"sites":[{"name":"자유전공학부","url":"https://cls.snu.ac.kr/notice/","enabled":true,"interest":"direct"}]}
+        """
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "web-notices.json")
+        try Data(json.utf8).write(to: url)
+
+        let sites = WebNoticeConfiguration.load(url: url)
+        #expect(sites.count == WebNoticeCatalog.defaults.count)
+        #expect(sites.first?.name == "자유전공학부")
+        #expect(sites.contains { $0.url.host == "extra.snu.ac.kr" })
+        // The merge is written back, so the list stays editable by hand.
+        let reloaded = WebNoticeConfiguration.load(url: url)
+        #expect(reloaded.count == sites.count)
     }
 }
 

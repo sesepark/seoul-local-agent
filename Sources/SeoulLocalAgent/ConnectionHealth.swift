@@ -78,6 +78,7 @@ enum ConnectionProbe {
     static let remindersID = "reminders"
     static let modelID = "model"
     static let webID = "web"
+    static let etlID = "etl"
 
     static func placeholders() -> [ConnectionCheck] {
         [
@@ -88,6 +89,7 @@ enum ConnectionProbe {
             .checking(id: remindersID, title: "미리 알림", symbol: "checklist"),
             .checking(id: modelID, title: "로컬 모델", symbol: "cpu"),
             .checking(id: webID, title: "웹 공지", symbol: "globe"),
+            .checking(id: etlID, title: "eTL", symbol: "graduationcap"),
         ]
     }
 
@@ -350,6 +352,49 @@ enum ConnectionProbe {
     }
 }
 
+// MARK: - eTL
+
+extension ConnectionProbe {
+    /// Asks eTL for the same course list a run asks for. A token that has been
+    /// revoked fails here with the same 401 the briefing would hit, and a term
+    /// that resolved to the wrong semester shows up as the wrong course count —
+    /// which is the failure this row exists to make visible.
+    static func etl() async -> ConnectionCheck {
+        guard let token = try? ETLConfiguration.token() else {
+            return ConnectionCheck(
+                id: etlID, title: "eTL", symbol: "graduationcap", state: .warning,
+                summary: "Keychain에 토큰이 없습니다.",
+                detail: "토큰이 없으면 브리핑에서 eTL은 0건으로 빠지고 다른 소스만 수집됩니다. myetl.snu.ac.kr › 계정 › 설정에서 «+ 새 액세스 토큰»으로 발급한 뒤 아래 명령에 붙여 넣으세요. 값은 화면에 보이지 않습니다.",
+                remedy: .copyCommand(ETLConfiguration.tokenCommand)
+            )
+        }
+        do {
+            let courses = try await ETLSource.courses(token: token)
+            guard !courses.isEmpty else {
+                return ConnectionCheck(
+                    id: etlID, title: "eTL", symbol: "graduationcap", state: .warning,
+                    summary: "수강 중인 과목을 찾지 못했습니다.",
+                    detail: "학기 사이라 아직 과목이 열리지 않았을 수 있습니다. 학기 중인데도 비어 있다면 토큰이 다른 계정의 것입니다."
+                )
+            }
+            return ConnectionCheck(
+                id: etlID, title: "eTL", symbol: "graduationcap", state: .ok,
+                summary: "\(ETLSemester.name(of: courses)) · \(courses.count)과목 · 읽기 전용으로 응답합니다.",
+                detail: courses.map(\.shortName).joined(separator: ", ")
+            )
+        } catch {
+            let message = Self.firstLine(of: error.localizedDescription)
+            let rejected = message.contains("거부")
+            return ConnectionCheck(
+                id: etlID, title: "eTL", symbol: "graduationcap", state: .failed,
+                summary: rejected ? "토큰이 거부되었습니다." : "eTL에 연결하지 못했습니다.",
+                detail: rejected ? "\(message) myetl.snu.ac.kr에서 토큰을 새로 발급해 다시 넣어 주세요." : message,
+                remedy: rejected ? .copyCommand(ETLConfiguration.tokenCommand) : nil
+            )
+        }
+    }
+}
+
 /// The one list of probes, in the one order.
 ///
 /// Both callers — 설정 › 연결 상태 and `--connection-check` — read it from here,
@@ -365,6 +410,7 @@ enum ConnectionHealthReport {
 
     static let awaited: [@Sendable () async -> ConnectionCheck] = [
         ConnectionProbe.gmail, ConnectionProbe.slack, ConnectionProbe.model, ConnectionProbe.web,
+        ConnectionProbe.etl,
     ]
 
     /// Every probe, run once, ordered as `ConnectionProbe.placeholders()` lists them.

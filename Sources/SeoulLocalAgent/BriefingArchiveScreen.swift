@@ -485,6 +485,7 @@ private struct BriefingEntryRow: View {
         case SourceName.messages: "message"
         case SourceName.calendar: "calendar"
         case SourceName.web: "globe"
+        case SourceName.etl: "graduationcap"
         default: "tray"
         }
     }

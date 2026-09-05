@@ -27,6 +27,41 @@ struct SeoulLocalAgentApp: App {
                 exit(EXIT_SUCCESS)
             }
         }
+        // eTL도 게시판과 같은 이유로 따로 확인할 수 있어야 한다. 수집을 진짜로 돌리면
+        // 기준선과 알림 단계를 써 버려서, 확인이 다음 브리핑의 내용을 바꾼다.
+        if CommandLine.arguments.contains("--etl-check") {
+            Task {
+                do {
+                    let found = try await ETLSource().inspect()
+                    guard !found.courses.isEmpty else {
+                        print("⚠️ eTL: 수강 중인 과목을 찾지 못했습니다.")
+                        exit(EXIT_SUCCESS)
+                    }
+                    print("✅ eTL \(found.semester) · \(found.courses.count)과목")
+                    print("   \(found.courses.map(\.shortName).joined(separator: ", "))")
+                    let announcementSample = found.announcements.first.map { " · 예: \($0.title.prefix(40))" } ?? ""
+                    print("   공지(최근 14일) \(found.announcements.count)건\(announcementSample)")
+                    print("   마감 남은 과제 \(found.upcoming.count)건")
+                    for row in found.upcoming.prefix(8) {
+                        let due = row.assignment.dueAt.map(ETLSource.dueText) ?? "마감 미정"
+                        let days = row.assignment.dueAt.map { "D-\(ETLDigestStore.daysUntil($0, from: Date()))" } ?? ""
+                        print("     · [\(row.course.shortName)] \(row.assignment.name) — \(due) \(days)")
+                    }
+                    // 실제로 수집하면 무엇이 브리핑에 올라가는지까지 보여 준다. `persists: false`라
+                    // 기준선도 알림 단계도 쓰지 않으므로, 확인했다는 이유로 다음 브리핑이
+                    // 달라지지 않는다.
+                    let harvest = await ETLSource().collect(persists: false)
+                    print("   지금 수집하면 올라갈 항목 \(harvest.items.count)건")
+                    for item in harvest.items.prefix(8) {
+                        print("     · [\(item.account)] \(item.subject)")
+                    }
+                    for warning in harvest.warnings { print("   ⚠︎ \(warning)") }
+                } catch {
+                    print("❌ eTL 실패: \(error.localizedDescription)")
+                }
+                exit(EXIT_SUCCESS)
+            }
+        }
         // The same probes 설정 › 연결 상태 runs, on the terminal. Worth having
         // separately: this is the check you want when the app will not start, or
         // when you want to see the answer without a window in the way.
