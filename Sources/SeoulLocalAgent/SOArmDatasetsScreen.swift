@@ -22,6 +22,7 @@ private struct SOArmDatasetsWorkspace: View {
             if let message = model.errorMessage {
                 DismissibleError(message: message) { model.errorMessage = nil }
             }
+            sparkPanel
             if model.datasets.isEmpty {
                 empty
             } else {
@@ -31,6 +32,7 @@ private struct SOArmDatasetsWorkspace: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         datasetList
+                        checkpoints
                     }
                     .frame(width: 250)
                     detail
@@ -73,10 +75,18 @@ private struct SOArmDatasetsWorkspace: View {
                     model.selectedDataset = dataset.name
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(dataset.name)
-                            .font(.callout.weight(.medium))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        HStack(spacing: Spacing.xs) {
+                            Text(dataset.name)
+                                .font(.callout.weight(.medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if model.isOnSpark(dataset.name) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(Color.snuBlueLabel)
+                                    .help("학습 서버에 있습니다")
+                            }
+                        }
                         Text("에피소드 \(dataset.episodes)개 · \(SOArmFormat.duration(dataset.seconds))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -97,6 +107,7 @@ private struct SOArmDatasetsWorkspace: View {
     private var detail: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             if let detail = model.datasetDetail {
+                transferRow(detail.summary)
                 player
                 cameraPicker(detail.summary.cameras)
                 episodes(detail.episodes)
@@ -106,6 +117,137 @@ private struct SOArmDatasetsWorkspace: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 학습 서버가 어떤 상태인지 한 줄.
+    ///
+    /// 못 붙어도 화면 전체를 막지 않는다. 이 화면의 본래 일은 녹화한 것을 보는 것이고,
+    /// 학습 서버는 거기에 얹힌 다음 단계다. 그래서 실패는 이 칸 안에서만 말한다.
+    @ViewBuilder
+    private var sparkPanel: some View {
+        let status = model.sparkStatus
+        HStack(spacing: Spacing.m) {
+            Image(systemName: (status?.isReachable ?? false) ? "cpu.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle((status?.isReachable ?? false) ? Color.snuBlueLabel : .secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("학습 서버")
+                    .font(.callout.weight(.medium))
+                Text(sparkDetailLine(status))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if model.isLoadingSpark {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("새로고침", systemImage: "arrow.clockwise") { model.loadSpark() }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .help("학습 서버 상태와 목록을 다시 읽습니다")
+            }
+        }
+        .padding(Spacing.m)
+        .glassPanel()
+    }
+
+    private func sparkDetailLine(_ status: SOArmSparkStatus?) -> String {
+        guard let status else { return "상태를 읽는 중입니다" }
+        guard status.isReachable else {
+            return status.failure ?? "닿지 않습니다"
+        }
+        var parts: [String] = []
+        if let gpu = status.gpuName { parts.append(gpu) }
+        if let temperature = status.temperature { parts.append("\(temperature)°C") }
+        if let watts = status.watts { parts.append(String(format: "%.0fW", watts)) }
+        if status.diskFreeBytes > 0 { parts.append("여유 " + SOArmFormat.size(status.diskFreeBytes)) }
+        return parts.isEmpty ? status.host : parts.joined(separator: " · ")
+    }
+
+    /// 고른 데이터셋을 학습 서버로 보내는 줄.
+    ///
+    /// 진행률 막대를 두지 않는다. 서버가 전송을 끝내고 한 번에 답하므로 보여 줄 숫자가 없고,
+    /// 지어낸 막대는 멈춘 전송을 도는 것처럼 보이게 한다. 도는 동안 버튼을 잠그고 도는 중이라고만
+    /// 말한다.
+    private func transferRow(_ summary: SOArmDatasetSummary) -> some View {
+        let isPushing = model.pushingDataset == summary.name
+        let isOnSpark = model.isOnSpark(summary.name)
+        let canPush = (model.sparkStatus?.isReachable ?? false) && model.pushingDataset == nil
+        return HStack(spacing: Spacing.m) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(summary.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(isOnSpark ? "학습 서버에 있습니다" : "아직 학습 서버에 없습니다")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                model.pushToSpark(summary.name)
+            } label: {
+                if isPushing {
+                    HStack(spacing: Spacing.xs) {
+                        ProgressView().controlSize(.small)
+                        Text("전송 중…")
+                    }
+                } else {
+                    Label(isOnSpark ? "다시 전송" : "학습 서버로 전송", systemImage: "arrow.up.circle")
+                }
+            }
+            .disabled(!canPush)
+            .help(canPush ? "rsync로 보냅니다. 이미 있는 파일은 다시 보내지 않습니다" : "학습 서버에 닿지 않습니다")
+        }
+        .padding(Spacing.m)
+        .contentCard()
+    }
+
+    /// 학습 서버에 쌓인 체크포인트.
+    ///
+    /// 회수하면 이 Mac이 아니라 콘솔 서버로 내려온다 — 추론은 팔이 붙어 있는 그 서버에서 돈다.
+    @ViewBuilder
+    private var checkpoints: some View {
+        if !model.sparkRuns.isEmpty {
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                Text("학습된 정책")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(model.sparkRuns) { run in
+                    VStack(alignment: .leading, spacing: Spacing.xs) {
+                        Text(run.name)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        ForEach(run.checkpoints) { checkpoint in
+                            HStack(spacing: Spacing.s) {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    Text("step \(checkpoint.step)")
+                                        .font(.caption2.monospacedDigit())
+                                    Text(SOArmFormat.size(checkpoint.sizeBytes))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Spacer()
+                                if model.pullingCheckpoint == "\(run.name)/\(checkpoint.step)" {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Button("회수") {
+                                        model.pullCheckpoint(run: run.name, step: checkpoint.step)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .font(.caption2)
+                                    .disabled(model.pullingCheckpoint != nil)
+                                    .help("콘솔 서버로 내려받습니다")
+                                }
+                            }
+                        }
+                    }
+                    .padding(Spacing.s)
+                    .contentCard()
+                }
+            }
+        }
     }
 
     @ViewBuilder

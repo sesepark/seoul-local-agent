@@ -34,6 +34,9 @@ final class SOArmConsoleModel: ObservableObject {
     /// `환경 진단`을 눌러 나온 점검표를 보여 주고 있는가. 서버는 마지막 진단 결과를 계속
     /// 들고 있으므로, 눌렀을 때만 펼치고 닫을 수 있게 한다.
     @Published var showsDiagnosis = false
+    /// 마지막 진단 결과. 버리지 않고 들고 있는 이유는, 어느 팔이 토크를 쥐고 있는지가
+    /// 화면이 `토크 해제` 버튼을 보여 줄지 말지를 정하기 때문이다.
+    @Published private(set) var doctor: SOArmDoctor?
 
     // 수집 조건. 시트를 닫아도 남아 있어야 해서 화면이 아니라 여기에 둔다.
     @Published var recordTask = ""
@@ -60,6 +63,19 @@ final class SOArmConsoleModel: ObservableObject {
     }
     @Published var selectedEpisode: Int?
     @Published var selectedCamera: String?
+
+    // 학습 서버(Spark)
+    @Published private(set) var sparkStatus: SOArmSparkStatus?
+    /// 학습 서버에 이미 올라가 있는 데이터셋 이름. 목록의 각 줄이 보낸 것인지 아닌지를
+    /// 여기로 판단한다.
+    @Published private(set) var sparkDatasets: [SOArmSparkDataset] = []
+    @Published private(set) var sparkRuns: [SOArmSparkRun] = []
+    /// 지금 보내고 있는 데이터셋 이름. 전송은 몇 분이 걸릴 수 있어 어느 줄이 도는 중인지
+    /// 화면이 알아야 한다.
+    @Published private(set) var pushingDataset: String?
+    /// 회수 중인 체크포인트. `run/step` 한 줄로 둔다.
+    @Published private(set) var pullingCheckpoint: String?
+    @Published private(set) var isLoadingSpark = false
 
     private let store: SOArmServerStore
     /// 화면을 눌러 보지 않고도 카메라가 붙은 모습과 웹 콘솔을 확인할 수 있게 하는 실행 인자.
@@ -114,7 +130,7 @@ final class SOArmConsoleModel: ObservableObject {
         }
     }
 
-    var client: SOArmClient { SOArmClient(baseURL: server.baseURL) }
+    var client: SOArmClient { SOArmClient(baseURL: server.baseURL, motionToken: server.motionToken) }
     var consoleURL: URL { server.baseURL }
     var mode: SOArmMode { status?.mode ?? .idle }
     var isModeRunning: Bool { mode != .idle }
@@ -305,7 +321,37 @@ final class SOArmConsoleModel: ObservableObject {
     /// 읽기 전용 진단. 모드가 도는 동안에는 서버가 거절하므로 버튼에만 붙어 있다.
     func runDoctor() {
         showsDiagnosis = true
-        perform { client in _ = try await client.doctor() }
+        guard !isBusy else { return }
+        isBusy = true
+        errorMessage = nil
+        let client = client
+        Task {
+            do {
+                doctor = try await client.doctor()
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            isBusy = false
+            await refresh()
+        }
+    }
+
+    /// 토크가 걸린 채로 남아 있는 팔들.
+    ///
+    /// 진단을 돌리기 전에는 알 수 없다. 서버 상태(`/api/status`)에는 모터 레지스터가 없고,
+    /// 그것을 읽으려면 serial을 여는 진단이 필요하다.
+    var armsHoldingTorque: [String] {
+        (doctor?.arms ?? []).filter { $0.healthy && !$0.torqueDisabled }.map(\.role)
+    }
+
+    /// 한 팔의 토크를 푼다. 푼 뒤 진단을 다시 돌려 실제로 꺼졌는지 확인한다 —
+    /// 껐다고 말하는 것과 꺼진 것을 보는 것은 다르다.
+    func releaseTorque(arm: String) {
+        perform { client in try await client.releaseTorque(arm: arm) }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(600))
+            runDoctor()
+        }
     }
 
     /// 진단을 아직 돌리지 않았어도 서버 상태만으로 알 수 있는 것들이 있다. 그 줄들은 그대로
@@ -376,6 +422,7 @@ final class SOArmConsoleModel: ObservableObject {
         Task {
             await connect()
             loadDatasets()
+            loadSpark()
         }
     }
 
@@ -429,6 +476,75 @@ final class SOArmConsoleModel: ObservableObject {
               let video = currentEpisode?.videos[camera],
               !video.path.isEmpty else { return nil }
         return client.videoURL(video.path)
+    }
+
+    // MARK: 학습 서버(Spark)
+
+    /// 학습 서버의 형편과 그쪽에 있는 것들을 한 번에 읽는다.
+    ///
+    /// 실패해도 `errorMessage`를 세우지 않는다. 학습 서버가 꺼져 있는 것은 수집 데이터
+    /// 화면이 하려는 일(녹화한 것을 보는 것)을 막지 않으므로, 붉은 줄로 화면을 덮는 대신
+    /// 학습 서버 칸에만 그 사실을 적는다.
+    func loadSpark() {
+        guard !isLoadingSpark else { return }
+        isLoadingSpark = true
+        let client = client
+        Task {
+            let status = (try? await client.sparkStatus()) ?? SOArmSparkStatus()
+            sparkStatus = status
+            if status.isReachable {
+                sparkDatasets = (try? await client.sparkDatasets()) ?? []
+                sparkRuns = (try? await client.sparkRuns()) ?? []
+            } else {
+                sparkDatasets = []
+                sparkRuns = []
+            }
+            isLoadingSpark = false
+        }
+    }
+
+    /// 이 데이터셋이 학습 서버에 이미 있는가.
+    func isOnSpark(_ name: String) -> Bool {
+        sparkDatasets.contains { $0.name == name }
+    }
+
+    /// 데이터셋 하나를 학습 서버로 보낸다.
+    ///
+    /// 진행률은 없다. 서버가 rsync를 끝내고 한 번에 답하므로 보여 줄 숫자가 없고, 지어낸
+    /// 막대는 멈춘 전송을 정상으로 보이게 한다. 대신 도는 동안 그 줄을 잠가 두 번 눌리는
+    /// 것을 막는다.
+    func pushToSpark(_ name: String) {
+        guard pushingDataset == nil else { return }
+        pushingDataset = name
+        let client = client
+        Task {
+            do {
+                try await client.pushToSpark(name)
+                errorMessage = nil
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            pushingDataset = nil
+            // 보낸 뒤 목록을 다시 읽어야 그 줄이 `전송됨`으로 바뀐다.
+            loadSpark()
+        }
+    }
+
+    /// 학습된 체크포인트를 콘솔 서버로 회수한다. 이 Mac이 아니라 팔이 붙어 있는 서버로
+    /// 내려온다 — 추론은 거기서 돈다.
+    func pullCheckpoint(run: String, step: String) {
+        guard pullingCheckpoint == nil else { return }
+        pullingCheckpoint = "\(run)/\(step)"
+        let client = client
+        Task {
+            do {
+                try await client.pullCheckpoint(run: run, step: step)
+                errorMessage = nil
+            } catch {
+                errorMessage = Self.message(for: error)
+            }
+            pullingCheckpoint = nil
+        }
     }
 
     // MARK: 카메라

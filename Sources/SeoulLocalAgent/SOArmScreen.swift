@@ -21,6 +21,7 @@ private struct SOArmWorkspace: View {
     @ObservedObject private var cameraPolicy = SOArmCameraPolicy.shared
     @Environment(\.openSettings) private var openSettings
     @State private var pending: SOArmStartRequest?
+    @State private var torqueGate: SOArmTorqueGate?
     /// 카메라 두 장이 나눠 쓸 수 있는 가로 폭. 창을 줄이고 늘릴 때마다 다시 들어온다.
     @State private var cameraRowWidth: CGFloat = 0
 
@@ -46,6 +47,9 @@ private struct SOArmWorkspace: View {
         // of it. Leaving this toolbar up put a second 전체화면 button in the title
         // bar over a screen that was already full screen.
         .toolbar(model.isConsoleFullScreen ? .hidden : .visible, for: .windowToolbar)
+        .sheet(item: $torqueGate) { gate in
+            SOArmTorqueReleaseSheet(gate: gate) { model.releaseTorque(arm: gate.arm) }
+        }
         .sheet(item: $pending) { request in
             SOArmConfirmationSheet(request: request) {
                 switch request {
@@ -96,6 +100,19 @@ private struct SOArmWorkspace: View {
             }
             .disabled(!model.connection.isConnected)
             .help("서버의 웹 콘솔을 창 전체에 띄웁니다")
+        }
+        ToolbarItem {
+            // 진단이 토크가 걸린 팔을 찾았을 때만 나온다. 늘 떠 있으면 누를 이유가 없는
+            // 버튼이 위험한 자리에 상주하게 되고, 그런 버튼은 언젠가 눌린다.
+            if let arm = model.armsHoldingTorque.first {
+                Button("토크 해제…", systemImage: "bolt.slash") {
+                    torqueGate = SOArmTorqueGate(arm: arm)
+                }
+                .tint(.red)
+                .toolbarKeepsTitle()
+                .disabled(model.isBusy || model.isModeRunning)
+                .help("이전 세션이 남긴 토크를 풉니다. 팔이 힘을 놓으므로 받쳐 줄 수 있을 때 하세요")
+            }
         }
         ToolbarItem {
             if model.status?.teleop.running == true {
@@ -584,6 +601,63 @@ private struct SOArmCameraCard: View {
 // MARK: - 시작 확인
 
 /// 무엇을 시작하려는지. 확인 문구가 둘 다 다르고, 서버는 문구가 정확히 맞을 때만 시작한다.
+/// 어느 팔의 토크를 풀 것인가.
+struct SOArmTorqueGate: Identifiable {
+    let arm: String
+    var id: String { arm }
+    var title: String { arm == "leader" ? "리더 팔 토크 해제" : "팔로워 팔 토크 해제" }
+}
+
+/// 토크를 푸는 확인 화면.
+///
+/// 원격 텔레옵 화면의 게이트와 같은 말을 한다. 같은 일을 하는 두 자리가 서로 다른 위험을
+/// 설명하면, 사람은 둘 중 무엇이 맞는지 화면 밖에서 판단해야 한다.
+private struct SOArmTorqueReleaseSheet: View {
+    let gate: SOArmTorqueGate
+    let confirm: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var acknowledged = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.l) {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                Text("MOTION AUTHORITY").font(.caption2).foregroundStyle(.tertiary)
+                Text(gate.title).font(.title3).bold()
+                // 실측(2026-09-02): 접힌 자세에서는 6초 동안 0.00° 움직이지 않았고, 뻗어 든
+                // 자세에서 풀었을 때 어깨가 17° 주저앉았다. 원격 텔레옵 화면과 같은 문장이다.
+                Text("토크를 풀면 팔은 지금 자세에서 힘을 놓습니다. 1/345 감속비 덕분에 대개는 그 자리에 그대로 서 있지만, 중력이 두는 자리보다 위로 버티고 있던 자세라면 그만큼 내려앉습니다. 팔을 뻗어 든 상태라면 받쳐 줄 사람이 있을 때 하세요.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Label("이전 세션이 남긴 토크입니다. 풀어야 다음 텔레옵이 시작됩니다.", systemImage: "info.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $acknowledged) {
+                Text("팔이 내려앉아도 되는 자세인지 확인했습니다")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .toggleStyle(.checkbox)
+            HStack {
+                Spacer()
+                Button("취소") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("토크 해제") {
+                    confirm()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(!acknowledged)
+            }
+        }
+        .padding(Spacing.xl)
+        .frame(width: 460)
+    }
+}
+
 private enum SOArmStartRequest: String, Identifiable {
     case teleoperation, recording
 

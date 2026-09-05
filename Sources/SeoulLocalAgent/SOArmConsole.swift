@@ -526,9 +526,13 @@ enum SOArmRecordControl: String, CaseIterable, Sendable {
 
 struct SOArmClient: Sendable {
     var baseURL: URL
+    /// 팔을 움직이는 요청에만 붙는다. 관찰에는 필요 없다 — 서버가 그렇게 가른다.
+    var motionToken: String = ""
 
     static let teleopConfirmation = "START SOARM101"
     static let recordConfirmation = "RECORD SOARM101"
+    /// 가상 리더가 쓰는 것과 같은 문구다. 푸는 일이 같으므로 문구도 같아야 한다.
+    static let torqueReleaseConfirmation = "RELEASE TORQUE SOARM101"
 
     /// 서버가 받는 에피소드 수의 상한.
     ///
@@ -604,6 +608,21 @@ struct SOArmClient: Sendable {
         _ = try await send("/api/cameras/\(name)/stop", method: "POST", timeout: 10)
     }
 
+    /// 한 팔의 토크를 푼다. 받치지 않으면 팔이 내려앉는다.
+    ///
+    /// 가상 리더에도 같은 일을 하는 자리가 있지만 그것은 가상 리더가 돌고 있을 때만 쓸 수
+    /// 있다. 이전 세션이 남긴 토크 때문에 텔레옵이 거절되는 자리는 그 밖이라, 서버가 따로
+    /// 내놓은 길이 필요했다.
+    func releaseTorque(arm: String) async throws {
+        _ = try await send(
+            "/api/torque/release",
+            method: "POST",
+            body: ["arm": arm, "confirmation": Self.torqueReleaseConfirmation],
+            timeout: 60,
+            motionToken: motionToken
+        )
+    }
+
     func datasets() async throws -> [SOArmDatasetSummary] {
         try SOArmDatasetSummary.list(try await send("/api/datasets", method: "GET", timeout: 20))
     }
@@ -623,13 +642,53 @@ struct SOArmClient: Sendable {
         baseURL.appending(path: "api/cameras/\(name).mjpg")
     }
 
+    // MARK: 학습 서버(Spark)
+
+    /// 학습 서버가 살아 있는지, GPU와 디스크가 어떤 상태인지.
+    ///
+    /// 콘솔 서버가 대신 물어봐 준다. 이 Mac이 학습 서버에 직접 붙지 않는 이유는 팔에 대한
+    /// 것과 같다 — 서버 하나가 장치와 원격 기계를 쥐고, 앱은 그 서버만 부른다.
+    func sparkStatus() async throws -> SOArmSparkStatus {
+        SOArmSparkStatus(try await send("/api/spark", method: "GET", timeout: 60))
+    }
+
+    /// 학습 서버에 이미 올라가 있는 데이터셋 이름들.
+    func sparkDatasets() async throws -> [SOArmSparkDataset] {
+        try SOArmSparkDataset.list(try await send("/api/spark/datasets", method: "GET", timeout: 60))
+    }
+
+    /// 데이터셋 하나를 학습 서버로 보낸다.
+    ///
+    /// 서버가 rsync가 끝날 때까지 응답을 붙들고 있으므로 타임아웃이 길다. 에피소드 몇 개는
+    /// 금방이지만 수 기가바이트는 몇 분이 걸린다. 진행률을 보여 줄 수 없는 것은 서버 API가
+    /// 아직 한 번에 답하기 때문이고, 그 편이 지금은 정직하다 — 없는 진행률을 지어내면
+    /// 멈춘 전송과 느린 전송을 구별할 수 없다.
+    func pushToSpark(_ name: String) async throws {
+        _ = try await send("/api/spark/datasets/\(name)", method: "POST", timeout: 3600)
+    }
+
+    /// 학습 서버의 학습 실행과 체크포인트.
+    func sparkRuns() async throws -> [SOArmSparkRun] {
+        try SOArmSparkRun.list(try await send("/api/spark/runs", method: "GET", timeout: 60))
+    }
+
+    /// 체크포인트 하나를 서버로 회수한다. 이 Mac이 아니라 콘솔 서버에 내려온다 — 추론은
+    /// 팔이 붙어 있는 그 서버에서 돈다.
+    func pullCheckpoint(run: String, step: String) async throws {
+        _ = try await send("/api/spark/runs/\(run)/\(step)", method: "POST", timeout: 1800)
+    }
+
     // MARK: 전송
 
-    private func send(_ path: String, method: String, body: [String: any Sendable]? = nil, timeout: TimeInterval) async throws -> Data {
+    private func send(_ path: String, method: String, body: [String: any Sendable]? = nil, timeout: TimeInterval, motionToken: String = "") async throws -> Data {
         var request = URLRequest(url: baseURL.appending(path: path.hasPrefix("/") ? String(path.dropFirst()) : path))
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        let token = motionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "x-soarm-motion-token")
+        }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -686,6 +745,7 @@ struct SOArmClient: Sendable {
         detail = SOArmServerText.korean(detail)
         switch status {
         case 400: return .confirmationMismatch(detail)
+        case 401: return .blocked(detail)
         case 404: return .badResponse(detail)
         case 409: return .blocked(detail)
         case 500...599: return .serverFailure(detail)
@@ -716,6 +776,38 @@ enum SOArmServerText {
             ("Clear the fault before arming",
              "멈춘 이유를 먼저 확인해 주세요. `확인하고 계속`을 누르면 지금 자세에서 다시 시작합니다."),
             ("Confirmation phrase does not match", "확인 문구가 맞지 않습니다."),
+            // 학습 서버로 보내고 받는 길에서 나는 실패들. 끊긴 전송은 받다 만 곳이 서버에
+            // 남아 있으므로, 다시 눌러도 처음부터 다시 보내지 않는다는 점을 함께 말한다.
+            ("The connection dropped during transfer",
+             "전송 도중 연결이 끊겼습니다. 다시 누르면 받다 만 곳부터 이어받습니다."),
+            ("The transfer did not finish within",
+             "전송이 제한 시간 안에 끝나지 않았습니다. 다시 누르면 이어받습니다."),
+            ("The training machine has no free disk space",
+             "학습 서버의 디스크가 가득 찼습니다. 오래된 데이터셋이나 체크포인트를 지운 뒤 다시 시도하세요."),
+            ("Cannot find the training machine on the network",
+             "학습 서버 주소를 찾지 못했습니다. Tailscale이 켜져 있는지 확인하세요."),
+            ("The training machine refused the login",
+             "학습 서버가 로그인을 거절했습니다. 콘솔 서버의 SSH 키가 학습 서버에 등록되어 있는지 확인하세요."),
+            ("The training machine's host key changed",
+             "학습 서버의 호스트 키가 전과 다릅니다. 기계를 다시 설치했다면 콘솔 서버의 known_hosts에서 옛 항목을 지우세요."),
+            ("The training machine refused the connection",
+             "학습 서버가 연결을 거절했습니다. 켜져 있는지, sshd가 도는지 확인하세요."),
+            ("The training machine did not answer",
+             "학습 서버가 응답하지 않습니다. 켜져 있는지 확인하세요."),
+            ("The training machine could not write the files",
+             "학습 서버가 파일을 쓰지 못했습니다. 디스크 공간과 권한을 확인하세요."),
+            ("Some files were not transferred",
+             "일부 파일이 전송되지 않았습니다. 다시 누르면 빠진 것만 보냅니다."),
+            ("Some files vanished during transfer",
+             "전송 도중 원본 파일이 바뀌었습니다. 수집이 끝난 뒤 다시 보내세요."),
+            ("The transfer protocol failed",
+             "전송 중 프로토콜 오류가 났습니다. 다시 시도하고, 계속 실패하면 양쪽 rsync 버전을 확인하세요."),
+            ("The transfer timed out",
+             "전송이 시간 안에 끝나지 않았습니다. 다시 누르면 이어받습니다."),
+            ("The training machine sent something that is not JSON",
+             "학습 서버의 응답을 읽지 못했습니다. 서버 로그를 확인하세요."),
+            ("Unknown policy type", "지원하지 않는 정책 종류입니다."),
+            ("steps or batch_size out of range", "학습 스텝 수나 배치 크기가 허용 범위를 벗어났습니다."),
             ("Motion token is missing or wrong", wrongTokenLine),
             ("SOARM_ENABLE_MOTION=1 is not set",
              "서버에서 동작이 잠겨 있습니다 (config/soarm.env의 SOARM_ENABLE_MOTION=1 후 서비스 재시작)."),
@@ -988,6 +1080,95 @@ struct SOArmEpisodeVideo: Sendable, Equatable {
         path = json.soarmString("url") ?? ""
         fromSeconds = json.soarmDouble("from_seconds") ?? 0
         toSeconds = json.soarmDouble("to_seconds") ?? 0
+    }
+}
+
+// MARK: - 학습 서버(Spark)
+
+/// 학습 서버의 형편.
+///
+/// `reachable`이 거짓일 때 이유를 함께 들고 있는 이유는, 화면이 "못 붙었다"만 말하면
+/// 사람이 할 수 있는 일이 없기 때문이다. 서버가 꺼진 것과 SSH 키가 없는 것은 다른 일이다.
+struct SOArmSparkStatus: Sendable, Equatable {
+    var isReachable = false
+    var failure: String?
+    var host = ""
+    var gpuName: String?
+    var temperature: Int?
+    var watts: Double?
+    var diskFreeBytes = 0
+
+    init() {}
+
+    init(_ data: Data) {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        isReachable = (json["reachable"] as? Bool) ?? false
+        failure = json.soarmString("error")
+        host = json.soarmString("host") ?? ""
+        diskFreeBytes = json.soarmInt("disk_free_bytes") ?? 0
+        let gpu = json.soarmDict("gpu")
+        gpuName = gpu.soarmString("name")
+        // GB10은 통합메모리라 nvidia-smi가 GPU 전용 메모리를 모른다고 답한다. 없는 값은
+        // 없는 대로 두고 화면에서 그 줄을 빼는 편이, 0을 그려 있는 척하는 것보다 낫다.
+        temperature = gpu.soarmInt("temperature_c")
+        watts = gpu.soarmDouble("power_w")
+    }
+}
+
+/// 학습 서버에 올라가 있는 데이터셋 하나.
+struct SOArmSparkDataset: Sendable, Equatable, Identifiable {
+    var name = ""
+    var episodes = 0
+    var frames = 0
+
+    var id: String { name }
+
+    init(_ json: [String: Any]) {
+        name = json.soarmString("name") ?? ""
+        episodes = json.soarmInt("episodes") ?? 0
+        frames = json.soarmInt("frames") ?? 0
+    }
+
+    static func list(_ data: Data) throws -> [SOArmSparkDataset] {
+        guard let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            throw SOArmError.badResponse("학습 서버 데이터셋 목록이 배열이 아닙니다")
+        }
+        return rows.map(SOArmSparkDataset.init).filter { !$0.name.isEmpty }
+    }
+}
+
+/// 학습 실행 하나와 그 체크포인트들.
+struct SOArmSparkRun: Sendable, Equatable, Identifiable {
+    var name = ""
+    var checkpoints: [SOArmSparkCheckpoint] = []
+
+    var id: String { name }
+
+    init(_ json: [String: Any]) {
+        name = json.soarmString("run") ?? ""
+        let rows = (json["checkpoints"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+        checkpoints = rows.map(SOArmSparkCheckpoint.init).filter { !$0.step.isEmpty }
+    }
+
+    static func list(_ data: Data) throws -> [SOArmSparkRun] {
+        guard let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            throw SOArmError.badResponse("학습 실행 목록이 배열이 아닙니다")
+        }
+        return rows.map(SOArmSparkRun.init).filter { !$0.name.isEmpty }
+    }
+}
+
+struct SOArmSparkCheckpoint: Sendable, Equatable, Identifiable {
+    var step = ""
+    var sizeBytes = 0
+    var finishedAt: Date?
+
+    var id: String { step }
+
+    init(_ json: [String: Any]) {
+        step = json.soarmString("step") ?? ""
+        sizeBytes = json.soarmInt("size_bytes") ?? 0
+        if let stamp = json.soarmDouble("finished_at") { finishedAt = Date(timeIntervalSince1970: stamp) }
     }
 }
 
